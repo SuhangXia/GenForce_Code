@@ -286,7 +286,7 @@ if __name__ == "__main__":
     sensor_types = args.sensor_types
     sensor_pair_permu = list(permutations(sensor_types, 2))
     if args.target is not None:
-        sensor_pairs = [combi for combi in sensor_pair_permu if args.target in combi[1]] # fixed target domain
+        sensor_pairs = [combi for combi in sensor_pair_permu if args.target == combi[1]] # fixed target domain
     else:
         sensor_pairs = sensor_pair_permu
     # marker_num_all = args.marker_num_all

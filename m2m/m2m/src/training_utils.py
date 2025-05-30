@@ -380,7 +380,10 @@ class PairedDatasetReal(Dataset):
     def __load_image_(self, img_path):
 
         if img_path.endswith(".npy"):
-            loaded_image = np.load(img_path)
+            try:
+                loaded_image = np.load(img_path)
+            except Exception as e:
+                print(img_path)
             if len(loaded_image.shape)==1: loaded_image = np.unpackbits(loaded_image).reshape((480,640))*255
             loaded_image = Image.fromarray(loaded_image.astype(np.uint8)).convert('RGB')
         elif img_path.endswith(".jpg"):

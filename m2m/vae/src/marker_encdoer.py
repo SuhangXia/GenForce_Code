@@ -300,7 +300,7 @@ class MarkerEncoder:
 
 def main():  
     config = {  
-        "train_batch_size": 8,  
+        "train_batch_size": 1,  
         "gradient_accumulation_steps": 4,  
         "learning_rate": 1e-4,  
         "max_train_steps": 100000,  
@@ -313,7 +313,7 @@ def main():
     trainer = MarkerEncoder(**config)  
     
     trainer.train(  
-        data_dir="dataset/sim",  
+        data_dir="dataset/m2m/sim",  
         num_epochs=100,  
         save_steps=1000,  
         log_steps=100  

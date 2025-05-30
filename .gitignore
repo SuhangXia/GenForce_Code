@@ -8,4 +8,7 @@ gif/
 *.npz
 !*.stl
 dataset/
+checkpoints/
+wandb/
+img_show.py
 
