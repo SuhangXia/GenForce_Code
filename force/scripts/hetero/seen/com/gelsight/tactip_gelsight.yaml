@@ -1,25 +1,25 @@
 task: tactip_gelsight
 
-src_img: infer/hetero/tactip_gelsight/02_26_03_25
-src_force: dataset/hetero/force/tactip
+src_img: dataset/Image_gen/heter/tactip_gelsight/genforce/infer/hetero/final_force/tactip_gelsight/02_26_03_25
+src_force: dataset/training/training/hetero/force/tactip
 
-tar_img: dataset/hetero/img/gelsight
-tar_force: dataset/hetero/force/gelsight
+tar_img: dataset/training/training/hetero/img/gelsight
+tar_force: dataset/training/training/hetero/force/gelsight
 
 min_max: force/config/min_max.json
 
 checkpoint: infer/force_com/hetero/tactip_gelsight/20250304_155035/epoch_20.pth
 save_dir: infer/force_com/hetero/{}
 
-src_depth: dataset/hetero/depth/tactip
-modulus: dataset/material_compensatin/hetero/cofficient
+src_depth: dataset/training/training/hetero/depth/tactip
+modulus: dataset/training/material_compensatin/hetero/cofficient
 
 unseen: ["sphere_s", "triangle", "pacman", "cone", "wave", "torus","dots"]
 test_unseen: False
 
 #Train
 train: True
-train_use_checkpoint: True                 
+train_use_checkpoint: False                 
 draw_force: True
 draw_use_checkpoint: False 
      
@@ -33,5 +33,5 @@ num_workers: 16
 batch_size: 4
 n_epoch: 20
 early_stop: 20
-lr: 1e-3   #train 1e-1;fine tune:1e-3
+lr: 1e-1   #train 1e-1;fine tune:1e-3
 seed: 0

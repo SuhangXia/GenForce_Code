@@ -1,6 +1,6 @@
 task: ratio_6_ratio_8
 
-src_img: dataset/homo/infer/modulus/ratio_8/ratio_6_ratio_8/01_21_23_22
+src_img: dataset/Image_gen/modulus/ratio_8/ratio_6_ratio_8/01_21_23_22
 src_force: dataset/homo/modulus/force/ratio_6
 
 tar_img: dataset/homo/modulus/image/ratio_8
