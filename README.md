@@ -28,7 +28,7 @@ The GenForce model contains two modules:
 We test our code on NVIDIA A100, 80GB memory;
 Reduce batch_size if out of memory; 
 
-(Mininum memory > 8GB to run marker-to-marker translation model; Force prediction model can run < 8GB). 
+(Mininum memory = 8GB to run marker-to-marker translation model with bathsize=1). 
 - Install required denpendencied using our conda env file
 ```
 conda env create -f environment.yaml
