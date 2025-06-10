@@ -21,7 +21,7 @@ The GenForce model contains two modules:
 
 * **Marker-to-marker translation model** ([m2m](/m2m)). The m2m module is available to transfer the deformation across arbitrary marker representations. The first step is to train the model to bridge the source sensors and the target sensors using the m2m model.This end-to-end model enables direct translation of marker-based images from source images to generated images with the image style of target sensors while preserving the deformation from source sensors. This model is based on image-conditioned diffusion model, which is scalable with the increasing types of marker images. It can achieve many-to-many translation within one model and the generated image styles are chosen by the conditioned reference images.
 
-* **Force prediction model** ([force](/m2m)). After training m2m model, we can transfer all of the marker images with force labels from the old sensor to new sensors (get the generated images), allowing to use the transferred marker images and the existing labels to train force prediciton models to target sensors.
+* **Force prediction model** ([force](/force)). After training m2m model, we can transfer all of the marker images with force labels from the old sensor to new sensors (get the generated images), allowing to use the transferred marker images and the existing labels to train force prediciton models to target sensors.
 
 # Getting Started
 ## Environment
