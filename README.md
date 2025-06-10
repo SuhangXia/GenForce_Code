@@ -54,18 +54,20 @@ python sim/deformation/1_stl2npy.py  # generate .npy file for indenter used in s
 python sim/deformation/2_deformation.py # get elastomer deformation with different indenters and contact positions
 python sim/deformation/3_npz2stl.py # transfer .npz file to stl file for rendering marker images
 ```
-> The input files are in [input](sim/assets/indenters/input), and output files are in [output](sim/assets/indenters/output)
+> The input files are in [input](sim/assets/indenters/input), and output files are generated in [output](sim/assets/indenters/output)
 
 > For test the code only, no need to run 2_deformation.py to the end. Get some npz files can continue run step3-4 to see the results.
 
-> If want to get same amounts of data similar to our results, step 2_deformation.py
-need to finish
+> If want to get same amounts of data similar to our dataset, step 2_deformation.py
+need to finish.
 
 - Marker rendering
 ```
 blender -b --python sim/marker/4_render.py
 ```
-> Can modify your own design by the changing the marker pattern in sim/marker/marker_pattern
+> Our designed marker patterns are in [marker_pattern](sim/marker/marker_pattern). Generated marker images are in [marker](sim/assets/marker)
+
+> Can replace the marker patterns with real-world reference tactile images, such as from GelSight, to get realistic deformation.
 
 ### Real-world data collection (if want to deploy in your sensor)
 Setup needed: Robot arm (or any 3DoF moving platform), indenters, tactile sensors
