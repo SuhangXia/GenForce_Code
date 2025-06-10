@@ -1,4 +1,4 @@
-python m2m/m2m/train_m2m.py \
+python m2m/m2m/src/train_m2m.py \
     --output_dir=checkpoints/new/sim/ \
     --dataset_folder=dataset/training/sim \
     --resolution=256 --train_batch_size=1 --enable_xformers_memory_efficient_attention \
@@ -6,3 +6,4 @@ python m2m/m2m/train_m2m.py \
     --max_train_steps 100_000 --learning_rate 5e-5 --lambda_gan 0.5 --lambda_lpips 1 --lambda_l2 5 \
     --dataloader_num_workers 8 --num_training_epochs 1000 --checkpointing_steps 1000 \
     --pretrained_ref_encoder=checkpoints/m2m/vae/model_70000.pth \
+    --pretrained_model_name_or_path=checkpoints/m2m/sim/model_123501.pkl

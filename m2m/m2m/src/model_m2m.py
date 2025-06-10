@@ -135,6 +135,7 @@ class Marker2Marker(nn.Module):
         output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
         return output_image
 
+    # Deterministic
     # def forward(self, cur_s, ref_t, deformation_s=None, modulus_t=None):
     #     cur_s_enc = self.vae.encode(cur_s).latent_dist.mean * self.vae.config.scaling_factor
     #     condition_enc = self.ref_encoder.encode(ref_t).latent_dist.mean * self.ref_encoder.config.scaling_factor #bx4x32x32
