@@ -114,6 +114,7 @@ For utilizing the model on other sensors, users just need to collect location pa
 sh m2m/vae/marker_encoder.sh
 ```
 > skip this step if using our checkpoint: checkpoints/m2m/vae/model_70000.pth
+
 > You can change the arguments in the main function of [vae](m2m/vae/src/marker_encdoer.py)
 
 ### Step2. Pretraining with simulated data

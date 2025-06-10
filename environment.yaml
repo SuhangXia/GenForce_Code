@@ -4,11 +4,11 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - pytorch
-  - torchvision
   - pip
   - numpy
   - pip:
+      - torch==2.7.0
+      - torchvision==0.22.0
       - torchmetrics
       - torchdata
       - opencv-python
@@ -17,7 +17,7 @@ dependencies:
       - clip @ git+https://github.com/openai/CLIP.git
       - transformers
       - urllib3
-      - xformers
+      - xformers==0.0.30
       - streamlit-keyup
       - diffusers
       - gradio
@@ -37,4 +37,3 @@ dependencies:
       - pillow
       - scipy
       - timm
-
