@@ -101,14 +101,15 @@ loaded_image.show()
 
 ## 1. Training for maker-to-marker translation
 
-For reproducing, Step1 to Step3 are the process we trained our model for the experiments in our paper.
+Step1 to Step3 are the process we trained our model for the experiments in our paper.
 
 For utilizing the model on other sensors, users just need to collect location paired images as the trajectories used in our paper and finetune the model with the checkpoints in Step 3.
 
-> To successfully run below code, changing the dataset_folder/ argument in each .sh file with your dataset location.
+> To successfully run below code, change the dataset_folder/ argument in each .sh file within [folder](m2m/m2m) with your dataset location.
 
 ### Step1. Training for marker encoder
 - To train the maker-to-marker translation model, we first train a marker encoder for marker feature extraction. 
+In the root dir of this project, run
 ```
 sh m2m/vae/marker_encoder.sh
 ```
