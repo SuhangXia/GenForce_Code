@@ -78,9 +78,9 @@ Step 2. Marker segmentation
 
 #### Our Dataset
 
-> To test the genforce model, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). Download and unzip the dataset into dataset/, checkpoints into checkpoints/.
+> To test the genforce model, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). Download and unzip the dataset (/training and /img_gen) into dataset/, checkpoints (/training/checkpoints) into checkpoints/.
 
-> For only training the model, no need to use raw data.
+> For training the model only, no need to use raw_data as we have converted the raw images into marker images in /training.
 
 > All the marker images are saved with np.packbits() to reduce memory cost. To see the image use
 ```
