@@ -11,4 +11,5 @@ checkpoints/
 wandb/
 img_show.py
 dataset/
+infer/
 

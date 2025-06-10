@@ -147,6 +147,9 @@ sh m2m/m2m/infer/m2m_heter.sh
 ## 2. Inference for maker-to-marker translation
 
 Upon training m2m model, we can convert all the images with force labels from the source sensors to target sensors.
+
+> change the from --save_type=npy to --save_type=jpg can directly get images with .jpg format
+
 - homogeneous translation. 
 ```
 sh m2m/m2m/infer/m2m_infer_homo.sh
