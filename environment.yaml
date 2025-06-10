@@ -21,7 +21,7 @@ dependencies:
       - streamlit-keyup
       - diffusers
       - gradio
-      - wandb
+      - wandb==0.19.11
       - vision-aided-loss
       - clean-fid
       - dominate
