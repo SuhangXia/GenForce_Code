@@ -1,3 +1,7 @@
+
+# Change --dataset_folder, --pretrained_ref_encoder, --pretrained_model_name_or_path according to your path
+# Reduce batch_size if out of memory
+
 --train_real # if training with real-sensor dataset
 --output_dir=checkpoints/heter/ # output directory for the checkpoints
 --dataset_folder=dataset/m2m/hetero/img  # dataset folder
@@ -18,3 +22,4 @@
 --num_training_epochs 1000 # epochs
 --pretrained_ref_encoder=checkpoints/m2m/vae/model_70000.pth # checkpoints for marker encoder
 --pretrained_model_name_or_path=checkpoints/checkpoints/m2m/hetero/model_25501.pkl # checkpoints for m2m model
+
