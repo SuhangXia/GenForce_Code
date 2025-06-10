@@ -1,34 +1,20 @@
-name: genforce
+name: nmi
 channels:
   - pytorch
   - defaults
 dependencies:
   - python=3.10
+  - pytorch
+  - torchvision
   - pip
+  - numpy
   - pip:
-      - numpy
-      - lpips
-      - clean-fid
-      - peft
-      - dominate
-      - tokenizers
-      - tqdm
-      - taichi
-      - pytransform3d
-      - imageio
-      - open3d
-      - scikit-image
-      - opencv-python
-      - clip @ git+https://github.com/openai/CLIP.git
-      - torch
-      - torchdata
       - torchmetrics
-      - torchvision
+      - torchdata
+      - opencv-python
       - einops
       - open-clip-torch
-      - pillow
-      - scipy
-      - timm
+      - clip @ git+https://github.com/openai/CLIP.git
       - transformers
       - urllib3
       - xformers
@@ -37,3 +23,18 @@ dependencies:
       - gradio
       - wandb
       - vision-aided-loss
+      - clean-fid
+      - dominate
+      - lpips
+      - peft
+      - tokenizers
+      - tqdm
+      - taichi
+      - pytransform3d
+      - imageio
+      - open3d
+      - scikit-image
+      - pillow
+      - scipy
+      - timm
+
