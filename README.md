@@ -65,20 +65,22 @@ need to finish.
 ```
 blender -b --python sim/marker/4_render.py
 ```
-> Our designed marker patterns are in [marker_pattern](sim/marker/marker_pattern). Generated marker images are in [marker](sim/assets/marker)
+> Our designed marker patterns are in [marker_pattern](sim/marker/marker_pattern). Generated marker images are in [marker](sim/assets/marker) after running the code.
 
 > Can replace the marker patterns with real-world reference tactile images, such as from GelSight, to get realistic deformation.
 
-### Real-world data collection (if want to deploy in your sensor)
-Setup needed: Robot arm (or any 3DoF moving platform), indenters, tactile sensors
+### Real-world data collection (In real sensors)
+Setup needed: Robot arm (or any 3DoF moving platform), [indenters](sim/assets/indenters/input/stl), tactile sensors
 
 Step 1. Collect the data by referring to the trajectory in our paper. If want to use material compensation, force-depth curved needed to be measured.
 
 Step 2. Marker segmentation
 
-### Our Dataset
+#### Our Dataset
 
-> To test the genforce model, our dataset and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). Put the dataset into dataset/, checkpoints into checkpoints/
+> To test the genforce model, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). Download and unzip the dataset into dataset/, checkpoints into checkpoints/.
+
+> For only training the model, no need to use raw data.
 
 > All the marker images are saved with np.packbits() to reduce memory cost. To see the image use
 ```
