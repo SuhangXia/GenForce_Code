@@ -109,7 +109,7 @@ For utilizing the model on other sensors, users just need to collect location pa
 
 > Run the first time, you may need to configure your wandb account.
 
-> Note that, in training stage, we only four images, such as [images](dataset/training/homo/img/npy/Circle-II/moon/1/last.csv) listed in each contact point [folder](dataset/training/homo/img/npy/Circle-II/moon/1). While in inference stage, we convert them all. Thus, a majority of images are unseen in the training stage.
+> Note that, in training stage, we only use four images, such as [images](dataset/training/homo/img/npy/Circle-II/moon/1/last.csv) listed in each contact point [folder](dataset/training/homo/img/npy/Circle-II/moon/1). While in inference stage, we convert them all. Thus, a majority of images are unseen in the training stage.
 
 ### Step1. Training for marker encoder
 - To train the maker-to-marker translation model, we first train a marker encoder for marker feature extraction. 
