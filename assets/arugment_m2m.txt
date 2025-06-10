@@ -1,0 +1,20 @@
+--train_real # if training with real-sensor dataset
+--output_dir=checkpoints/heter/ # output directory for the checkpoints
+--dataset_folder=dataset/m2m/hetero/img  # dataset folder
+--resolution=256  # image resolution -- input
+--train_batch_size=1  # batch size
+--enable_xformers_memory_efficient_attention  # xformer for memory optimization
+--sensor_types gelsight uskin tactip   # sensors to train. Thoses names are same with the sensor folder names.  
+--unseen sphere_s triangle pacman cone wave torus dots # indenters set as unseen objects
+--viz_freq 25  # frequency to update wandb
+--report_to wandb  # use wandb
+--tracker_project_name genforce_heter  # name of wandb project
+--max_train_steps 100_000 # maximum training step
+--learning_rate 5e-5 # learning rate
+--lambda_gan 0.5 # weight for gan loss
+--lambda_lpips 1 # weight for lpips loss
+--lambda_l2 5  # weight for L2 loss
+--dataloader_num_workers 24  # num workers, set same as cpu corez
+--num_training_epochs 1000 # epochs
+--pretrained_ref_encoder=checkpoints/m2m/vae/model_70000.pth # checkpoints for marker encoder
+--pretrained_model_name_or_path=checkpoints/checkpoints/m2m/hetero/model_25501.pkl # checkpoints for m2m model
