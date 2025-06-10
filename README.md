@@ -19,7 +19,7 @@ A framework, GenForce, that enables transferable force sensing across tactile se
 
 The GenForce model contains two modules:
 
-* **Marker-to-marker translation model** ([m2m](/m2m)). The m2m module is available to transfer the deformation across arbitrary marker representations. The first step is to train the model to bridge the source sensors and the target sensors using the m2m model.This end-to-end model enables direct translation of marker-based images from source images to generated images with the image style of target sensors while preserving the deformation from source sensors. This model is based on image-conditioned diffusion model, which is scalable with the increasing types of marker images. It can achieve many-to-many translation and the generated image styles are chosen by the conditioned reference images.
+* **Marker-to-marker translation model** ([m2m](/m2m)). The m2m module is available to transfer the deformation across arbitrary marker representations. The first step is to train the model to bridge the source sensors and the target sensors using the m2m model.This end-to-end model enables direct translation of marker-based images from source images to generated images with the image style of target sensors while preserving the deformation from source sensors. This model is based on image-conditioned diffusion model, which is scalable with the increasing types of marker images. It can achieve many-to-many translation within one model and the generated image styles are chosen by the conditioned reference images.
 
 * **Force prediction model** ([force](/m2m)). After training m2m model, we can transfer all of the marker images with force labels from the old sensor to new sensors (get the generated images), allowing to use the transferred marker images and the existing labels to train force prediciton models to target sensors.
 
@@ -39,7 +39,7 @@ conda activate genforce
 
 ### Simulation for marker deformation
 
-> Marker simulation is used generate any marker deformation before real-world data collection and is helpful to get a pretrained M2M model. 
+> Marker simulation is used to generate any marker deformation before real-world data collection and is helpful to get a pretrained M2M model. 
 
 Tested in ubuntu 20.0. 
 
@@ -54,8 +54,10 @@ python sim/deformation/1_stl2npy.py  # generate .npy file for indenter used in s
 python sim/deformation/2_deformation.py # get elastomer deformation with different indenters and contact positions
 python sim/deformation/3_npz2stl.py # transfer .npz file to stl file for rendering marker images
 ```
-> The input files are in [input](sim/assets/indenters/input), and output files are in [input](sim/assets/indenters/output)
+> The input files are in [input](sim/assets/indenters/input), and output files are in [output](sim/assets/indenters/output)
+
 > For test the code only, no need to run 2_deformation.py to the end. Get some npz files can continue run step3-4 to see the results.
+
 > If want to get same amounts of data similar to our results, step 2_deformation.py
 need to finish
 
