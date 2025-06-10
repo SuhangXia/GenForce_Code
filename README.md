@@ -196,7 +196,7 @@ sh force/scripts/hetero/seen/com/grid/0_0.5.sh
 
 > argument: --src_depth means the path for contact depth files ;- -modulus means the material prior, saved with coefficient such as dataset/training/material_compensation/hetero/cofficient and dataset/training/material_compensation/modulus/cofficients/modulus. Note that, both files are in the dataset not in the repo.
 
-> Change the arg `modulus` in [.yaml](force/scripts/hetero/seen/com/gelsight/tactip_gelsight.yaml) as dataset/training/material_compensatin/xxxx(hetero)/cofficient 
+> Change the arg `modulus` in [.yaml](force/scripts/hetero/seen/com/gelsight/tactip_gelsight.yaml) as dataset/training/material_compensatin/xxxx(hetero)/cofficient. 
 
 # Citation 
 
