@@ -1,15 +1,15 @@
 task: Array-I_Array-II
 
-src_img: dataset/Image_gen/homo/Array-II/Array-I_Array-II/01_13_07_09
-src_force: dataset/training/training/homo/force/Array-I
+src_img: dataset/img_gen/homo/Array-II/Array-I_Array-II/01_13_07_09
+src_force: dataset/training/homo/force/Array-I
 
-tar_img: dataset/training/training/homo/img/npy/Array-II
-tar_force: dataset/training/training/homo/force/Array-II
+tar_img: dataset/training/homo/img/npy/Array-II
+tar_force: dataset/training/homo/force/Array-II
 
 min_max: force/config/min_max.json
 
-checkpoint: infer/force/Array-II/Array-I_Array-II/20250211_205151/epoch_40.pth
-save_dir: checkpoints/checkpoints/force//Array-II/{}
+checkpoint: checkpoints/force/homo/Array-II/Array-I_Array-II.pth
+save_dir: checkpoints/new/force//Array-II/{}
 
 unseen: ["sphere_s", "triangle", "pacman", "cone", "wave", "torus"]
 test_unseen: False

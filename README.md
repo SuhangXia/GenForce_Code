@@ -81,7 +81,7 @@ Step 2. Marker segmentation
 
 > To test the genforce model without data collection, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). 
 
-> Download and unzip the dataset (/training/training.zip, /training/material_compensation.zip, and /img_gen/Image_gen.zip) into dataset/, checkpoints (/training/checkpoints/m2m_checkpoint.zip, force_checkpoint.zip) into checkpoints/.
+> Download and unzip the dataset (/training.zip, /training/material_compensation.zip, and /img_gen/img_gen.zip) into dataset/, checkpoints (/training/checkpoints/m2m_checkpoint.zip, force_checkpoint.zip) into checkpoints/.
 
 > The final folder structure can refer to [dataset_folder](assets/folder_struc_dataset.txt)
 
@@ -169,12 +169,16 @@ sh m2m/m2m/infer/m2m_infer_heter.sh
 ```
 ## 3. Training for force prediciton models
 After inference, we get the generated images and force labels from the source sensors. We can use those data to train the force prediction model for each target sensor.
+
+> We provide some generated images and checkpoints in our dataset. Full generated images can use above inference to get other images if interested in.
+
 - homogeneous translation (run bash files in [Folder](force/scripts/homo))
+
 For example, to tranfer to Array-II
 ```
 sh force/scripts/homo/seen/m2m/Array-II/Array-II.sh
 ```
-> Change the path in the [.yaml](force/scripts/homo/seen/m2m/Array-II) file to your path. See [Argument](/argument_explanation.md) to config the .yaml file the root of .sh file.
+> Change the path in the [.yaml](force/scripts/homo/seen/m2m/Array-II) file to your path. See [Argument](/assets/argument_force.md) to config the .yaml file.
 
 - material softness effect. 
 For example, to tranfer to ratio8 without compensation ([wo_com](force/wo_com))
@@ -186,9 +190,13 @@ For example, to train all heterogeneous sensors with compensation [com](force/co
 ```
 sh force/scripts/hetero/seen/com/grid/0_0.5.sh
 ```
+> Folers named with /com include config file for material compensation; /wo_com include config files without compensation
+
 > Change the path in the [.yaml](force/scripts/hetero/seen/com/gelsight/tactip_gelsight.yaml) file to your path. 
 
-> Unzip material_compensation to dataset/training/, change the arg  `modulus` in [.yaml](force/scripts/hetero/seen/com/gelsight/tactip_gelsight.yaml) as dataset/training/material_compensatin/xxxx(hetero)/cofficient 
+> argument: --src_depth means the path for contact depth files ;- -modulus means the material prior, saved with coefficient such as dataset/training/material_compensation/hetero/cofficient and dataset/training/material_compensation/modulus/cofficients/modulus. Note that, both files are in the dataset not in the repo.
+
+> Change the arg `modulus` in [.yaml](force/scripts/hetero/seen/com/gelsight/tactip_gelsight.yaml) as dataset/training/material_compensatin/xxxx(hetero)/cofficient 
 
 # Citation 
 
