@@ -106,14 +106,21 @@ Step1 to Step3 are the process we trained our model for the experiments in our p
 For utilizing the model on other sensors, users just need to collect location paired images as the trajectories used in our paper and finetune the model with the checkpoints in Step 3.
 
 > To successfully run below code, change the --dataset_folder argument in each .sh file within [folder](m2m/m2m) with your dataset location. Explaination for the key arguments of .sh file in M2M, find [here](assets/arugment_m2m.txt)
+> Run the first, you may need to configure your wandb account.
 
 ### Step1. Training for marker encoder
 - To train the maker-to-marker translation model, we first train a marker encoder for marker feature extraction. 
 ```
 sh m2m/vae/marker_encoder.sh
 ```
+> skip this step if using our checkpoint: checkpoints/m2m/vae/model_70000.pth
+> You can change the arguments in the main function of [vae](m2m/vae/src/marker_encdoer.py)
+
 ### Step2. Pretraining with simulated data
 - We freeze marker encoder for the image condition and pretrain the m2m model with simulated data. 
+
+> change the ---output_dir, --dataset_folder and --pretrained_ref_encoder in [.sh](m2m/m2m/m2m_sim.sh) with your path
+
 ```
 sh m2m/m2m/m2m_sim.sh
 ```
