@@ -1,0 +1,36 @@
+dataset/
+├── heter
+│   ├── tactip_gelsight
+│   └── uskin_gelsight
+├── homo
+│   └── Array-II
+│       ├── Array-I_Array-II
+│       ├── Circle-I_Array-II
+│       ├── Circle-II_Array-II
+│       └── Diamond-I_Array-II
+└── modulus
+    └── ratio_8
+        ├── ratio_10_ratio_8
+        ├── ratio_12_ratio_8
+        ├── ratio_14_ratio_8
+        ├── ratio_16_ratio_8
+        ├── ratio_18_ratio_8
+        └── ratio_6_ratio_8
+└── training
+    ├── hetero
+    │   ├── depth
+    │   ├── force
+    │   └── img
+    ├── homo
+    │   ├── force
+    │   └── img
+    ├── material_compensation
+        ├── hetero
+        └── modulus
+    ├── modulus
+    │   ├── depth
+    │   ├── force
+    │   └── img
+    └── sim
+
+
