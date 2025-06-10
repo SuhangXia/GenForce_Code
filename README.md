@@ -82,7 +82,7 @@ Step 2. Marker segmentation
 
 > Download and unzip the dataset (/training/training.zip, /training/material_compensation.zip, and /img_gen/Image_gen.zip) into dataset/, checkpoints (/training/checkpoints/m2m_checkpoint.zip, force_checkpoint.zip) into checkpoints/.
 
-> The final folder structure can refer to [dataset_folder](/home/zhuo/git/nmi/GenForce_Code/assets/)
+> The final folder structure can refer to [dataset_folder](assets/folder_struc_dataset.txt)
 
 > For training the model only, no need to use raw_data as we have converted the raw images into marker images in /training.
 
