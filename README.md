@@ -19,16 +19,13 @@ A framework, GenForce, that enables transferable force sensing across tactile se
 
 The GenForce model contains two modules:
 
-* **Marker-to-marker translation model** ([m2m](/m2m)). The m2m module is available to transfer the deformation across arbitrary marker representations. The first step is to train the model to bridge the source sensors and the target sensors using the m2m model.This end-to-end model enables direct translation of marker-based images from source images to generated images with the image style of target sensors while preserving the deformation from source sensors .
+* **Marker-to-marker translation model** ([m2m](/m2m)). The m2m module is available to transfer the deformation across arbitrary marker representations. The first step is to train the model to bridge the source sensors and the target sensors using the m2m model.This end-to-end model enables direct translation of marker-based images from source images to generated images with the image style of target sensors while preserving the deformation from source sensors. This model is based on image-conditioned diffusion model, which is scalable with the increasing types of marker images. It can achieve many-to-many translation and the generated image styles are chosen by the conditioned reference images.
 
-* **Force prediction model** ([force](/m2m)). After training m2m model, we can transfer all of the marker images with force labels from the old sensor to new sensors, allowing to use the transferred marker images and the existing labels to train force prediciton models to target sensors.
+* **Force prediction model** ([force](/m2m)). After training m2m model, we can transfer all of the marker images with force labels from the old sensor to new sensors (get the generated images), allowing to use the transferred marker images and the existing labels to train force prediciton models to target sensors.
 
 # Getting Started
 ## Environment
-We test our code on NVIDIA A100, 80GB memory;
-Reduce batch_size if out of memory; 
-
-(Mininum memory = 8GB to run marker-to-marker translation model with bathsize=1). 
+We test our code on NVIDIA A100, 80GB memory. The mininum memory to run our code is 8GB with bathsize=1. Reduce batch_size if out of memory; 
 - Install required denpendencied using our conda env file
 ```
 conda env create -f environment.yaml
@@ -37,6 +34,46 @@ conda env create -f environment.yaml
 ```
 conda activate genforce
 ```
+
+## 0. Data Collection
+
+### Simulation for marker deformation
+
+> Marker simulation is used generate any marker deformation before real-world data collection and is helpful to get a pretrained M2M model. 
+
+Tested in ubuntu 20.0. 
+
+- Install `pcl-tools`, `blender`
+```
+sudo apt install pcl-tools
+sudo snap install blender --channel=3.3lts/stable --classic
+```
+- Elastomer deformation 
+```
+python sim/deformation/1_stl2npy.py  # generate .npy file for indenter used in simulation
+python sim/deformation/2_deformation.py # get elastomer deformation with different indenters and contact positions
+python sim/deformation/3_npz2stl.py # transfer .npz file to stl file for rendering marker images
+```
+> The input files are in [input](sim/assets/indenters/input), and output files are in [input](sim/assets/indenters/output)
+> For test the code only, no need to run 2_deformation.py to the end. Get some npz files can continue run step3-4 to see the results.
+> If want to get same amounts of data similar to our results, step 2_deformation.py
+need to finish
+
+- Marker rendering
+```
+blender -b --python sim/marker/4_render.py
+```
+> Can modify your own design by the changing the marker pattern in sim/marker/marker_pattern
+
+### Real-world data collection (if want to deploy in your sensor)
+Setup needed: Robot arm (or any 3DoF moving platform), indenters, tactile sensors
+
+Step 1. Collect the data by referring to the trajectory in our paper. If want to use material compensation, force-depth curved needed to be measured.
+
+Step 2. Marker segmentation
+
+### Our Dataset
+
 > To test the genforce model, our dataset and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). Put the dataset into dataset/, checkpoints into checkpoints/
 
 > All the marker images are saved with np.packbits() to reduce memory cost. To see the image use
@@ -50,35 +87,6 @@ loaded_image = np.unpackbits(loaded_image).reshape((480,640))*255
 loaded_image = Image.fromarray(loaded_image.astype(np.uint8)).convert('RGB')
 loaded_image.show()
 ```
-## 0. Data Collection
-
-### Simulation for marker deformation
-
-Tested in ubuntu 20.0
-
-- Install `pcl-tools`, `blender`
-```
-sudo apt install pcl-tools
-sudo snap install blender --channel=3.3lts/stable --classic
-```
-- Elastomer deformation 
-```
-python sim/deformation/1_stl2npy.py
-python sim/deformation/2_deformation.py
-python sim/deformation/3_npz2stl.py
-```
-- Marker rendering
-```
-blender -b --python sim/marker/4_render.py
-```
-> Can modify your own design by the changing the marker pattern in sim/marker/marker_pattern
-
-### Real-world data collection (if want to deploy in your sensor)
-Setup needed: Robot arm (or any 3DoF moving platform), indenters, tactile sensors
-
-Step 1. Collect the data by referring to the trajectory in our paper. If want to use material compensation, force-depth curved needed to be measured.
-
-Step 2. Marker segmentation
 
 ## 1. Training for maker-to-marker translation
 
