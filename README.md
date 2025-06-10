@@ -54,7 +54,7 @@ python sim/deformation/1_stl2npy.py  # generate .npy file for indenter used in s
 python sim/deformation/2_deformation.py # get elastomer deformation with different indenters and contact positions
 python sim/deformation/3_npz2stl.py # transfer .npz file to stl file for rendering marker images
 ```
-> The input files are in [input](sim/assets/indenters/input), and output files are generated in [output](sim/assets/indenters/output)
+> The input files are in [input](sim/assets/indenters/input), and output files are generated in sim/assets/indenters/output after running the code.
 
 > For test the code only, no need to run 2_deformation.py to the end. Get some npz files can continue run step3-4 to see the results.
 
@@ -70,6 +70,7 @@ blender -b --python sim/marker/4_render.py
 > Can replace the marker patterns with real-world reference tactile images, such as from GelSight, to get realistic deformation.
 
 ### Real-world data collection (In real sensors)
+
 Setup needed: Robot arm (or any 3DoF moving platform), [indenters](sim/assets/indenters/input/stl), tactile sensors
 
 Step 1. Collect the data by referring to the trajectory in our paper. If want to use material compensation, force-depth curved needed to be measured.
@@ -78,7 +79,7 @@ Step 2. Marker segmentation
 
 #### Our Dataset
 
-> To test the genforce model, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). 
+> To test the genforce model without data collection, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/ErEtoYdE9ORClPqQitlJi54BskYVqG-okHlEANpyqh2nsA?e=zwOhMs). 
 
 > Download and unzip the dataset (/training/training.zip, /training/material_compensation.zip, and /img_gen/Image_gen.zip) into dataset/, checkpoints (/training/checkpoints/m2m_checkpoint.zip, force_checkpoint.zip) into checkpoints/.
 
