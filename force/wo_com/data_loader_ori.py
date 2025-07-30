@@ -166,79 +166,71 @@ def compute_global_min_max(force_dir):
 
     return {"min": global_min.tolist(), "max": global_max.tolist()}, great_one_newton  
 
-# def collate_fn_random(batch, is_infer=False, window_size=10):
-#     """
-#     Collate function for batching fixed-length sliding windows with end-frame padding.
 
-#     Args:
-#         batch: List of sample dicts, each with keys: 'images', 'forces', 'length'
-#         is_infer: If True, always take window from the start; if False, randomly choose start for training
-#         window_size: Desired output window length (default 10)
+def collate_fn(batch, is_infer=False):  
+    """  
+    Custom collate function to handle varying sequence lengths (dynamic padding).  
+    Args:  
+        batch (list): List of samples, each containing `images`, `forces`, and `length`.  
+    Returns:  
+        images (torch.Tensor): Batched images of shape (max_seq, batch_size, c, h, w).  
+        forces (torch.Tensor): Batched forces of shape (max_seq, batch_size, 3).  
+        lengths (torch.Tensor): Sequence lengths for each batch item.  
+    """  
+    # Find the maximum sequence length in the batch  
+    max_length = max(item["length"] for item in batch)  
+    min_length = min(item["length"] for item in batch)  
 
-#     Returns:
-#         batch_images: Tensor, shape (window_size, batch, C, H, W)
-#         batch_forces: Tensor, shape (window_size, batch, 3)
-#     """
-#     batch_images = []
-#     batch_forces = []
+    # Randomly sample the sequence length from 2 to max_length  
+    if not is_infer:
+        s0 = 0
+        s = random.randint(2, max_length)  
+
+        # hetero1
+        # s0 = random.randint(0, max_length-1)  
+        # s = random.randint(s0+1, max_length)  
+
+        #hetero2
+        # s0 = random.randint(0, max_length-1)  
+        # s = s0+1
+ 
+    else:
+        # hetero
+        # s0 = random.randint(0, max_length-1)  
+        # s = s0+1
+        s0 = 0
+        s = max_length
     
-#     for item in batch:
-#         images = torch.stack(item["images"])  # (seq_len, C, H, W)
-#         forces = torch.tensor(item["forces"], dtype=torch.float32)  # (seq_len, 3)
-#         length = item["length"]
-#         if is_infer:
-#             win_images = images
-#             win_forces = forces
-#         else:
-#             if length >= window_size:
-#                 # Pick the window start index
-#                 s0 = random.randint(0, length - window_size)  # For training, random window start
-#                 s1 = s0 + window_size
-#                 win_images = images[s0:s1]
-#                 win_forces = forces[s0:s1]
-#             else:
-#                 # If sequence shorter than window_size, pad with last frame/row
-#                 pad_len = window_size - length
-#                 pad_img = images[-1:].repeat(pad_len, 1, 1, 1)  # Pad images with last frame
-#                 pad_for = forces[-1:].repeat(pad_len, 1)        # Pad forces with last row
-#                 win_images = torch.cat([images, pad_img], dim=0)
-#                 win_forces = torch.cat([forces, pad_for], dim=0)
-            
-#         batch_images.append(win_images)    # (window_size, C, H, W)
-#         batch_forces.append(win_forces)    # (window_size, 3)
+    # s = random.randint(2, max_length) 
+    # print(f"s:{s}/{max_length}") 
+    # Batch images (padded to max_length)  
+    batch_images = []  
+    for item in batch:  
+        images = torch.stack(item["images"])  # Current sequence (s, c, h, w)  
+        pad_size = s - images.shape[0]  
+        if pad_size > 0:  # Pad sequence with last frame  
+            padding = images[-1:].repeat(pad_size, 1, 1, 1)  # Repeat the last frame to pad  
+            images = torch.cat([images, padding], dim=0)  
+        # batch_images.append(images[:s])  
+        # hetero
+        batch_images.append(images[s0:s])  
+    batch_images = torch.stack(batch_images, dim=1)  # Shape: (max_seq, batch_size, c, h, w)  
 
-#     # Stack batches into shape: (window_size, batch, ...)
-#     batch_images = torch.stack(batch_images, dim=1)  # (window_size, batch, C, H, W)
-#     batch_forces = torch.stack(batch_forces, dim=1)  # (window_size, batch, 3)
-#     return batch_images, batch_forces
+    # Batch forces (padded to max_length)  
+    batch_forces = []  
+    for item in batch:  
+        forces = torch.tensor(item["forces"], dtype=torch.float32)  # Current forces (s, 3)  
+        pad_size = s - forces.shape[0]  
+        if pad_size > 0:  # Pad sequence with last row  
+            padding = forces[-1:].repeat(pad_size, 1)  # Repeat the last row to pad  
+            forces = torch.cat([forces, padding], dim=0)  
+        # batch_forces.append(forces[:s])  
+        # hetero
+        batch_forces.append(forces[s0:s])  
+    batch_forces = torch.stack(batch_forces, dim=1)  # Shape: (max_seq, batch_size, 3)  
 
-
-def collate_fn(batch, window_size=3, is_infer=False):
-    imgs_list = []
-    forces_list = []
-
-    for item in batch:
-        images = torch.stack(item["images"])     # (T, C, H, W)
-        forces = torch.tensor(item["forces"], dtype=torch.float32)   # (T, 3)
-        T = images.shape[0]
-        frame_shape = images.shape[1:]
-
-        for t in range(T):
-            num_pad = window_size - (t + 1)
-            if num_pad > 0:
-                pad_img = images[0:1].repeat(num_pad, 1, 1, 1)
-                pad_for = forces[0:1].repeat(num_pad, 1)
-                win_img = torch.cat([pad_img, images[:t+1]], dim=0)
-                win_for = torch.cat([pad_for, forces[:t+1]], dim=0)
-            else:
-                win_img = images[t-window_size+1:t+1]
-                win_for = forces[t-window_size+1:t+1]
-            imgs_list.append(win_img)   # (window_size, C, H, W)
-            forces_list.append(win_for) # (window_size, 3)
-
-    batch_images = torch.stack(imgs_list, dim=1)   # (window_size, batch_total, C, H, W)
-    batch_forces = torch.stack(forces_list, dim=1) # (window_size, batch_total, 3)
     return batch_images, batch_forces
+
 
 def create_dataloader(img_dir, force_dir, force_filter_list, global_min_max, args, shuffle=True):  
     """  

@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from gru import ConvGRU
 from extractor import FeatureEncoder, ResidualBlock
 
@@ -35,7 +34,6 @@ class TemporalForce(nn.Module):
             nn.Sigmoid()  
         )  
 
-
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -66,6 +64,7 @@ class TemporalForce(nn.Module):
         # Forward through Post processing  
         outputs = outputs.view(-1, self.feature_dim, 32, 32)   # Shape: (s * b, hidden_dim, 32, 32)  
         outputs = self.post_processing(outputs)  # Shape: (s * b, 512, 1, 1)  
+        
         # Forward through Reg Layer  
         outputs =  outputs.view(-1, 512)  # Shape: (s * b, 512)  
         outputs= self.reg_layer(outputs)  # Shape: (s * b, 3) 
