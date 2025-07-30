@@ -1,10 +1,10 @@
 task: ratio_6_ratio_8
 
-src_img: dataset/Image_gen/modulus/ratio_8/ratio_6_ratio_8/01_21_23_22
-src_force: dataset/training/training/modulus/force/ratio_6
+src_img: dataset/img_gen/modulus/ratio_8/ratio_6_ratio_8/01_21_23_22
+src_force: dataset/training/modulus/force/ratio_6
 
-tar_img: dataset/training/training/modulus/img/ratio_8
-tar_force: dataset/training/training/modulus/force/ratio_8
+tar_img: dataset/training/modulus/img/ratio_8
+tar_force: dataset/training/modulus/force/ratio_8
 
 min_max: force/config/min_max.json
 

@@ -7,8 +7,9 @@ gif/
 *.ply
 *.npz
 *.jpg
-dataset/
 checkpoints/
 wandb/
 img_show.py
-sim/assets/indenters/output/
+dataset/
+infer/
+

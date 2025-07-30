@@ -1,17 +1,17 @@
 task: uskin_gelsight
 
-src_img: dataset/Image_gen/heter/uskin_gelsight/genforce/infer/hetero/final_force/uskin_gelsight/02_25_21_14
-src_force: dataset/training/training/hetero/force/uskin
+src_img: dataset/img_gen/heter/uskin_gelsight/genforce/infer/hetero/final_force/uskin_gelsight/02_25_21_14
+src_force: dataset/training/hetero/force/uskin
 
-tar_img: dataset/training/training/hetero/img/gelsight
-tar_force: dataset/training/training/hetero/force/gelsight
+tar_img: dataset/training/hetero/img/gelsight
+tar_force: dataset/training/hetero/force/gelsight
 
 min_max: force/config/min_max.json
 
 checkpoint: infer/force_com/hetero/uskin_gelsight/20250305_015626/epoch_20.pth
 save_dir: infer/force_com/hetero/{}
 
-src_depth: dataset/training/training/hetero/depth/uskin
+src_depth: dataset/training/hetero/depth/uskin
 modulus: dataset/training/material_compensatin/hetero/cofficient
 
 unseen: ["sphere_s", "triangle", "pacman", "cone", "wave", "torus","dots"]

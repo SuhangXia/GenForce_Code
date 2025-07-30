@@ -304,7 +304,7 @@ def main():
         "gradient_accumulation_steps": 4,  
         "learning_rate": 1e-4,  
         "max_train_steps": 100000,  
-        "output_dir": "checkpoints/marker_encoder",  
+        "output_dir": "checkpoints/new/marker_encoder",  
         "mixed_precision": "fp16",
         "lora_rank": 4,
         "checkpoint_path": None
@@ -313,7 +313,7 @@ def main():
     trainer = MarkerEncoder(**config)  
     
     trainer.train(  
-        data_dir="dataset/m2m/sim",  
+        data_dir="dataset/training/sim",  
         num_epochs=100,  
         save_steps=1000,  
         log_steps=100  

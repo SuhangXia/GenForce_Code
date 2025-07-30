@@ -242,6 +242,8 @@ class PairedDatasetSim(Dataset):
             source_image = self.transform(source_image)
             target_image = self.transform(target_image)
             target_ref_image = self.transform(target_ref_image)
+        
+        # target_image = F.normalize(target_image,mean=[0.5],std=[0.5])
             
         return {
             'source': source_image,
