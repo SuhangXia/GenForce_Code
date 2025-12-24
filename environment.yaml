@@ -29,7 +29,7 @@ dependencies:
       - peft
       - tokenizers
       - tqdm
-      - taichi
+      - taichi==1.6
       - pytransform3d
       - imageio
       - open3d
