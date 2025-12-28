@@ -6,6 +6,8 @@ The code for paper:
 
 (published in **Nature Communiations 2026**)
 
+![image](assets/Nature_Communications_Logo.png)
+
 [Project page](https://zhuochenn.github.io/genforce-project/). 
 
 Zhuo Chen1, Ni Ou1, Xuyang Zhang1, Zhiyuan Wu1, Yongqiang Zhao1, Yupeng Wang1, Nathan Lepora2, Lorenzo Jamone3, Jiankang Deng4, Shan Luo1
