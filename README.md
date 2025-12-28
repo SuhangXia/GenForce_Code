@@ -11,14 +11,6 @@ The code for paper:
 
 [Project page](https://zhuochenn.github.io/genforce-project/). 
 
-Zhuo Chen1, Ni Ou1, Xuyang Zhang1, Zhiyuan Wu1, Yongqiang Zhao1, Yupeng Wang1, Nathan Lepora2, Lorenzo Jamone3, Jiankang Deng4, Shan Luo1
-
-- 1 King’s College London, London, United Kingdom.
-- 2 University of Bristol, Bristol, United Kingdom.
-- 3 University College London, London, United Kingdom.
-- 4 Imperial College London, London, United Kingdom.
-
-
 
 
 # Overview
