@@ -3,6 +3,7 @@
 The code for paper:
 
 **Training Tactile Sensors to Learn Force Sensing from Each Other**
+
 (published in **Nature Communiations 2026**)
 
 [Project page](https://zhuochenn.github.io/genforce-project/). 
