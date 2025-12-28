@@ -71,11 +71,13 @@ blender -b --python sim/marker/4_render.py
 
 ### Real-world data collection (In real sensors)
 
-Setup needed: Robot arm (or any 3DoF moving platform), [indenters](sim/assets/indenters/input/stl), tactile sensors
+Setup: Robot arm (or any 3DoF moving platform), [indenters](sim/assets/indenters/input/stl), tactile sensors
 
-Step 1. Collect the data by referring to the trajectory in our paper. If want to use material compensation, force-depth curved needed to be measured.
+> We use ur5e + ATI nano 17 in our paper, see paper and code [data_collection](data_collection/components/).
 
-Step 2. Marker segmentation
+Step 1. Collect the data by referring to the trajectory and code in our paper. If want to use material compensation, force-depth curved needed to be measured.
+
+Step 2. Marker segmentation, see code [segmentation](data_collection/marker_seg)
 
 #### Our Dataset
 
@@ -85,7 +87,7 @@ Step 2. Marker segmentation
 
 > The final folder structure can refer to [dataset_folder](assets/folder_struc_dataset.txt)
 
-> For training the model only, no need to use raw_data as we have converted the raw images into marker images in /training.
+> For training the model only, no need to use raw_data as we have converted some of the raw images into marker images in /training.
 
 > All the marker images are saved with np.packbits() to reduce memory cost. To see the image use
 ```

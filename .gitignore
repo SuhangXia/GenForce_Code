@@ -12,4 +12,8 @@ wandb/
 img_show.py
 dataset/
 infer/
+npy_100000/
+pcd_100000/
+ply/
+output/
 
