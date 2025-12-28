@@ -1,0 +1,17 @@
+<launch>
+    <arg name="sensor2" default="uskin"/>
+    <!-- <arg name="checkpoint2" default="DI_uskin"/> -->
+    <arg name="checkpoint2" default="tactip_uskin"/>
+    <!-- <arg name="checkpoint2" default="uskin"/> -->
+
+    <node pkg="genforce" type="uskin_publisher.py" name="uskin_publisher" output="screen" />
+    <node pkg="genforce" type="force.py" name="force_uskin" output="screen" >
+            <param name="sensor_id" value="$(arg sensor2)"/>
+            <param name="checkpoint" value="$(arg checkpoint2)"/>
+    </node>
+
+
+
+
+</launch>
+

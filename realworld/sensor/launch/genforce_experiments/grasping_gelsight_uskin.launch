@@ -1,0 +1,39 @@
+<launch>
+    <arg name="sensor1" default="AII"/>
+    <arg name="sensor2" default="uskin"/>
+    <arg name="checkpoint1" default="DI_AII_npy"/>
+    <arg name="checkpoint2" default="DI_uskin"/>
+    <arg name="cam_id" default="6"/>
+
+    <node pkg="genforce" type="gelsight_publisher.py" name="uskin_publisher" output="screen">
+        <param name="cam_id" value="$(arg cam_id)"/>
+        <param name="sensor_id" value="$(arg sensor1)"/>
+    </node>
+    
+    <node pkg="genforce" type="uskin_publisher.py" name="uskin_publisher" output="screen" />
+    <node pkg="genforce" type="force.py" name="force_gelsight" output="screen" >
+            <param name="sensor_id" value="$(arg sensor1)"/>
+            <param name="checkpoint" value="$(arg checkpoint1)"/>
+    </node>
+
+    <node pkg="genforce" type="force.py" name="force_uskin" output="screen" >
+            <param name="sensor_id" value="$(arg sensor2)"/>
+            <param name="checkpoint" value="$(arg checkpoint2)"/>
+    </node>
+
+    <!-- realsense node -->
+    <!-- <arg name="color_fps" default="60"/>
+    <arg name="color_width" default="640"/>
+    <arg name="color_height" default="360" />
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+      <arg name="color_fps" value="$(arg color_fps)"/>
+      <arg name="color_width" value="$(arg color_width)" />
+      <arg name="color_height" value="$(arg color_height)" />
+    </include> -->
+
+    <!-- <node pkg="genforce" type="data_show.py" name="data_show" output="screen" /> -->
+
+
+
+</launch>
+

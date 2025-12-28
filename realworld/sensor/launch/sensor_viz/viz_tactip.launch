@@ -1,0 +1,9 @@
+<launch>
+
+    <!-- tactip -->
+    <node pkg="genforce" type="tactip_publisher.py" name="tactip_publisher" output="screen" >
+        <param name="cam_id" value="6"/>
+    </node>
+
+
+</launch>

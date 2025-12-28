@@ -1,0 +1,49 @@
+<launch>
+    <arg name="sensor1" default="AII"/>
+    <arg name="sensor2" default="uskin"/>
+    <arg name="checkpoint1" default="AII"/>
+    <arg name="checkpoint2" default="uskin"/>
+    <arg name="cam_id" default="6"/>
+
+    <node pkg="genforce" type="gelsight_publisher.py" name="uskin_publisher" output="screen">
+        <param name="cam_id" value="$(arg cam_id)"/>
+        <param name="sensor_id" value="$(arg sensor1)"/>
+    </node>
+    
+    <node pkg="genforce" type="uskin_publisher.py" name="uskin_publisher" output="screen" />
+    <node pkg="genforce" type="force.py" name="force_gelsight" output="screen" >
+            <param name="sensor_id" value="$(arg sensor1)"/>
+            <param name="checkpoint" value="$(arg checkpoint1)"/>
+    </node>
+    <!-- <node pkg="genforce" type="force_gelsight.py" name="force_gelsight" output="screen" /> -->
+
+    <node pkg="genforce" type="force.py" name="force_uskin" output="screen" >
+            <param name="sensor_id" value="$(arg sensor2)"/>
+            <param name="checkpoint" value="$(arg checkpoint2)"/>
+    </node>
+
+    <node pkg="rqt_image_view" type="rqt_image_view" name="image_view_gelsight" output="screen"  args="/$(arg sensor1)/marker
+    "/>
+    <!-- <node pkg="rqt_image_view" type="rqt_image_view" name="image_view_marker_arrow" output="screen" args="/$(arg sensor1)/marker_arrow"/> -->
+    <node pkg="rqt_image_view" type="rqt_image_view" name="image_view_uskin" output="screen" args="/$(arg sensor2)/marker"/>
+    <node pkg="rqt_plot" type="rqt_plot" name="plot_gelsight_xy" output="screen" args="/force/$(arg sensor1)/x /force/$(arg sensor1)/y "/>
+    <node pkg="rqt_plot" type="rqt_plot" name="plot_gelsight_z" output="screen" args="/force/$(arg sensor1)/z"/>
+    <node pkg="rqt_plot" type="rqt_plot" name="plot_uskin_xy" output="screen" args="/force/$(arg sensor2)/x /force/$(arg sensor2)/y"/>
+    <node pkg="rqt_plot" type="rqt_plot" name="plot_uskin_z" output="screen" args="/force/$(arg sensor2)/z"/>
+
+
+    <!-- realsense node -->
+    <arg name="color_fps" default="60"/>
+    <arg name="color_width" default="640"/>
+    <arg name="color_height" default="360" />
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+      <arg name="color_fps" value="$(arg color_fps)"/>
+      <arg name="color_width" value="$(arg color_width)" />
+      <arg name="color_height" value="$(arg color_height)" />
+    </include>
+
+    <node pkg="rqt_image_view" type="rqt_image_view" name="rqt_image_view_realsense2" output="screen" args="/camera/color/image_raw"/>
+
+
+</launch>
+

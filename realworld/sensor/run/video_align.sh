@@ -1,0 +1,13 @@
+python video_align.py --video_root video/ --name box_20250806_174234.mp4
+python video_align.py --video_root video/ --name box_20250806_174443.mp4
+python video_align.py --video_root video/ --name notebook_20250806_175525.mp4
+python video_align.py --video_root video/ --name orange_20250806_171125.mp4
+python video_align.py --video_root video/ --name orange_20250806_171151.mp4
+python video_align.py --video_root video/ --name orange_20250806_171345.mp4
+python video_align.py --video_root video/ --name orange_20250806_173619.mp4
+python video_align.py --video_root video/ --name orange_20250806_173836.mp4
+python video_align.py --video_root video/ --name orange_20250806_174047.mp4
+python video_align.py --video_root video/ --name pen_20250806_175306.mp4
+python video_align.py --video_root video/ --name plum_20250806_174635.mp4
+python video_align.py --video_root video/ --name tea_box_20250806_175022.mp4
+python video_align.py --video_root video/ --name wood_20250806_175821.mp4

@@ -1,0 +1,1 @@
+python video_align_auto.py --root video/ 

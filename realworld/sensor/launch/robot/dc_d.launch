@@ -1,0 +1,19 @@
+<launch>
+
+    <node pkg="genforce" type="robot_publisher.py" name="robot_publisher" output="screen"/>
+    <node pkg="genforce" type="uskin_publisher.py" name="uskin_publisher" output="screen"/>
+
+    <node pkg="genforce" type="gelsight_publisher.py" name="gelsight_publisher" output="screen">
+        <param name="cam_port" value="10"/>
+    </node>
+
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+        <arg name="enable_gyro" value="true"/>
+        <arg name="enable_accel" value="true"/>
+        <arg name="unite_imu_method" value="linear_interpolation"/>
+    </include>
+
+    <include file="$(find aruco_ros)/launch/single.launch"/>
+    <node pkg="genforce" type="syn_publisher.py" name="syn_publisher" output="screen"/>
+
+</launch>

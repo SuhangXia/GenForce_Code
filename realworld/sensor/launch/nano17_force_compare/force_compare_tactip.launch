@@ -1,0 +1,14 @@
+<launch>
+    <arg name="sensor1" default="tactip"/>
+    <arg name="checkpoint1" default="DI_tactip"/>
+    <!-- <arg name="checkpoint2" default="uskin"/> -->
+
+    <node pkg="genforce" type="tactip_publisher.py" name="tactip_publisher" output="screen" />
+    <node pkg="genforce" type="force.py" name="force_tactip" output="screen" >
+            <param name="sensor_id" value="$(arg sensor1)"/>
+            <param name="checkpoint" value="$(arg checkpoint1)"/>
+    </node>
+
+
+</launch>
+

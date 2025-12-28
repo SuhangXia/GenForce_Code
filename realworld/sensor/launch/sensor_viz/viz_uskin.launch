@@ -1,0 +1,6 @@
+<launch>
+
+    <!-- uskin -->
+    <node pkg="genforce" type="uskin_publisher.py" name="uskin_publisher" output="screen"/>
+
+</launch>
