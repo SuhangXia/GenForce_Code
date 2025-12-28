@@ -6,6 +6,7 @@ The code for paper:
 
 (published in **Nature Communiations 2026**)
 
+![image](assets/cover.jpg)
 ![image](assets/Nature_Communications_Logo.png)
 
 [Project page](https://zhuochenn.github.io/genforce-project/). 
@@ -18,7 +19,7 @@ Zhuo Chen1, Ni Ou1, Xuyang Zhang1, Zhiyuan Wu1, Yongqiang Zhao1, Yupeng Wang1, N
 - 4 Imperial College London, London, United Kingdom.
 
 
-![image](assets/cover.jpg)
+
 
 # Overview
 A framework, GenForce, that enables transferable force sensing across tactile sensors. GenForce unifies tactile signals into shared marker representations, analogous to cortical sensory encoding, allowing force prediction models trained on one sensor to be transferred to others without the need for exhaustive force data collection.  More Details can be found in our paper.
