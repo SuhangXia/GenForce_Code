@@ -1,6 +1,6 @@
 task: uskin_gelsight
 
-src_img: dataset/img_gen/heter/uskin_gelsight/genforce/infer/hetero/final_force/uskin_gelsight/02_25_21_14
+src_img: dataset/img_gen/heter/uskin_gelsight/02_25_21_14
 src_force: dataset/training/hetero/force/uskin
 
 tar_img: dataset/training/hetero/img/gelsight
@@ -12,7 +12,7 @@ checkpoint: infer/force_com/hetero/uskin_gelsight/20250305_015626/epoch_20.pth
 save_dir: infer/force_com/hetero/{}
 
 src_depth: dataset/training/hetero/depth/uskin
-modulus: dataset/training/material_compensatin/hetero/cofficient
+modulus: dataset/training/material_compensation/hetero/cofficient
 
 unseen: ["sphere_s", "triangle", "pacman", "cone", "wave", "torus","dots"]
 test_unseen: False

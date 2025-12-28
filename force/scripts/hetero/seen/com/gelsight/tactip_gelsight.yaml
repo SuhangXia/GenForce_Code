@@ -1,6 +1,6 @@
 task: tactip_gelsight
 
-src_img: dataset/img_gen/heter/tactip_gelsight/genforce/infer/hetero/final_force/tactip_gelsight/02_26_03_25
+src_img: dataset/img_gen/heter/tactip_gelsight/02_26_03_25
 src_force: dataset/training/hetero/force/tactip
 
 tar_img: dataset/training/hetero/img/gelsight
@@ -12,7 +12,7 @@ checkpoint: infer/force_com/hetero/tactip_gelsight/20250304_155035/epoch_20.pth
 save_dir: infer/force_com/hetero/{}
 
 src_depth: dataset/training/hetero/depth/tactip
-modulus: dataset/training/material_compensatin/hetero/cofficient
+modulus: dataset/training/material_compensation/hetero/cofficient
 
 unseen: ["sphere_s", "triangle", "pacman", "cone", "wave", "torus","dots"]
 test_unseen: False
