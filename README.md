@@ -210,7 +210,9 @@ sh force/scripts/hetero/seen/com/grid/0_0.5.sh
 After obtaining force prediction models, we can use those models on robot grapsing and slip compensation.
 
 > we use ROS1 to brige sensors and franka fr3 robot arm/hand
+
 > code for sensors can be found [sensor](realworld/sensor)
+
 > code for robot can be found [franka](realworld/franka)
 
 # Citation 
