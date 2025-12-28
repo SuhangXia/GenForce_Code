@@ -141,17 +141,17 @@ sh m2m/m2m/m2m_sim.sh
 #### homogeneous translation
 - Finetuning the m2m model with homogeneous data. 
 ```
-sh m2m/m2m/infer/m2m_homo.sh
+sh m2m/m2m/m2m_homo.sh
 ```
 #### material softness effect
 - Finetuning the m2m model with material softness effect data. 
 ```
-sh m2m/m2m/infer/m2m_modulus.sh
+sh m2m/m2m/m2m_modulus.sh
 ```
 #### homogeneous translation
 - Finetuning the m2m model with homogeneous data. 
 ```
-sh m2m/m2m/infer/m2m_heter.sh
+sh m2m/m2m/m2m_heter.sh
 ```
 ## 2. Inference for maker-to-marker translation
 
