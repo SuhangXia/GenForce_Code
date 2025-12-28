@@ -6,7 +6,7 @@ The code for paper:
 
 (published in **Nature Communiations 2026**)
 
-![image](assets/Nature_Communications_Logo.jpg)
+![image](assets/Nature_Communications_Logo.png)
 
 [Project page](https://zhuochenn.github.io/genforce-project/). 
 
