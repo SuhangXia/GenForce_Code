@@ -94,7 +94,7 @@ Step 2. Marker segmentation, see code [segmentation](data_collection/marker_seg)
 
 > For training the model only, no need to use raw_data as we have converted some of the raw images into marker images in /training.
 
-> All the marker images are saved with np.packbits() to reduce memory cost. To see the image use
+> All the marker images are saved using np.packbits() with smaller size and higher quality. To see the image, use
 ```
 from PIL import Image
 import numpy as np
