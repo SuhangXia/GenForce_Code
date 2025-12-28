@@ -217,6 +217,45 @@ After obtaining force prediction models, we can use those models on robot grapsi
 
 # Citation 
 
+```
+ @article{chen2026genforce,
+  title={Training Tactile Sensors to Learn Force Sensing from Each Other},
+  author={Chen, Zhuo and Ou, Ni and Zhang, Xuyang and Wu, Zhiyuan
+          and Zhao, Yongqiang and Wang, Yupeng and Papastavridis, EmmanouilSpyrakos and Lepora, Nathan
+          and Jamone, Lorenzo and Deng, Jiankang and Luo, Shan},
+  journal={Nature Communications},
+  year={2026}
+
+  @inproceedings{chen2025transforce,
+  title={Transforce: Transferable force prediction for vision-based tactile sensors with sequential image translation},
+  author={Chen, Zhuo and Ou, Ni and Zhang, Xuyang and Luo, Shan},
+  booktitle={2025 IEEE International Conference on Robotics and Automation (ICRA)},
+  pages={237--243},
+  year={2025},
+  organization={IEEE}
+  }
+
+  @inproceedings{chen2024deep,
+  title={Deep domain adaptation regression for force calibration of optical tactile sensors},
+  author={Chen, Zhuo and Ou, Ni and Jiang, Jiaqi and Luo, Shan},
+  booktitle={2024 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  pages={13561--13568},
+  year={2024},
+  organization={IEEE}
+  }
+
+  @article{ou2024marker,
+  title={Marker or markerless? mode-switchable optical tactile sensing for diverse robot tasks},
+  author={Ou, Ni and Chen, Zhuo and Luo, Shan},
+  journal={IEEE Robotics and Automation Letters},
+  year={2024},
+  publisher={IEEE}
+  }
+
+}
+
+```
+
 # Contact
 Any questions, feel free to reach out to:
 
