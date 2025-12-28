@@ -1,0 +1,19 @@
+stream:
+  ip: "192.168.0.103"
+  markers_h: 5
+  markers_w: 7
+  marker_distance: 2.4
+  mmpp: 0.0249  # 0.0267
+  selected_corners: [(19, 3), (639, 3), (639, 445), (28, 450)] # TL, TR, BR, BL
+  has_marker: false
+  marker_pixel_size: 9
+  resize_ratio: 1.0
+
+calibration:
+  ball_diam: 5 # mm unit
+
+io:
+  input_dir: "../imgs/"
+  mask_cache: "../cache/"
+  use_cache: true
+  

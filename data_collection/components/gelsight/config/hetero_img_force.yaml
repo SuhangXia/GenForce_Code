@@ -1,0 +1,14 @@
+#Nano17
+nano17:
+  num_channels: 6
+  x_timeMax: 20
+  frames: 10*5
+  interval: 1000
+  baseline_count: 50
+
+#GelSight
+GelSight:
+  port: 0
+
+#Indenter
+Indenter: dotin

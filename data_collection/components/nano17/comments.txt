@@ -1,0 +1,8 @@
+1.nano 17 api code
+2.ur5 matlab control
+
+
+------------------------------------
+
+1."read_nano17.py" handles nano 17 data reading.
+2."ur5_run.m" manages the UR5 peg routing.

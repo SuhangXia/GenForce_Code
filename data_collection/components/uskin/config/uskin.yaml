@@ -1,0 +1,35 @@
+#Nano17
+nano17:
+  num_channels: 6
+  x_timeMax: 20
+  frames: 10*5
+  interval: 1000
+  baseline_count: 50
+
+#GelSight
+GelSight:
+  port: 1
+
+#Indenter
+Indenter: cone
+
+#robo
+robo:
+  a: 0.1
+  v: 0.1 #10% on pane
+  frequency: 40   # 
+
+
+ip: 10.40.101.10
+
+
+path:
+  stepX: 0.005
+  stepY: 0.007
+  stepZ: 0.00025
+  maxZ: 0.001
+  angleN: 8
+  radius: 0.001
+
+modulus:
+  depth: 0.001 
