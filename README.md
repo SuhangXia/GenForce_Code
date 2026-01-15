@@ -4,7 +4,7 @@ The code for paper:
 
 **Training Tactile Sensors to Learn Force Sensing from Each Other**
 
-(published in **Nature Communiations 2026**)
+(published in **Nature Communications 2026**)
 
 ![image](assets/cover.png)
 
@@ -79,7 +79,7 @@ Step 2. Marker segmentation, see code [segmentation](data_collection/marker_seg)
 
 #### Our Dataset
 
-> To test the genforce model without data collection, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://emckclac-my.sharepoint.com/:f:/g/personal/k23058530_kcl_ac_uk/IgCxLaGHRPTkQpT6kIrZSYueAbJGFahvqJB5RADacqodp7A). 
+> To test the genforce model without data collection, our dataset (simulation and real-world) and checkpoints can be downloaded from [Dataset](https://huggingface.co/datasets/zhuoKCL/genforce)in Hugginface. 
 
 
 
