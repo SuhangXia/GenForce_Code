@@ -13,7 +13,7 @@ Output layout:
         scale_15mm/
           marker_Array1.jpg
           ...
-          patch_coords_16x16.json
+          adapter_coord_map.npy
         scale_16mm/
           ...
 
@@ -52,6 +52,7 @@ DEFAULT_DEPTH_RANGE = (0.4, 2.2)
 DEFAULT_FOV_DEG = 40.0
 DEFAULT_REFERENCE_SCALE_MM = 25.0
 DEFAULT_DISTANCE_SAFETY = 0.98
+DEFAULT_PATCH_GRID = "14x14"
 DEFAULT_IMAGE_RES = (640, 480)
 TEXTURE_EXTS = {".jpg", ".jpeg", ".png"}
 
@@ -647,11 +648,49 @@ def npz_deformation_stats(npz_path: Path) -> Dict[str, float]:
     }
 
 
-def patch_coords_16x16(scale_mm: int) -> List[List[List[float]]]:
-    axis = np.linspace(-scale_mm / 2.0, scale_mm / 2.0, 16, dtype=np.float64)
-    xx, yy = np.meshgrid(axis, axis, indexing="xy")
-    coords = np.stack([xx, yy], axis=-1)
-    return np.round(coords, 6).tolist()
+def parse_patch_grid(spec: str) -> Tuple[int, int]:
+    value = str(spec).strip().lower()
+    if "x" not in value:
+        raise ValueError(f"Invalid patch grid '{spec}', expected format HxW (for example 16x16)")
+    parts = value.split("x")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid patch grid '{spec}', expected format HxW")
+    try:
+        patch_h = int(parts[0])
+        patch_w = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"Invalid patch grid '{spec}', H and W must be integers") from exc
+    if patch_h <= 0 or patch_w <= 0:
+        raise ValueError(f"Invalid patch grid '{spec}', H and W must be > 0")
+    return patch_h, patch_w
+
+
+def make_adapter_coord_map(scale_mm: float, patch_h: int, patch_w: int) -> np.ndarray:
+    if scale_mm <= 0:
+        raise ValueError("scale_mm must be > 0")
+    if patch_h <= 0 or patch_w <= 0:
+        raise ValueError("patch_h and patch_w must be > 0")
+
+    # Patch-center coordinates with image row-major convention:
+    # i (row) goes top->bottom, j (col) goes left->right.
+    # X increases to the right, Y increases downward.
+    step_x = float(scale_mm) / float(patch_w)
+    step_y = float(scale_mm) / float(patch_h)
+    x_axis = np.linspace(
+        -float(scale_mm) / 2.0 + step_x / 2.0,
+        float(scale_mm) / 2.0 - step_x / 2.0,
+        patch_w,
+        dtype=np.float64,
+    )
+    y_axis = np.linspace(
+        -float(scale_mm) / 2.0 + step_y / 2.0,
+        float(scale_mm) / 2.0 - step_y / 2.0,
+        patch_h,
+        dtype=np.float64,
+    )
+    xx, yy = np.meshgrid(x_axis, y_axis, indexing="xy")
+    coord_map = np.stack([xx, yy], axis=-1).astype(np.float64, copy=False)
+    return coord_map
 
 
 def run_cmd_checked(cmd: Sequence[str], cwd: Path, timeout_sec: int, stage: str) -> None:
@@ -829,9 +868,12 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
             stage="blender_render",
         )
 
-        patch_path = scale_dir / "patch_coords_16x16.json"
-        with open(patch_path, "w", encoding="utf-8") as f:
-            json.dump(patch_coords_16x16(scale_mm), f, indent=2)
+        patch_h = int(task["patch_h"])
+        patch_w = int(task["patch_w"])
+        coord_map = make_adapter_coord_map(float(scale_mm), patch_h, patch_w)
+        coord_map_path = scale_dir / "adapter_coord_map.npy"
+        np.save(coord_map_path, coord_map)
+        coord_map_shape = [int(coord_map.shape[0]), int(coord_map.shape[1]), int(coord_map.shape[2])]
 
         rendered = sorted(p.name for p in scale_dir.glob("marker_*.jpg"))
         if not rendered:
@@ -842,7 +884,8 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "episode_id": episode_id,
             "scale_mm": scale_mm,
             "scale_dir": str(scale_dir),
-            "patch_path": str(patch_path),
+            "adapter_coord_map_path": str(coord_map_path),
+            "adapter_coord_map_shape": coord_map_shape,
             "rendered_markers": rendered,
             "temp_scale_dir": str(temp_scale_dir),
         }
@@ -909,6 +952,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--particle", type=str, default="100000")
     p.add_argument("--episodes-per-indenter", type=int, default=1)
     p.add_argument("--scales-mm", type=int, nargs="+", default=DEFAULT_SCALES_MM)
+    p.add_argument(
+        "--patch-grid",
+        type=str,
+        default=DEFAULT_PATCH_GRID,
+        help="Patch grid in HxW format for adapter_coord_map export (for example 16x16).",
+    )
     p.add_argument("--objects", nargs="*", default=None, help="Optional subset of indenter names")
 
     p.add_argument("--x-min", type=float, default=DEFAULT_X_RANGE[0])
@@ -999,6 +1048,7 @@ def main() -> None:
         raise ValueError("--fov-deg must be in (0, 179)")
     if args.uv_inset_ratio < 0.0 or args.uv_inset_ratio >= 0.49:
         raise ValueError("--uv-inset-ratio must be in [0.0, 0.49)")
+    patch_h, patch_w = parse_patch_grid(args.patch_grid)
 
     if args.camera_distance_m is not None:
         if args.camera_distance_m <= 0:
@@ -1102,6 +1152,7 @@ def main() -> None:
     logging.info("Indenters: %d", len(indenter_names))
     logging.info("Episodes: %d", total_episodes)
     logging.info("Scales: %s", args.scales_mm)
+    logging.info("Patch grid: %dx%d", patch_h, patch_w)
     logging.info("Total (episode,scale) physics tasks: %d", total_scale_tasks)
     logging.info("Marker textures: %d (%s)", len(textures), texture_dir)
     logging.info("Workers: physics=%d (GPU), render=%d (CPU)", args.max_physics_workers, args.max_render_workers)
@@ -1181,6 +1232,8 @@ def main() -> None:
                     "distance_safety": float(args.distance_safety),
                     "uv_mode": str(args.uv_mode),
                     "uv_inset_ratio": float(args.uv_inset_ratio),
+                    "patch_h": int(patch_h),
+                    "patch_w": int(patch_w),
                     "render_timeout_sec": int(args.render_timeout_sec),
                     "keep_intermediates": bool(args.keep_intermediates),
                 }
@@ -1240,7 +1293,8 @@ def main() -> None:
                     "camera_distance_m": float(render_distance_m),
                     "camera_fov_deg": float(render_fov_deg),
                     "rendered_markers": rr["rendered_markers"],
-                    "patch_coords_16x16": str((scale_dir / "patch_coords_16x16.json").relative_to(ep_state.episode_dir)),
+                    "adapter_coord_map": str(Path(rr["adapter_coord_map_path"]).relative_to(ep_state.episode_dir)),
+                    "adapter_coord_map_shape": rr["adapter_coord_map_shape"],
                 }
 
                 logging.info(
@@ -1304,6 +1358,8 @@ def main() -> None:
             "dataset_root": str(dataset_root),
             "particle": str(args.particle),
             "scales_mm": [int(s) for s in args.scales_mm],
+            "patch_grid": [int(patch_h), int(patch_w)],
+            "coordinate_convention": "X right positive, Y down positive, row-major",
             "episodes_per_indenter": int(args.episodes_per_indenter),
             "indenter_count": len(indenter_names),
             "texture_count": len(textures),

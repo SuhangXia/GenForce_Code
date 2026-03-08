@@ -1,29 +1,30 @@
 {
-  "generated_at": "2026-03-08T21:09:27.547343+00:00",
-  "dataset_root": "/home/suhang/projects/test_code/GenForce_Code/adapter_dataset_ultimate",
+  "generated_at": "2026-03-08T22:54:20.070155+00:00",
+  "dataset_root": "/home/suhang/projects/test_code/GenForce_Code/adapter_dataset_smoke",
   "particle": "100000",
   "scales_mm": [
-    15
+    15,
+    20
   ],
   "patch_grid": [
-    16,
-    16
+    14,
+    14
   ],
   "coordinate_convention": "X right positive, Y down positive, row-major",
   "episodes_per_indenter": 1,
   "indenter_count": 1,
   "texture_count": 12,
   "total_episodes_planned": 1,
-  "total_scale_tasks_planned": 1,
-  "physics_tasks_succeeded": 1,
-  "render_tasks_succeeded": 1,
+  "total_scale_tasks_planned": 2,
+  "physics_tasks_succeeded": 2,
+  "render_tasks_succeeded": 2,
   "successful_episodes": 1,
   "failed_episodes": [],
   "episodes": [
     {
       "episode_id": 0,
       "path": "episode_000000",
-      "indenter": "cylinder",
+      "indenter": "sphere",
       "contact": {
         "x_mm": 0.8366,
         "y_mm": -2.8499,

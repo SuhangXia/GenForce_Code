@@ -2,7 +2,7 @@
 """
 Training script for the Universal Scale Adapter (USA).
 
-Reads adapter_dataset_v2/manifest.json with physically isolated Train/Val/Test splits:
+Reads adapter_dataset_ultimate/manifest.json with physically isolated Train/Val/Test splits:
   - Test: 4 indenters (pacman, wave, torus, hexagon) — zero-shot generalization
   - Train/Val: remaining indenters, 85% / 15% split
 
@@ -11,7 +11,7 @@ Pairing modes:
   - val/test: target fixed to 15mm, source from [18,20,22,25]
 
 Usage:
-    python scrpit/train_adapter.py --dataset adapter_dataset_v2
+    python scrpit/train_adapter.py --dataset adapter_dataset_ultimate
     python scrpit/train_adapter.py --sanity-check   # overfit 1 batch
     python scrpit/train_adapter.py --epochs 200 --lr 5e-5
 """
@@ -23,12 +23,13 @@ import logging
 import random
 from pathlib import Path
 
+import numpy as np
 import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -39,7 +40,7 @@ from usa_adapter import UniversalScaleAdapter
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATASET = PROJECT_ROOT / "adapter_dataset_v2"
+DEFAULT_DATASET = PROJECT_ROOT / "adapter_dataset_ultimate"
 
 # Indenters held out EXCLUSIVELY for test (zero-shot)
 TEST_INDENTERS = frozenset({"pacman", "wave", "torus", "hexagon"})
@@ -57,36 +58,14 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Coordinate grid (16x16 → 196 tokens)
-# ---------------------------------------------------------------------------
-
-def _generate_coord_grid(
-    width_mm: float, height_mm: float,
-    grid_h: int = 14, grid_w: int = 14,
-) -> torch.Tensor:
-    """Create (grid_h*grid_w, 2) tensor of physical (x_mm, y_mm) coordinates."""
-    xs = torch.linspace(0, width_mm, grid_w)
-    ys = torch.linspace(0, height_mm, grid_h)
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    coords = torch.stack([grid_x, grid_y], dim=-1)
-    return coords.reshape(-1, 2)
-
-
-# ---------------------------------------------------------------------------
-# MultiscaleTactileDataset — adapter_dataset_v2 format
+# MultiscaleTactileDataset — adapter_dataset_ultimate format
 # ---------------------------------------------------------------------------
 
 class MultiscaleTactileDataset(Dataset):
     """
-    Yields (img_A, coords_A, img_B, coords_B) for USA training.
+    Yields (img_context, coord_context, img_query, coord_query) for USA training.
 
-    Physically isolated splits by indenter:
-      - test: episodes with indenter in TEST_INDENTERS
-      - train/val: remaining episodes, 85% / 15%
-
-    Pairing (mode):
-      - train: random (scale_A, scale_B) with A != B
-      - val/test: target B = 15mm, source A = random from [18,20,22,25]
+    Uses real per-scale adapter_coord_map.npy exported by the generator.
     """
 
     def __init__(
@@ -96,11 +75,10 @@ class MultiscaleTactileDataset(Dataset):
         episode_meta: dict[int, dict],
         scales_mm: list[int],
         mode: str,
-        grid_h: int = 14,
-        grid_w: int = 14,
         augment: bool = True,
         pairs_per_epoch: int | None = None,
         seed: int = 42,
+        expected_token_count: int | None = None,
     ):
         super().__init__()
         self.dataset_root = Path(dataset_root)
@@ -108,26 +86,21 @@ class MultiscaleTactileDataset(Dataset):
         self.episode_meta = episode_meta
         self.scales_mm = sorted(scales_mm)
         self.mode = mode
-        self.grid_h = grid_h
-        self.grid_w = grid_w
         self.augment = augment
         self.seed = seed
+        self.expected_token_count = expected_token_count
 
-        # Precompute coord grids per scale (all scales are square)
-        self.scale_coords: dict[int, torch.Tensor] = {}
-        for s in self.scales_mm:
-            self.scale_coords[s] = _generate_coord_grid(s, s, grid_h, grid_w)
-
-        # Scale pairs for train: all (A,B) with A != B
         self.scale_pairs = [(a, b) for a, b in itertools.permutations(self.scales_mm, 2)]
-
-        # Val/test: source scales (excluding 15mm anchor)
         self.source_scales = [s for s in self.scales_mm if s != ANCHOR_SCALE_MM]
         if not self.source_scales:
             self.source_scales = [s for s in SOURCE_SCALES_MM if s in self.scales_mm]
 
         self._len = pairs_per_epoch if pairs_per_epoch else len(episode_ids)
         self._rng = random.Random(seed)
+        self._coord_cache: dict[Path, torch.Tensor] = {}
+        self._warned_no_common: set[tuple[int, str, str]] = set()
+        self._log_samples_done = 0
+        self._max_sample_logs = 8
 
         img_size = 224
         if augment:
@@ -147,47 +120,151 @@ class MultiscaleTactileDataset(Dataset):
     def __len__(self) -> int:
         return self._len
 
+    @staticmethod
+    def _parse_scale_key(scale_key: str) -> int:
+        # scale_15mm -> 15
+        head = scale_key.removeprefix("scale_")
+        value = head.removesuffix("mm")
+        return int(value)
+
+    @staticmethod
+    def _should_log_from_worker() -> bool:
+        info = get_worker_info()
+        return info is None or info.id == 0
+
+    def _choose_scale_pair(self, ep_id: int, scales: dict) -> tuple[str, str]:
+        if self.mode == "train":
+            scale_context, scale_query = self._rng.choice(self.scale_pairs)
+            key_context = f"scale_{scale_context}mm"
+            key_query = f"scale_{scale_query}mm"
+        else:
+            scale_query = ANCHOR_SCALE_MM
+            scale_context = self._rng.choice(self.source_scales)
+            if scale_context == scale_query:
+                candidates = [s for s in self.source_scales if s != scale_query]
+                if candidates:
+                    scale_context = self._rng.choice(candidates)
+            key_context = f"scale_{scale_context}mm"
+            key_query = f"scale_{scale_query}mm"
+
+        if key_context in scales and key_query in scales and key_context != key_query:
+            return key_context, key_query
+
+        valid = sorted([k for k in scales if k.startswith("scale_")])
+        if len(valid) < 2:
+            raise RuntimeError(f"Episode {ep_id} has < 2 valid scales: {list(scales)}")
+        return tuple(self._rng.sample(valid, 2))
+
+    def _choose_marker_pair(self, ep_id: int, key_context: str, key_query: str, meta_context: dict, meta_query: dict) -> tuple[str, str]:
+        markers_context = sorted(meta_context.get("rendered_markers", []))
+        markers_query = sorted(meta_query.get("rendered_markers", []))
+        if not markers_context or not markers_query:
+            raise RuntimeError(
+                f"Missing rendered_markers for episode {ep_id}: "
+                f"{key_context}={len(markers_context)} {key_query}={len(markers_query)}"
+            )
+
+        common = sorted(set(markers_context).intersection(markers_query))
+        if common:
+            marker_name = self._rng.choice(common)
+            return marker_name, marker_name
+
+        warn_key = (ep_id, key_context, key_query)
+        if warn_key not in self._warned_no_common:
+            self._warned_no_common.add(warn_key)
+            log.warning(
+                "No common marker file for ep=%06d (%s,%s). Using fallback context=%s query=%s",
+                ep_id,
+                key_context,
+                key_query,
+                markers_context[0],
+                markers_query[0],
+            )
+        return markers_context[0], markers_query[0]
+
+    def _load_coord_map(self, episode_dir: Path, ep_id: int, scale_key: str, scale_meta: dict) -> torch.Tensor:
+        rel = scale_meta.get("adapter_coord_map")
+        if not rel:
+            raise RuntimeError(f"Missing adapter_coord_map for episode {ep_id} {scale_key}")
+
+        abs_path = episode_dir / rel
+        if abs_path not in self._coord_cache:
+            if not abs_path.exists():
+                raise FileNotFoundError(f"adapter_coord_map not found: {abs_path}")
+
+            arr = np.load(abs_path)
+            if arr.ndim != 3 or arr.shape[-1] != 2:
+                raise RuntimeError(
+                    f"Invalid adapter_coord_map shape at {abs_path}: expected (H,W,2), got {arr.shape}"
+                )
+
+            declared_shape = scale_meta.get("adapter_coord_map_shape")
+            if declared_shape and list(arr.shape) != list(declared_shape):
+                raise RuntimeError(
+                    f"adapter_coord_map_shape mismatch at {abs_path}: "
+                    f"declared={declared_shape} actual={list(arr.shape)}"
+                )
+
+            coords = torch.from_numpy(arr).to(torch.float32).reshape(-1, 2)
+            if self.expected_token_count is not None and coords.shape[0] != self.expected_token_count:
+                raise RuntimeError(
+                    f"Token mismatch for {abs_path}: coord tokens={coords.shape[0]} "
+                    f"but backbone expects {self.expected_token_count}. "
+                    "Regenerate dataset with matching patch_grid or switch backbone tokenization."
+                )
+
+            self._coord_cache[abs_path] = coords
+            if self._should_log_from_worker():
+                log.info("Loaded coord map: %s shape=%s flattened=%s", abs_path, tuple(arr.shape), tuple(coords.shape))
+
+        return self._coord_cache[abs_path]
+
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ep_id = self._rng.choice(self.episode_ids)
         meta = self.episode_meta[ep_id]
         scales = meta.get("scales", {})
-        ep_dir = meta.get("dir", f"episode_{ep_id:06d}")
+        episode_path = meta["__episode_path"]
+        episode_dir = self.dataset_root / episode_path
 
-        if self.mode == "train":
-            scale_a, scale_b = self._rng.choice(self.scale_pairs)
-        else:
-            # val/test: target B = 15mm, source A = random from source_scales
-            scale_b = ANCHOR_SCALE_MM
-            scale_a = self._rng.choice(self.source_scales)
-            if scale_a == scale_b:
-                scale_a = self._rng.choice([s for s in self.source_scales if s != scale_b])
+        key_context, key_query = self._choose_scale_pair(ep_id, scales)
+        scale_meta_context = scales[key_context]
+        scale_meta_query = scales[key_query]
 
-        key_a = f"scale_{scale_a}mm"
-        key_b = f"scale_{scale_b}mm"
-        if key_a not in scales or key_b not in scales:
-            # Fallback: pick any valid pair
-            valid = [k for k in scales if k.startswith("scale_")]
-            if len(valid) < 2:
-                raise RuntimeError(f"Episode {ep_id} has < 2 scales: {list(scales)}")
-            key_a, key_b = self._rng.sample(valid, 2)
+        marker_context, marker_query = self._choose_marker_pair(
+            ep_id,
+            key_context,
+            key_query,
+            scale_meta_context,
+            scale_meta_query,
+        )
 
-        rel_a = scales[key_a]["image"]
-        rel_b = scales[key_b]["image"]
-        path_a = self.dataset_root / rel_a
-        path_b = self.dataset_root / rel_b
+        img_path_context = episode_dir / key_context / marker_context
+        img_path_query = episode_dir / key_query / marker_query
+        if not img_path_context.exists():
+            raise FileNotFoundError(f"Missing context image: {img_path_context}")
+        if not img_path_query.exists():
+            raise FileNotFoundError(f"Missing query image: {img_path_query}")
 
-        scale_a = scales[key_a]["physical_width_mm"]
-        scale_b = scales[key_b]["physical_height_mm"]
+        img_context = self.transform(Image.open(img_path_context).convert("RGB"))
+        img_query = self.transform(Image.open(img_path_query).convert("RGB"))
 
-        img_a = Image.open(path_a).convert("RGB")
-        img_b = Image.open(path_b).convert("RGB")
-        img_a = self.transform(img_a)
-        img_b = self.transform(img_b)
+        coord_context = self._load_coord_map(episode_dir, ep_id, key_context, scale_meta_context)
+        coord_query = self._load_coord_map(episode_dir, ep_id, key_query, scale_meta_query)
 
-        coords_a = self.scale_coords[scale_a]
-        coords_b = self.scale_coords[scale_b]
+        if self._should_log_from_worker() and self._log_samples_done < self._max_sample_logs:
+            self._log_samples_done += 1
+            log.info(
+                "Sample ep=%06d pair=(%s -> %s) markers=(%s, %s) coord_shapes=(%s, %s)",
+                ep_id,
+                key_context,
+                key_query,
+                marker_context,
+                marker_query,
+                tuple(coord_context.shape),
+                tuple(coord_query.shape),
+            )
 
-        return img_a, coords_a, img_b, coords_b
+        return img_context, coord_context, img_query, coord_query
 
 
 def load_manifest_and_split(
@@ -196,31 +273,40 @@ def load_manifest_and_split(
     test_indenters: frozenset[str],
     train_ratio: float = 0.85,
     seed: int = 42,
-) -> tuple[list[int], list[int], list[int], dict[int, dict]]:
+) -> tuple[list[int], list[int], list[int], dict[int, dict], dict]:
     """
     Load manifest, split by indenter. Load full metadata (incl. scales) from each episode.
-    Returns (train_ids, val_ids, test_ids, episode_meta).
+    Returns (train_ids, val_ids, test_ids, episode_meta, manifest_info).
     """
     with open(manifest_path) as f:
         data = json.load(f)
+
+    manifest_info = {
+        "patch_grid": data.get("patch_grid"),
+        "coordinate_convention": data.get("coordinate_convention"),
+    }
 
     episodes = data.get("episodes", [])
     episode_meta: dict[int, dict] = {}
     for ep in episodes:
         eid = ep["episode_id"]
-        ep_dir = ep.get("dir", f"episode_{eid:06d}")
-        meta_path = Path(dataset_root) / ep_dir / "metadata.json"
+        ep_path = ep.get("path", f"episode_{eid:06d}")
+        meta_path = Path(dataset_root) / ep_path / "metadata.json"
         if meta_path.exists():
             with open(meta_path) as mf:
                 full_meta = json.load(mf)
+            full_meta["__episode_path"] = ep_path
             episode_meta[eid] = full_meta
         else:
-            episode_meta[eid] = ep
+            fallback = dict(ep)
+            fallback["__episode_path"] = ep_path
+            episode_meta[eid] = fallback
 
     by_indenter: dict[str, list[int]] = {}
     for ep in episodes:
-        ind = ep.get("indenter", "unknown")
-        by_indenter.setdefault(ind, []).append(ep["episode_id"])
+        eid = ep["episode_id"]
+        ind = episode_meta[eid].get("indenter", ep.get("indenter", "unknown"))
+        by_indenter.setdefault(ind, []).append(eid)
 
     train_ids = []
     val_ids = []
@@ -237,7 +323,7 @@ def load_manifest_and_split(
             train_ids.extend(ids[:n_train])
             val_ids.extend(ids[n_train:])
 
-    return train_ids, val_ids, test_ids, episode_meta
+    return train_ids, val_ids, test_ids, episode_meta, manifest_info
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +342,13 @@ class FrozenViTFeatureExtractor(nn.Module):
         self.to(device)
         self._device = device
         self.embed_dim = self.vit.embed_dim
+        grid_size = getattr(self.vit.patch_embed, "grid_size", None)
+        if grid_size is not None:
+            self.patch_grid = (int(grid_size[0]), int(grid_size[1]))
+            self.patch_token_count = int(self.patch_grid[0] * self.patch_grid[1])
+        else:
+            self.patch_token_count = int(getattr(self.vit.patch_embed, "num_patches"))
+            self.patch_grid = None
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -298,7 +391,7 @@ def train(args):
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     scales_mm = args.scales
-    train_ids, val_ids, test_ids, episode_meta = load_manifest_and_split(
+    train_ids, val_ids, test_ids, episode_meta, manifest_info = load_manifest_and_split(
         manifest_path,
         dataset_root=dataset_root,
         test_indenters=TEST_INDENTERS,
@@ -309,19 +402,79 @@ def train(args):
     log.info("Split: train=%d val=%d test=%d (test indenters: %s)",
              len(train_ids), len(val_ids), len(test_ids), sorted(TEST_INDENTERS))
 
+    vit = FrozenViTFeatureExtractor(device=device)
+    backbone_tokens = vit.patch_token_count
+    dataset_patch_grid = manifest_info.get("patch_grid")
+    coord_convention = manifest_info.get("coordinate_convention")
+    log.info(
+        "Coordinate map convention: %s",
+        coord_convention if coord_convention else "(missing in manifest)",
+    )
+    if not dataset_patch_grid or len(dataset_patch_grid) != 2:
+        raise RuntimeError(
+            "Manifest is missing valid patch_grid=[H,W]. "
+            "This dataset format requires patch_grid for strict backbone compatibility checks."
+        )
+
+    ds_h, ds_w = int(dataset_patch_grid[0]), int(dataset_patch_grid[1])
+    dataset_tokens = ds_h * ds_w
+    log.info(
+        "Patch-grid check: dataset patch_grid=%dx%d (%d tokens), backbone tokens=%d%s",
+        ds_h,
+        ds_w,
+        dataset_tokens,
+        backbone_tokens,
+        f" (grid={vit.patch_grid[0]}x{vit.patch_grid[1]})" if vit.patch_grid else "",
+    )
+    if dataset_tokens != backbone_tokens:
+        raise RuntimeError(
+            "Dataset patch_grid is incompatible with backbone patch token count: "
+            f"dataset={ds_h}x{ds_w} ({dataset_tokens}) vs backbone_tokens={backbone_tokens}. "
+            "Please regenerate dataset with matching patch_grid or change backbone."
+        )
+
+    def _log_example_pair():
+        if not train_ids:
+            return
+        eid = train_ids[0]
+        meta = episode_meta[eid]
+        scales = sorted([k for k in meta.get("scales", {}).keys() if k.startswith("scale_")])
+        if len(scales) < 2:
+            return
+        key_context, key_query = scales[0], scales[1]
+        markers_context = sorted(meta["scales"][key_context].get("rendered_markers", []))
+        markers_query = sorted(meta["scales"][key_query].get("rendered_markers", []))
+        common = sorted(set(markers_context).intersection(markers_query))
+        chosen = common[0] if common else (markers_context[0] if markers_context else "(none)")
+        log.info(
+            "Example pair: ep=%06d path=%s pair=(%s -> %s) marker=%s",
+            eid,
+            meta.get("__episode_path", f"episode_{eid:06d}"),
+            key_context,
+            key_query,
+            chosen,
+        )
+
+    # ---- Sanity check: single fixed batch ----
+    dataset_common_kwargs = dict(
+        dataset_root=dataset_root,
+        episode_meta=episode_meta,
+        scales_mm=scales_mm,
+        expected_token_count=backbone_tokens,
+    )
+
     # ---- Sanity check: single fixed batch ----
     if args.sanity_check:
         log.info("SANITY CHECK: overfitting 1 batch for %d epochs", args.epochs)
         train_ds = MultiscaleTactileDataset(
-            dataset_root=dataset_root,
             episode_ids=train_ids[: max(1, args.batch_size)],
-            episode_meta=episode_meta,
-            scales_mm=scales_mm,
             mode="train",
             augment=False,
             pairs_per_epoch=args.batch_size,
             seed=args.seed,
+            **dataset_common_kwargs,
         )
+        _log_example_pair()
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
@@ -334,15 +487,14 @@ def train(args):
         val_loader = None
     else:
         train_ds = MultiscaleTactileDataset(
-            dataset_root=dataset_root,
             episode_ids=train_ids,
-            episode_meta=episode_meta,
-            scales_mm=scales_mm,
             mode="train",
             augment=True,
             pairs_per_epoch=args.pairs_per_epoch,
             seed=args.seed,
+            **dataset_common_kwargs,
         )
+        _log_example_pair()
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
@@ -353,14 +505,12 @@ def train(args):
         )
         if val_ids:
             val_ds = MultiscaleTactileDataset(
-                dataset_root=dataset_root,
                 episode_ids=val_ids,
-                episode_meta=episode_meta,
-                scales_mm=scales_mm,
                 mode="val",
                 augment=False,
                 pairs_per_epoch=min(500, len(val_ids) * 2),
                 seed=args.seed + 1,
+                **dataset_common_kwargs,
             )
             val_loader = DataLoader(
                 val_ds,
@@ -372,7 +522,6 @@ def train(args):
             val_loader = None
 
     # ---- Models ----
-    vit = FrozenViTFeatureExtractor(device=device)
     adapter = UniversalScaleAdapter(
         embed_dim=vit.embed_dim, num_heads=8, num_layers=2
     ).to(device)
@@ -415,8 +564,8 @@ def train(args):
         n_batches = 0
 
         if args.sanity_check:
-            img_a, coords_a, img_b, coords_b = [x.to(device) for x in single_batch]
-            batches = [(img_a, coords_a, img_b, coords_b)] * 1
+            img_context, coord_context, img_query, coord_query = [x.to(device) for x in single_batch]
+            batches = [(img_context, coord_context, img_query, coord_query)] * 1
         else:
             batches = train_loader
 
@@ -429,22 +578,30 @@ def train(args):
 
         for batch in pbar:
             if not args.sanity_check:
-                img_a, coords_a, img_b, coords_b = [x.to(device) for x in batch]
+                img_context, coord_context, img_query, coord_query = [x.to(device) for x in batch]
             else:
-                img_a, coords_a, img_b, coords_b = batch
+                img_context, coord_context, img_query, coord_query = batch
 
             with torch.no_grad():
-                feat_a = vit(img_a)
-                feat_b = vit(img_b)
+                feat_context = vit(img_context)
+                feat_query = vit(img_query)
 
-            pred_b = adapter(source_feat=feat_a, source_coords=coords_a, target_coords=coords_b)
-            loss_a2b = F.mse_loss(pred_b, feat_b)
+            pred_query = adapter(
+                context_feat=feat_context,
+                context_coord_map_mm=coord_context,
+                query_coord_map_mm=coord_query,
+            )
+            loss_context_to_query = F.mse_loss(pred_query, feat_query)
 
-            pred_a = adapter(source_feat=feat_b, source_coords=coords_b, target_coords=coords_a)
-            loss_b2a = F.mse_loss(pred_a, feat_a)
+            pred_context = adapter(
+                context_feat=feat_query,
+                context_coord_map_mm=coord_query,
+                query_coord_map_mm=coord_context,
+            )
+            loss_query_to_context = F.mse_loss(pred_context, feat_context)
 
-            loss = loss_a2b + loss_b2a
-            cos = cosine_similarity(pred_b, feat_b).item()
+            loss = loss_context_to_query + loss_query_to_context
+            cos = cosine_similarity(pred_query, feat_query).item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -474,22 +631,30 @@ def train(args):
             val_cos = 0.0
             val_n = 0
             with torch.no_grad():
-                for img_a, coords_a, img_b, coords_b in tqdm(
+                for img_context, coord_context, img_query, coord_query in tqdm(
                     val_loader, desc="Val", leave=False, disable=not args.progress
                 ):
-                    img_a, coords_a, img_b, coords_b = (
-                        img_a.to(device), coords_a.to(device),
-                        img_b.to(device), coords_b.to(device),
+                    img_context, coord_context, img_query, coord_query = (
+                        img_context.to(device), coord_context.to(device),
+                        img_query.to(device), coord_query.to(device),
                     )
-                    feat_a = vit(img_a)
-                    feat_b = vit(img_b)
-                    pred_b = adapter(feat_a, coords_a, coords_b)
-                    pred_a = adapter(feat_b, coords_b, coords_a)
-                    loss = F.mse_loss(pred_b, feat_b) + F.mse_loss(pred_a, feat_a)
-                    cos = cosine_similarity(pred_b, feat_b)
-                    val_loss += loss.item() * img_a.size(0)
-                    val_cos += cos.item() * img_a.size(0)
-                    val_n += img_a.size(0)
+                    feat_context = vit(img_context)
+                    feat_query = vit(img_query)
+                    pred_query = adapter(
+                        context_feat=feat_context,
+                        context_coord_map_mm=coord_context,
+                        query_coord_map_mm=coord_query,
+                    )
+                    pred_context = adapter(
+                        context_feat=feat_query,
+                        context_coord_map_mm=coord_query,
+                        query_coord_map_mm=coord_context,
+                    )
+                    loss = F.mse_loss(pred_query, feat_query) + F.mse_loss(pred_context, feat_context)
+                    cos = cosine_similarity(pred_query, feat_query)
+                    val_loss += loss.item() * img_context.size(0)
+                    val_cos += cos.item() * img_context.size(0)
+                    val_n += img_context.size(0)
             val_loss /= max(val_n, 1)
             val_cos /= max(val_n, 1)
             adapter.train()
@@ -545,31 +710,37 @@ def train(args):
             adapter.load_state_dict(ckpt["model_state_dict"])
             adapter.eval()
             test_ds = MultiscaleTactileDataset(
-                dataset_root=dataset_root,
                 episode_ids=test_ids,
-                episode_meta=episode_meta,
-                scales_mm=scales_mm,
                 mode="test",
                 augment=False,
                 pairs_per_epoch=min(500, len(test_ids) * 2),
                 seed=args.seed + 2,
+                **dataset_common_kwargs,
             )
             test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
             test_loss = 0.0
             test_cos = 0.0
             test_n = 0
             with torch.no_grad():
-                for img_a, coords_a, img_b, coords_b in tqdm(test_loader, desc="Test"):
-                    img_a, coords_a = img_a.to(device), coords_a.to(device)
-                    img_b, coords_b = img_b.to(device), coords_b.to(device)
-                    feat_a, feat_b = vit(img_a), vit(img_b)
-                    pred_b = adapter(feat_a, coords_a, coords_b)
-                    pred_a = adapter(feat_b, coords_b, coords_a)
-                    loss = F.mse_loss(pred_b, feat_b) + F.mse_loss(pred_a, feat_a)
-                    cos = cosine_similarity(pred_b, feat_b)
-                    test_loss += loss.item() * img_a.size(0)
-                    test_cos += cos.item() * img_a.size(0)
-                    test_n += img_a.size(0)
+                for img_context, coord_context, img_query, coord_query in tqdm(test_loader, desc="Test"):
+                    img_context, coord_context = img_context.to(device), coord_context.to(device)
+                    img_query, coord_query = img_query.to(device), coord_query.to(device)
+                    feat_context, feat_query = vit(img_context), vit(img_query)
+                    pred_query = adapter(
+                        context_feat=feat_context,
+                        context_coord_map_mm=coord_context,
+                        query_coord_map_mm=coord_query,
+                    )
+                    pred_context = adapter(
+                        context_feat=feat_query,
+                        context_coord_map_mm=coord_query,
+                        query_coord_map_mm=coord_context,
+                    )
+                    loss = F.mse_loss(pred_query, feat_query) + F.mse_loss(pred_context, feat_context)
+                    cos = cosine_similarity(pred_query, feat_query)
+                    test_loss += loss.item() * img_context.size(0)
+                    test_cos += cos.item() * img_context.size(0)
+                    test_n += img_context.size(0)
             test_loss /= max(test_n, 1)
             test_cos /= max(test_n, 1)
             log.info("TEST (zero-shot indenters): loss=%.6f  cos_sim=%.4f",
@@ -581,9 +752,9 @@ def train(args):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train USA adapter (adapter_dataset_v2)")
+    p = argparse.ArgumentParser(description="Train USA adapter (adapter_dataset_ultimate)")
     p.add_argument("--dataset", type=str, default=str(DEFAULT_DATASET),
-                   help="Path to adapter_dataset_v2")
+                   help="Path to adapter_dataset_ultimate")
     p.add_argument("--scales", nargs="+", type=int, default=[15, 18, 20, 22, 25])
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)

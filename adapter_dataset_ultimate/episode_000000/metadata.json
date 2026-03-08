@@ -1,12 +1,12 @@
 {
   "episode_id": 0,
-  "generated_at": "2026-03-08T19:55:39.064083+00:00",
+  "generated_at": "2026-03-08T21:09:27.547092+00:00",
   "indenter": "cylinder",
   "particle": "100000",
   "contact": {
     "x_mm": 0.8366,
     "y_mm": -2.8499,
-    "depth_mm": 2.2
+    "depth_mm": 0.9
   },
   "image_resolution": {
     "width": 640,
@@ -17,12 +17,12 @@
       "scale_mm": 15,
       "contact_x_mm": 0.8366,
       "contact_y_mm": -2.8499,
-      "contact_depth_mm": 2.2,
+      "contact_depth_mm": 0.9,
       "deformation_stats": {
-        "surface_max_down_mm": 2.211728096008301,
-        "surface_mean_down_mm": 0.3640129609898415,
+        "surface_max_down_mm": 0.9129638671875,
+        "surface_mean_down_mm": 0.16974267332288123,
         "surface_min_z_start_mm": 12.0,
-        "surface_min_z_end_mm": 9.7882719039917
+        "surface_min_z_end_mm": 11.0870361328125
       },
       "camera_mode": "fixed_distance_variable_fov",
       "camera_distance_m": 0.03365659838831912,
@@ -41,37 +41,12 @@
         "marker_Diamond3.jpg",
         "marker_Diamond4.jpg"
       ],
-      "patch_coords_16x16": "scale_15mm/patch_coords_16x16.json"
-    },
-    "scale_30mm": {
-      "scale_mm": 30,
-      "contact_x_mm": 0.8366,
-      "contact_y_mm": -2.8499,
-      "contact_depth_mm": 2.2,
-      "deformation_stats": {
-        "surface_max_down_mm": 2.2137632369995117,
-        "surface_mean_down_mm": 0.08407984788646161,
-        "surface_min_z_start_mm": 12.0,
-        "surface_min_z_end_mm": 9.786236763000488
-      },
-      "camera_mode": "fixed_distance_variable_fov",
-      "camera_distance_m": 0.03365659838831912,
-      "camera_fov_deg": 48.04294714967595,
-      "rendered_markers": [
-        "marker_Array1.jpg",
-        "marker_Array2.jpg",
-        "marker_Array3.jpg",
-        "marker_Array4.jpg",
-        "marker_Circle1.jpg",
-        "marker_Circle2.jpg",
-        "marker_Circle3.jpg",
-        "marker_Circle4.jpg",
-        "marker_Diamond1.jpg",
-        "marker_Diamond2.jpg",
-        "marker_Diamond3.jpg",
-        "marker_Diamond4.jpg"
-      ],
-      "patch_coords_16x16": "scale_30mm/patch_coords_16x16.json"
+      "adapter_coord_map": "scale_15mm/adapter_coord_map.npy",
+      "adapter_coord_map_shape": [
+        16,
+        16,
+        2
+      ]
     }
   }
 }
