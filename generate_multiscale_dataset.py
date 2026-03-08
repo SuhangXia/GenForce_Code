@@ -198,6 +198,7 @@ from pathlib import Path
 import bmesh
 import bpy
 import numpy as np
+from mathutils import Vector
 
 
 def parse_args():
@@ -217,6 +218,12 @@ def parse_args():
     p.add_argument("--base-fov-deg", type=float, default=40.0)
     p.add_argument("--fixed-distance-m", type=float, required=True)
     p.add_argument("--distance-safety", type=float, default=0.98)
+    p.add_argument(
+        "--uv-mode",
+        choices=["unwrap_genforce", "physical_math"],
+        default="unwrap_genforce",
+    )
+    p.add_argument("--uv-inset-ratio", type=float, default=0.01)
     return p.parse_args(user_argv)
 
 
@@ -253,25 +260,31 @@ def delete_bottom_faces(obj, cutoff_offset=0.002):
         bm.free()
         raise RuntimeError("Mesh has no vertices")
 
+    # If the mesh is open (has boundary edges), it is already a surface mesh.
+    # Do not try to delete bottom faces, otherwise deep indent regions can be removed.
+    if any(e.is_boundary for e in bm.edges):
+        bm.free()
+        return
+
     z_bottom = min(v.co.z for v in bm.verts)
     z_top = max(v.co.z for v in bm.verts)
     z_span = z_top - z_bottom
-    cutoff = z_bottom + cutoff_offset
-
-    # Safety guard: if mesh is effectively a single surface shell (very small z-span),
-    # deleting \"bottom\" faces would remove the whole tactile surface.
-    if z_span < cutoff_offset * 1.2:
+    if z_span <= 0.0:
         bm.free()
         return
-    to_delete = []
-    for f in bm.faces:
-        # Delete only faces near the bottom that are likely underside faces.
-        # This avoids deleting the active top tactile surface on thin meshes.
-        if all(v.co.z < cutoff for v in f.verts) and f.normal.z < -0.05:
-            to_delete.append(f)
 
-    # Extra guard against accidental full mesh deletion.
-    if to_delete and len(to_delete) < int(0.6 * max(len(bm.faces), 1)):
+    # Robust threshold: target only the lowest few faces of closed Poisson shells.
+    face_z = []
+    for f in bm.faces:
+        zc = sum(v.co.z for v in f.verts) / float(len(f.verts))
+        face_z.append((f, zc))
+    z_values = np.array([z for _, z in face_z], dtype=np.float64)
+    low_q = float(np.quantile(z_values, 0.04))
+    hard_cap = z_bottom + max(cutoff_offset, 0.06 * z_span)
+    threshold = min(low_q, hard_cap)
+
+    to_delete = [f for f, zc in face_z if zc <= threshold and f.normal.z < -0.25]
+    if to_delete and len(to_delete) < int(0.25 * max(len(bm.faces), 1)):
         bmesh.ops.delete(bm, geom=to_delete, context="FACES")
 
     bm.to_mesh(me)
@@ -293,9 +306,11 @@ def compute_bbox_world(obj):
     return cx, cy, z_top
 
 
-def apply_uv_math(obj, cx: float, cy: float, scale_m: float):
+def apply_uv_math(obj, cx: float, cy: float, scale_m: float, uv_inset_ratio: float):
     if scale_m <= 0:
         raise ValueError("scale_m must be > 0")
+    if uv_inset_ratio < 0.0 or uv_inset_ratio >= 0.49:
+        raise ValueError("uv_inset_ratio must be in [0.0, 0.49)")
 
     me = obj.data
     bm = bmesh.new()
@@ -310,11 +325,76 @@ def apply_uv_math(obj, cx: float, cy: float, scale_m: float):
             w = obj.matrix_world @ loop.vert.co
             u = (w.x - cx) / scale_m + 0.5
             v = (w.y - cy) / scale_m + 0.5
+            if uv_inset_ratio > 0.0:
+                u = u * (1.0 - 2.0 * uv_inset_ratio) + uv_inset_ratio
+                v = v * (1.0 - 2.0 * uv_inset_ratio) + uv_inset_ratio
             loop[uv_layer].uv = (u, v)
 
     bm.to_mesh(me)
     bm.free()
     me.update()
+
+
+def check_and_rotate_uvs_genforce(obj):
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    uv_layer = bm.loops.layers.uv.verify()
+
+    bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    xmin = min(corner.x for corner in bbox_corners)
+    xmax = max(corner.x for corner in bbox_corners)
+    ymin = min(corner.y for corner in bbox_corners)
+    ymax = max(corner.y for corner in bbox_corners)
+
+    for _ in range(4):
+        uv_at_max = None
+        uv_at_min = None
+        for face in bm.faces:
+            if not face.select:
+                continue
+            for loop in face.loops:
+                vert = loop.vert
+                uv_coords = loop[uv_layer]
+                if abs(vert.co.x - xmax) < 0.001 and abs(vert.co.y - ymax) < 0.001:
+                    uv_at_max = Vector((uv_coords.uv.x, uv_coords.uv.y))
+                if abs(vert.co.x - xmin) < 0.001 and abs(vert.co.y - ymin) < 0.001:
+                    uv_at_min = Vector((uv_coords.uv.x, uv_coords.uv.y))
+
+        if uv_at_max and uv_at_min:
+            if (
+                abs(uv_at_max.x - 1.0) < 0.1
+                and abs(uv_at_max.y - 0.0) < 0.1
+                and abs(uv_at_min.x - 0.0) < 0.1
+                and abs(uv_at_min.y - 1.0) < 0.1
+            ):
+                break
+
+            for face in bm.faces:
+                if not face.select:
+                    continue
+                for loop in face.loops:
+                    uv_coords = loop[uv_layer]
+                    old_x, old_y = uv_coords.uv.x, uv_coords.uv.y
+                    uv_coords.uv.x = old_y
+                    uv_coords.uv.y = 1.0 - old_x
+            bmesh.update_edit_mesh(me)
+
+    bmesh.update_edit_mesh(me)
+
+
+def apply_uv_unwrap_genforce(obj):
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bm = bmesh.from_edit_mesh(obj.data)
+
+    for face in bm.faces:
+        face.select = (face.normal.z < 0)
+    bmesh.update_edit_mesh(obj.data)
+
+    bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.001)
+    check_and_rotate_uvs_genforce(obj)
+    bpy.ops.object.mode_set(mode="OBJECT")
 
 
 def setup_material():
@@ -331,7 +411,7 @@ def setup_material():
     tex = nodes.new("ShaderNodeTexImage")
     uv = nodes.new("ShaderNodeTexCoord")
 
-    tex.extension = "EXTEND"
+    tex.extension = "CLIP"
     tex.interpolation = "Cubic"
 
     bsdf.inputs["Specular"].default_value = 0.0
@@ -354,6 +434,27 @@ def setup_world_light():
         bg = nodes.new("ShaderNodeBackground")
     bg.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
     bg.inputs["Strength"].default_value = 60.0
+
+
+def add_black_backdrop(cx: float, cy: float, z_top: float, scale_m: float):
+    # Put a black plane behind the gel so any uncovered pixels remain black.
+    plane_z = z_top + max(scale_m * 0.08, 0.002)
+    bpy.ops.mesh.primitive_plane_add(size=1.0, location=(cx, cy, plane_z))
+    plane = bpy.context.active_object
+    plane.name = "BlackBackdrop"
+    plane.scale = (scale_m * 4.0, scale_m * 4.0, 1.0)
+
+    mat = bpy.data.materials.new("BlackBackdropMat")
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    bsdf = nodes.get("Principled BSDF")
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+        bsdf.inputs["Specular"].default_value = 0.0
+        bsdf.inputs["Roughness"].default_value = 1.0
+
+    plane.data.materials.clear()
+    plane.data.materials.append(mat)
 
 
 def setup_camera(
@@ -417,6 +518,7 @@ def configure_render(out_dir: Path):
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "JPEG"
     scene.render.image_settings.quality = 100
+    scene.render.film_transparent = False
 
     scene.view_settings.view_transform = "Standard"
     scene.view_settings.exposure = 0.0
@@ -445,7 +547,11 @@ def main():
 
     scale_m = float(args.scale_mm) / 1000.0
     cx, cy, z_top = compute_bbox_world(obj)
-    apply_uv_math(obj, cx, cy, scale_m)
+    if args.uv_mode == "unwrap_genforce":
+        apply_uv_unwrap_genforce(obj)
+    else:
+        apply_uv_math(obj, cx, cy, scale_m, args.uv_inset_ratio)
+    add_black_backdrop(cx, cy, z_top, scale_m)
 
     mat, tex_node = setup_material()
     if obj.data.materials:
@@ -711,6 +817,10 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
             str(task["fixed_distance_m"]),
             "--distance-safety",
             str(task["distance_safety"]),
+            "--uv-mode",
+            str(task["uv_mode"]),
+            "--uv-inset-ratio",
+            str(task["uv_inset_ratio"]),
         ]
         run_cmd_checked(
             render_cmd,
@@ -839,6 +949,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DISTANCE_SAFETY,
         help="Safety multiplier used when deriving camera distance (and in legacy fixed_fov mode).",
     )
+    p.add_argument(
+        "--uv-inset-ratio",
+        type=float,
+        default=0.01,
+        help="Inset UVs from [0,1] boundary to avoid edge artifacts on texture borders.",
+    )
+    p.add_argument(
+        "--uv-mode",
+        choices=["unwrap_genforce", "physical_math"],
+        default="unwrap_genforce",
+        help="UV strategy for marker mapping.",
+    )
 
     p.add_argument("--max-physics-workers", type=int, default=7)
     p.add_argument("--max-render-workers", type=int, default=max(1, (os.cpu_count() or 8) - 1))
@@ -875,6 +997,8 @@ def main() -> None:
         raise ValueError("--distance-safety must be > 0")
     if args.fov_deg <= 0 or args.fov_deg >= 179.0:
         raise ValueError("--fov-deg must be in (0, 179)")
+    if args.uv_inset_ratio < 0.0 or args.uv_inset_ratio >= 0.49:
+        raise ValueError("--uv-inset-ratio must be in [0.0, 0.49)")
 
     if args.camera_distance_m is not None:
         if args.camera_distance_m <= 0:
@@ -982,11 +1106,13 @@ def main() -> None:
     logging.info("Marker textures: %d (%s)", len(textures), texture_dir)
     logging.info("Workers: physics=%d (GPU), render=%d (CPU)", args.max_physics_workers, args.max_render_workers)
     logging.info(
-        "Camera: mode=%s fixed_distance=%.6fm base_fov=%.3fdeg ref_scale=%.2fmm",
+        "Camera: mode=%s fixed_distance=%.6fm base_fov=%.3fdeg ref_scale=%.2fmm uv_mode=%s uv_inset=%.3f",
         args.camera_mode,
         fixed_camera_distance_m,
         float(args.fov_deg),
         float(args.reference_scale_mm),
+        str(args.uv_mode),
+        float(args.uv_inset_ratio),
     )
     logging.info("=" * 72)
 
@@ -1053,6 +1179,8 @@ def main() -> None:
                     "base_fov_deg": float(args.fov_deg),
                     "fixed_distance_m": float(fixed_camera_distance_m),
                     "distance_safety": float(args.distance_safety),
+                    "uv_mode": str(args.uv_mode),
+                    "uv_inset_ratio": float(args.uv_inset_ratio),
                     "render_timeout_sec": int(args.render_timeout_sec),
                     "keep_intermediates": bool(args.keep_intermediates),
                 }

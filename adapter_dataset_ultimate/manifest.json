@@ -1,24 +1,18 @@
 {
-  "generated_at": "2026-03-08T19:04:58.812800+00:00",
+  "generated_at": "2026-03-08T19:55:39.064260+00:00",
   "dataset_root": "/home/suhang/projects/test_code/GenForce_Code/adapter_dataset_ultimate",
   "particle": "100000",
   "scales_mm": [
     15,
-    16,
-    18,
-    20,
-    22,
-    25,
-    28,
     30
   ],
   "episodes_per_indenter": 1,
   "indenter_count": 1,
   "texture_count": 12,
   "total_episodes_planned": 1,
-  "total_scale_tasks_planned": 8,
-  "physics_tasks_succeeded": 8,
-  "render_tasks_succeeded": 8,
+  "total_scale_tasks_planned": 2,
+  "physics_tasks_succeeded": 2,
+  "render_tasks_succeeded": 2,
   "successful_episodes": 1,
   "failed_episodes": [],
   "episodes": [
