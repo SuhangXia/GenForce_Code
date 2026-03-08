@@ -154,6 +154,7 @@ def parse_args():
     parser.add_argument("--output", required=True)
     parser.add_argument("--scale-mm", required=True, type=float)
     parser.add_argument("--fov-deg", default=40.0, type=float)
+    parser.add_argument("--uv-black-border-ratio", default=0.02, type=float)
     return parser.parse_args(user_argv)
 
 
@@ -207,7 +208,36 @@ def robust_bbox_world(obj):
     return min_x, min_y, width, height, center_x, center_y, bottom_z
 
 
-def create_material(marker_path: str):
+def make_blacked_border_image(src_img, border_ratio: float):
+    border_ratio = min(max(float(border_ratio), 0.0), 0.2)
+    if border_ratio <= 0.0:
+        return src_img
+
+    width, height = int(src_img.size[0]), int(src_img.size[1])
+    border_px = int(round(min(width, height) * border_ratio))
+    if border_px <= 0:
+        return src_img
+
+    pixels = np.array(src_img.pixels[:], dtype=np.float32).reshape(height, width, 4)
+    pixels[:border_px, :, :3] = 0.0
+    pixels[-border_px:, :, :3] = 0.0
+    pixels[:, :border_px, :3] = 0.0
+    pixels[:, -border_px:, :3] = 0.0
+
+    img = bpy.data.images.new(
+        name=f"{src_img.name}_blacked",
+        width=width,
+        height=height,
+        alpha=True,
+        float_buffer=False,
+    )
+    img.colorspace_settings.name = "sRGB"
+    img.pixels.foreach_set(pixels.reshape(-1))
+    img.update()
+    return img
+
+
+def create_material(marker_path: str, uv_black_border_ratio: float):
     material = bpy.data.materials.new(name="AdapterPrincipled")
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -221,11 +251,12 @@ def create_material(marker_path: str):
     tex = nodes.new("ShaderNodeTexImage")
     tex_coord = nodes.new("ShaderNodeTexCoord")
 
-    tex.image = bpy.data.images.load(marker_path)
+    marker_img = bpy.data.images.load(marker_path)
+    marker_img.colorspace_settings.name = "sRGB"
+    tex.image = make_blacked_border_image(marker_img, uv_black_border_ratio)
     # Keep out-of-range UVs black to preserve black sensor coating background.
     tex.extension = "CLIP"
     tex.interpolation = "Cubic"
-    tex.image.colorspace_settings.name = "sRGB"
 
     # Marker appearance is driven by texture itself (black paint + white markers),
     # not by scene lighting/shadows.
@@ -241,7 +272,12 @@ def create_material(marker_path: str):
     return material
 
 
-def apply_uv_relative(obj, center_x: float, center_y: float, scale_mm: float):
+def apply_uv_relative(
+    obj,
+    center_x: float,
+    center_y: float,
+    scale_mm: float,
+):
     scale_m = max(scale_mm / 1000.0, 1e-8)
     min_x = center_x - scale_m * 0.5
     min_y = center_y - scale_m * 0.5
@@ -258,8 +294,6 @@ def apply_uv_relative(obj, center_x: float, center_y: float, scale_mm: float):
             world_co = obj.matrix_world @ loop.vert.co
             u = (world_co.x - min_x) / scale_m
             v = (world_co.y - min_y) / scale_m
-            u = min(max(u, 0.0), 1.0)
-            v = min(max(v, 0.0), 1.0)
             loop[uv_layer].uv = (u, v)
 
     bm.to_mesh(me)
@@ -316,6 +350,7 @@ def configure_render(output_path: str):
         scene.cycles.sample_clamp_indirect = 2.0
         scene.cycles.max_bounces = 4
     scene.render.image_settings.file_format = "JPEG"
+    scene.render.image_settings.quality = 100
     scene.render.resolution_x = 640
     scene.render.resolution_y = 480
     scene.render.resolution_percentage = 100
@@ -337,7 +372,7 @@ def main():
 
     min_x, min_y, width, height, center_x, center_y, bottom_z = robust_bbox_world(obj)
 
-    material = create_material(args.marker)
+    material = create_material(args.marker, args.uv_black_border_ratio)
     if obj.data.materials:
         obj.data.materials[0] = material
     else:
@@ -402,6 +437,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fov-deg", type=float, default=DEFAULT_FOV_DEG)
+    parser.add_argument(
+        "--uv-black-border-ratio",
+        type=float,
+        default=0.02,
+        help="Fraction of marker texture border (per side) forced to black before rendering.",
+    )
     parser.add_argument(
         "--scale-mode",
         type=str,
@@ -486,6 +527,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--worker-id must satisfy 0 <= worker_id < num_workers")
     if args.physics_scale_mm is not None and args.physics_scale_mm <= 0:
         parser.error("--physics-scale-mm must be > 0 when provided")
+    if not (0.0 <= args.uv_black_border_ratio <= 0.2):
+        parser.error("--uv-black-border-ratio must be in [0.0, 0.2]")
 
     return args
 
@@ -748,6 +791,8 @@ def run_episode(
                         str(scale_mm),
                         "--fov-deg",
                         str(args.fov_deg),
+                        "--uv-black-border-ratio",
+                        str(args.uv_black_border_ratio),
                     ],
                     cwd=repo_root,
                     stage_name="blender_render",
@@ -846,6 +891,8 @@ def run_episode(
                         str(scale_mm),
                         "--fov-deg",
                         str(args.fov_deg),
+                        "--uv-black-border-ratio",
+                        str(args.uv_black_border_ratio),
                     ],
                     cwd=repo_root,
                     stage_name="blender_render",
