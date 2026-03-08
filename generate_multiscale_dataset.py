@@ -1,42 +1,60 @@
 #!/usr/bin/env python3
-"""Generate a multiscale tactile dataset with synchronized contact physics.
+"""Generate a large multiscale tactile dataset with cheap marker diversification.
 
-Pipeline per episode/scale:
-1) Update elastomer size in sim/parameters.yml.
-2) Run gel_press.py to generate deformation (.npz).
-3) Run inline Open3D script (temp file) to convert .npz -> .stl.
-4) Run inline Blender script (temp file) to render marker image.
-5) Save metadata.json with patch coordinates for each scale.
+Core idea (Simulation Economics):
+- Expensive stage: Taichi MPM deformation (.npz -> .stl) for each (episode, scale).
+- Cheap stage: Blender re-renders same deformed .stl with ALL marker textures.
 
-The script keeps x/y/depth and marker fixed across scales for each episode,
-which creates "parallel universe" samples for cross-scale transfer.
+Output layout:
+    adapter_dataset_ultimate/
+      manifest.json
+      episode_000000/
+        metadata.json
+        scale_15mm/
+          marker_Array1.jpg
+          ...
+          patch_coords_16x16.json
+        scale_16mm/
+          ...
+
+This script is parallel-friendly:
+- Physics workers: capped (default 7) to avoid CUDA OOM.
+- Render workers: CPU-oriented process pool.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
+import concurrent.futures as cf
 import datetime as dt
-import fcntl
 import json
 import logging
+import math
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 import random
 import shutil
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+import traceback
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import yaml
 
 
-DEFAULT_SCALES_MM = [15, 18, 20, 22, 25]
+DEFAULT_SCALES_MM = list(range(15, 26))
+DEFAULT_X_RANGE = (-3.0, 3.0)
+DEFAULT_Y_RANGE = (-3.0, 3.0)
+DEFAULT_DEPTH_RANGE = (0.4, 2.2)
 DEFAULT_FOV_DEG = 40.0
+DEFAULT_REFERENCE_SCALE_MM = 25.0
+DEFAULT_DISTANCE_SAFETY = 0.98
+DEFAULT_IMAGE_RES = (640, 480)
+TEXTURE_EXTS = {".jpg", ".jpeg", ".png"}
+
 
 OPEN3D_TEMP_SCRIPT = r'''
 import argparse
@@ -46,19 +64,17 @@ import open3d as o3d
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Convert deformation npz to STL.")
-    parser.add_argument("--input-npz", required=True)
-    parser.add_argument("--output-stl", required=True)
-    parser.add_argument("--poisson-depth", type=int, default=9)
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Convert deformation npz to STL")
+    p.add_argument("--input-npz", required=True)
+    p.add_argument("--output-stl", required=True)
+    return p.parse_args()
 
 
-def load_points(npz_path: Path):
+def load_surface_points(npz_path: Path):
     data = np.load(npz_path)
-    required = ["p_xpos_list", "p_ypos_list", "p_zpos_list"]
-    for key in required:
+    for key in ("p_xpos_list", "p_ypos_list", "p_zpos_list"):
         if key not in data:
-            raise KeyError(f"Missing key '{key}' in {npz_path}")
+            raise KeyError(f"Missing key {key} in {npz_path}")
 
     x = np.asarray(data["p_xpos_list"])
     y = np.asarray(data["p_ypos_list"])
@@ -69,27 +85,28 @@ def load_points(npz_path: Path):
     z_last = z[-1] if z.ndim > 1 else z
 
     if not (x_last.shape == y_last.shape == z_last.shape):
-        raise ValueError("Shape mismatch among x/y/z arrays in npz data")
+        raise ValueError("x/y/z shape mismatch in deformation npz")
 
-    n_points = int(x_last.shape[0])
-    grid_n = int(round(np.sqrt(n_points)))
-    if grid_n * grid_n != n_points:
-        grid_n = None
+    n = int(x_last.shape[0])
+    grid_n = int(round(np.sqrt(n)))
+    regular_grid = (grid_n * grid_n == n)
 
-    # Convert mm -> m so Blender camera trig uses physical metric units.
+    # mm -> m for Blender physical scale consistency.
     points = np.stack([x_last, y_last, z_last], axis=1).astype(np.float64) / 1000.0
-    mask = np.isfinite(points).all(axis=1)
-    points = points[mask]
+
+    finite = np.isfinite(points).all(axis=1)
+    if not np.all(finite):
+        points = points[finite]
+        regular_grid = False
+
     if points.shape[0] < 100:
-        raise ValueError(f"Too few valid points ({points.shape[0]}) in {npz_path}")
-    if mask.sum() != n_points:
-        # Non-finite points break grid connectivity assumptions.
-        grid_n = None
-    return points, grid_n
+        raise ValueError(f"Too few valid points in {npz_path}: {points.shape[0]}")
+
+    return points, regular_grid, grid_n
 
 
-def grid_mesh_from_surface(points: np.ndarray, grid_n: int) -> o3d.geometry.TriangleMesh:
-    triangles = []
+def mesh_from_regular_grid(points: np.ndarray, grid_n: int):
+    tris = []
     for j in range(grid_n - 1):
         row = j * grid_n
         row_next = (j + 1) * grid_n
@@ -98,62 +115,72 @@ def grid_mesh_from_surface(points: np.ndarray, grid_n: int) -> o3d.geometry.Tria
             v10 = row + i + 1
             v01 = row_next + i
             v11 = row_next + i + 1
-            triangles.append([v00, v01, v10])
-            triangles.append([v10, v01, v11])
+            tris.append([v00, v01, v10])
+            tris.append([v10, v01, v11])
+
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(points)
-    mesh.triangles = o3d.utility.Vector3iVector(np.asarray(triangles, dtype=np.int32))
+    mesh.triangles = o3d.utility.Vector3iVector(np.asarray(tris, dtype=np.int32))
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
     mesh.compute_vertex_normals()
     return mesh
 
 
-def main() -> None:
+def mesh_from_point_cloud(points: np.ndarray):
+    # Filter z outliers conservatively before reconstruction.
+    z = points[:, 2]
+    q1, q99 = np.quantile(z, [0.01, 0.99])
+    zmask = (z >= q1 - 0.001) & (z <= q99 + 0.001)
+    if np.sum(zmask) >= max(100, int(0.8 * points.shape[0])):
+        points = points[zmask]
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=2.0)
+    if len(pcd.points) < 100:
+        raise RuntimeError("Point cloud too sparse after outlier filtering")
+
+    span = np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
+    diag = float(np.linalg.norm(span))
+    radius = max(diag * 0.03, 1e-4)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60)
+    )
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+    if len(mesh.triangles) == 0:
+        raise RuntimeError("Poisson reconstruction produced empty mesh")
+
+    densities = np.asarray(densities)
+    if densities.size:
+        th = float(np.quantile(densities, 0.02))
+        mesh.remove_vertices_by_mask(densities < th)
+
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def main():
     args = parse_args()
     npz_path = Path(args.input_npz)
     stl_path = Path(args.output_stl)
     stl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    points, grid_n = load_points(npz_path)
+    points, regular_grid, grid_n = load_surface_points(npz_path)
 
-    if grid_n is not None:
-        mesh = grid_mesh_from_surface(points, grid_n)
+    if regular_grid and points.shape[0] == grid_n * grid_n:
+        mesh = mesh_from_regular_grid(points, grid_n)
     else:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-
-        span = points.max(axis=0) - points.min(axis=0)
-        diag = float(np.linalg.norm(span))
-        radius = max(diag * 0.03, 1e-4)
-
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60)
-        )
-        try:
-            pcd.orient_normals_consistent_tangent_plane(50)
-        except RuntimeError:
-            # Some point clouds are sparse near borders; continue with estimated normals.
-            pass
-
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=args.poisson_depth
-        )
-        if len(mesh.triangles) == 0:
-            raise RuntimeError("Poisson reconstruction produced an empty mesh")
-
-        densities = np.asarray(densities)
-        if densities.size:
-            threshold = float(np.quantile(densities, 0.02))
-            mesh.remove_vertices_by_mask(densities < threshold)
-
-        mesh.remove_degenerate_triangles()
-        mesh.remove_duplicated_triangles()
-        mesh.remove_duplicated_vertices()
-        mesh.remove_non_manifold_edges()
-        mesh.compute_vertex_normals()
+        mesh = mesh_from_point_cloud(points)
 
     ok = o3d.io.write_triangle_mesh(str(stl_path), mesh, write_ascii=False)
     if not ok:
-        raise RuntimeError(f"Failed to write STL: {stl_path}")
+        raise RuntimeError(f"Failed to write STL to {stl_path}")
 
     print(f"Converted {npz_path} -> {stl_path} with {len(mesh.triangles)} triangles")
 
@@ -162,152 +189,114 @@ if __name__ == "__main__":
     main()
 '''
 
+
 BLENDER_TEMP_SCRIPT = r'''
 import argparse
-import bmesh
 import math
 from pathlib import Path
+
+import bmesh
 import bpy
 import numpy as np
 
 
 def parse_args():
-    argv = bpy.app.driver_namespace.get("argv")
-    if argv is None:
-        import sys
-        argv = sys.argv
-    user_argv = argv[argv.index("--") + 1 :] if "--" in argv else []
+    import sys
 
-    parser = argparse.ArgumentParser(description="Render STL with marker texture")
-    parser.add_argument("--stl", required=True)
-    parser.add_argument("--marker", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--scale-mm", required=True, type=float)
-    parser.add_argument("--fov-deg", default=40.0, type=float)
-    parser.add_argument("--uv-black-border-ratio", default=0.02, type=float)
-    return parser.parse_args(user_argv)
+    user_argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
+    p = argparse.ArgumentParser(description="Render one STL with all marker textures")
+    p.add_argument("--stl", required=True)
+    p.add_argument("--textures-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--scale-mm", type=float, required=True)
+    p.add_argument(
+        "--camera-mode",
+        choices=["fixed_distance_variable_fov", "fixed_fov_variable_distance"],
+        default="fixed_distance_variable_fov",
+    )
+    p.add_argument("--base-fov-deg", type=float, default=40.0)
+    p.add_argument("--fixed-distance-m", type=float, required=True)
+    p.add_argument("--distance-safety", type=float, default=0.98)
+    return p.parse_args(user_argv)
 
 
 def clean_scene():
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete(use_global=False)
 
-    for mesh in list(bpy.data.meshes):
-        if mesh.users == 0:
-            bpy.data.meshes.remove(mesh)
-    for mat in list(bpy.data.materials):
-        if mat.users == 0:
-            bpy.data.materials.remove(mat)
-    for img in list(bpy.data.images):
-        if img.users == 0:
-            bpy.data.images.remove(img)
+    for block in list(bpy.data.meshes):
+        if block.users == 0:
+            bpy.data.meshes.remove(block)
+    for block in list(bpy.data.materials):
+        if block.users == 0:
+            bpy.data.materials.remove(block)
 
 
-def import_stl(stl_path: str):
+def import_stl(path: str):
     try:
-        bpy.ops.import_mesh.stl(filepath=stl_path)
+        bpy.ops.import_mesh.stl(filepath=path)
     except Exception:
-        bpy.ops.wm.stl_import(filepath=stl_path)
+        bpy.ops.wm.stl_import(filepath=path)
 
     obj = bpy.context.active_object
     if obj is None or obj.type != "MESH":
-        raise RuntimeError("STL import failed or did not produce a mesh object")
+        raise RuntimeError("Failed to import STL mesh")
     return obj
 
 
-def robust_bbox_world(obj):
-    verts_world = np.array(
-        [tuple(obj.matrix_world @ v.co) for v in obj.data.vertices], dtype=np.float64
-    )
-    if verts_world.shape[0] < 8:
-        raise RuntimeError("Mesh has too few vertices")
+def delete_bottom_faces(obj, cutoff_offset=0.002):
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
 
-    q_low = np.quantile(verts_world, 0.02, axis=0)
-    q_high = np.quantile(verts_world, 0.98, axis=0)
+    if not bm.verts:
+        bm.free()
+        raise RuntimeError("Mesh has no vertices")
 
-    min_x, min_y, min_z = [float(v) for v in q_low]
-    max_x, max_y, max_z = [float(v) for v in q_high]
+    z_bottom = min(v.co.z for v in bm.verts)
+    z_top = max(v.co.z for v in bm.verts)
+    z_span = z_top - z_bottom
+    cutoff = z_bottom + cutoff_offset
 
-    width = max(max_x - min_x, 1e-8)
-    height = max(max_y - min_y, 1e-8)
+    # Safety guard: if mesh is effectively a single surface shell (very small z-span),
+    # deleting \"bottom\" faces would remove the whole tactile surface.
+    if z_span < cutoff_offset * 1.2:
+        bm.free()
+        return
+    to_delete = []
+    for f in bm.faces:
+        # Delete only faces near the bottom that are likely underside faces.
+        # This avoids deleting the active top tactile surface on thin meshes.
+        if all(v.co.z < cutoff for v in f.verts) and f.normal.z < -0.05:
+            to_delete.append(f)
 
-    center_x = (min_x + max_x) * 0.5
-    center_y = (min_y + max_y) * 0.5
-    bottom_z = min_z
+    # Extra guard against accidental full mesh deletion.
+    if to_delete and len(to_delete) < int(0.6 * max(len(bm.faces), 1)):
+        bmesh.ops.delete(bm, geom=to_delete, context="FACES")
 
-    return min_x, min_y, width, height, center_x, center_y, bottom_z
-
-
-def make_blacked_border_image(src_img, border_ratio: float):
-    border_ratio = min(max(float(border_ratio), 0.0), 0.2)
-    if border_ratio <= 0.0:
-        return src_img
-
-    width, height = int(src_img.size[0]), int(src_img.size[1])
-    border_px = int(round(min(width, height) * border_ratio))
-    if border_px <= 0:
-        return src_img
-
-    pixels = np.array(src_img.pixels[:], dtype=np.float32).reshape(height, width, 4)
-    pixels[:border_px, :, :3] = 0.0
-    pixels[-border_px:, :, :3] = 0.0
-    pixels[:, :border_px, :3] = 0.0
-    pixels[:, -border_px:, :3] = 0.0
-
-    img = bpy.data.images.new(
-        name=f"{src_img.name}_blacked",
-        width=width,
-        height=height,
-        alpha=True,
-        float_buffer=False,
-    )
-    img.colorspace_settings.name = "sRGB"
-    img.pixels.foreach_set(pixels.reshape(-1))
-    img.update()
-    return img
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
 
 
-def create_material(marker_path: str, uv_black_border_ratio: float):
-    material = bpy.data.materials.new(name="AdapterPrincipled")
-    material.use_nodes = True
-    nodes = material.node_tree.nodes
-    links = material.node_tree.links
+def compute_bbox_world(obj):
+    verts = np.array([tuple(obj.matrix_world @ v.co) for v in obj.data.vertices], dtype=np.float64)
+    if verts.shape[0] < 3:
+        raise RuntimeError("Mesh has too few vertices after cleanup")
 
-    for node in list(nodes):
-        nodes.remove(node)
+    min_x, min_y, min_z = verts.min(axis=0)
+    max_x, max_y, max_z = verts.max(axis=0)
 
-    out = nodes.new("ShaderNodeOutputMaterial")
-    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    tex = nodes.new("ShaderNodeTexImage")
-    tex_coord = nodes.new("ShaderNodeTexCoord")
-
-    marker_img = bpy.data.images.load(marker_path)
-    marker_img.colorspace_settings.name = "sRGB"
-    tex.image = make_blacked_border_image(marker_img, uv_black_border_ratio)
-    # Keep out-of-range UVs black to preserve black sensor coating background.
-    tex.extension = "CLIP"
-    tex.interpolation = "Cubic"
-
-    # Marker appearance is driven by texture itself (black paint + white markers),
-    # not by scene lighting/shadows.
-    bsdf.inputs["Specular"].default_value = 0.0
-    bsdf.inputs["Roughness"].default_value = 0.5
-    bsdf.inputs["Emission Strength"].default_value = 1.0
-
-    links.new(tex_coord.outputs["UV"], tex.inputs["Vector"])
-    links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-    links.new(tex.outputs["Color"], bsdf.inputs["Emission"])
-    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-
-    return material
+    cx = float((min_x + max_x) * 0.5)
+    cy = float((min_y + max_y) * 0.5)
+    z_top = float(max_z)
+    return cx, cy, z_top
 
 
-def apply_uv_relative(
-    obj,
-    center_x: float,
-    center_y: float,
-    scale_mm: float,
-):
+def apply_uv_math(obj, cx: float, cy: float, scale_m: float):
+    if scale_m <= 0:
+        raise ValueError("scale_m must be > 0")
+
     me = obj.data
     bm = bmesh.new()
     bm.from_mesh(me)
@@ -316,34 +305,42 @@ def apply_uv_relative(
     if uv_layer is None:
         uv_layer = bm.loops.layers.uv.new("UVMap")
 
-    # Prefer material-coordinate UVs derived from vertex index on regular grids.
-    # This preserves marker deformation instead of re-projecting onto deformed XY.
-    n_verts = len(me.vertices)
-    grid_n = int(round(math.sqrt(n_verts)))
-    if grid_n * grid_n == n_verts and grid_n > 1:
-        inv = 1.0 / float(grid_n - 1)
-        for face in bm.faces:
-            for loop in face.loops:
-                vidx = loop.vert.index
-                i = vidx % grid_n
-                j = vidx // grid_n
-                u = float(i) * inv
-                v = float(j) * inv
-                loop[uv_layer].uv = (u, v)
-    else:
-        scale_m = max(scale_mm / 1000.0, 1e-8)
-        min_x = center_x - scale_m * 0.5
-        min_y = center_y - scale_m * 0.5
-        for face in bm.faces:
-            for loop in face.loops:
-                world_co = obj.matrix_world @ loop.vert.co
-                u = (world_co.x - min_x) / scale_m
-                v = (world_co.y - min_y) / scale_m
-                loop[uv_layer].uv = (u, v)
+    for face in bm.faces:
+        for loop in face.loops:
+            w = obj.matrix_world @ loop.vert.co
+            u = (w.x - cx) / scale_m + 0.5
+            v = (w.y - cy) / scale_m + 0.5
+            loop[uv_layer].uv = (u, v)
 
     bm.to_mesh(me)
     bm.free()
     me.update()
+
+
+def setup_material():
+    mat = bpy.data.materials.new("MarkerMaterial")
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    for n in list(nodes):
+        nodes.remove(n)
+
+    out = nodes.new("ShaderNodeOutputMaterial")
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    tex = nodes.new("ShaderNodeTexImage")
+    uv = nodes.new("ShaderNodeTexCoord")
+
+    tex.extension = "EXTEND"
+    tex.interpolation = "Cubic"
+
+    bsdf.inputs["Specular"].default_value = 0.0
+    bsdf.inputs["Roughness"].default_value = 0.45
+
+    links.new(uv.outputs["UV"], tex.inputs["Vector"])
+    links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    return mat, tex
 
 
 def setup_world_light():
@@ -351,85 +348,134 @@ def setup_world_light():
     if scene.world is None:
         scene.world = bpy.data.worlds.new("World")
     scene.world.use_nodes = True
-
     nodes = scene.world.node_tree.nodes
     bg = nodes.get("Background")
     if bg is None:
         bg = nodes.new("ShaderNodeBackground")
-    # Match GenForce-style black background.
-    bg.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
-    bg.inputs["Strength"].default_value = 0.0
+    bg.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    bg.inputs["Strength"].default_value = 60.0
 
-def setup_camera(center_x: float, center_y: float, bottom_z: float, scale_mm: float, fov_deg: float):
+
+def setup_camera(
+    cx: float,
+    cy: float,
+    z_top: float,
+    scale_m: float,
+    camera_mode: str,
+    base_fov_deg: float,
+    fixed_distance_m: float,
+    distance_safety: float,
+):
     scene = bpy.context.scene
 
-    camera_data = bpy.data.cameras.new("AdapterCamera")
-    camera_data.type = "PERSP"
-    camera_data.sensor_fit = "HORIZONTAL"
+    cam_data = bpy.data.cameras.new("ScaleCam")
+    cam_data.type = "PERSP"
+    cam_data.sensor_fit = "HORIZONTAL"
+    cam_data.clip_start = 0.0001
+    cam_data.clip_end = 100.0
 
-    fov_h = math.radians(fov_deg)
-    camera_data.angle = fov_h
+    if scale_m <= 0:
+        raise ValueError("scale_m must be > 0")
+    if fixed_distance_m <= 0:
+        raise ValueError("fixed_distance_m must be > 0")
 
-    scale_m = scale_mm / 1000.0
-    distance = (scale_m / 2.0) / math.tan(fov_h / 2.0)
-    # Important for mm-scale scenes: Blender default clip_start (0.1m) would clip
-    # the entire tactile surface because camera distance is around 0.02-0.03m.
-    camera_data.clip_start = 1e-4
-    camera_data.clip_end = 10.0
+    if camera_mode == "fixed_distance_variable_fov":
+        distance = fixed_distance_m
+        fov = 2.0 * math.atan((scale_m / 2.0) / distance)
+    else:
+        fov = math.radians(base_fov_deg)
+        if fov <= 1e-6 or fov >= math.pi - 1e-6:
+            raise ValueError("base_fov_deg produces invalid camera angle")
+        distance = (scale_m / 2.0) / math.tan(fov / 2.0)
+        distance *= distance_safety
 
-    cam_obj = bpy.data.objects.new("AdapterCamera", camera_data)
-    cam_obj.location = (center_x, center_y, bottom_z - distance)
-    cam_obj.rotation_euler = (math.pi, 0.0, 0.0)
+    cam_data.angle = fov
 
-    scene.collection.objects.link(cam_obj)
-    scene.camera = cam_obj
+    cam = bpy.data.objects.new("ScaleCam", cam_data)
+    cam.location = (cx, cy, z_top - distance)
+    cam.rotation_euler = (math.pi, 0.0, 0.0)
+
+    scene.collection.objects.link(cam)
+    scene.camera = cam
+    print(
+        f"Camera setup | mode={camera_mode} scale_mm={scale_m*1000.0:.1f} "
+        f"fov_deg={math.degrees(fov):.4f} distance_m={distance:.6f}"
+    )
 
 
-def configure_render(output_path: str):
+def configure_render(out_dir: Path):
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
     if hasattr(scene, "cycles"):
         scene.cycles.samples = 64
         scene.cycles.use_adaptive_sampling = True
-        scene.cycles.sample_clamp_direct = 2.0
-        scene.cycles.sample_clamp_indirect = 2.0
         scene.cycles.max_bounces = 4
-    scene.render.image_settings.file_format = "JPEG"
-    scene.render.image_settings.quality = 100
+        scene.cycles.device = "CPU"
+
     scene.render.resolution_x = 640
     scene.render.resolution_y = 480
     scene.render.resolution_percentage = 100
-    # Keep texture contrast stable for marker visibility.
+    scene.render.image_settings.file_format = "JPEG"
+    scene.render.image_settings.quality = 100
+
     scene.view_settings.view_transform = "Standard"
     scene.view_settings.exposure = 0.0
     scene.view_settings.gamma = 1.0
-    scene.render.filepath = output_path
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+
+def list_textures(textures_dir: Path):
+    exts = {".jpg", ".jpeg", ".png"}
+    paths = sorted([p for p in textures_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
+    if not paths:
+        raise FileNotFoundError(f"No texture files found in {textures_dir}")
+    return paths
 
 
 def main():
     args = parse_args()
-
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    stl = Path(args.stl)
+    textures_dir = Path(args.textures_dir)
+    output_dir = Path(args.output_dir)
 
     clean_scene()
-    obj = import_stl(args.stl)
+    obj = import_stl(str(stl))
+    delete_bottom_faces(obj, cutoff_offset=0.002)
 
-    min_x, min_y, width, height, center_x, center_y, bottom_z = robust_bbox_world(obj)
+    scale_m = float(args.scale_mm) / 1000.0
+    cx, cy, z_top = compute_bbox_world(obj)
+    apply_uv_math(obj, cx, cy, scale_m)
 
-    material = create_material(args.marker, args.uv_black_border_ratio)
+    mat, tex_node = setup_material()
     if obj.data.materials:
-        obj.data.materials[0] = material
+        obj.data.materials[0] = mat
     else:
-        obj.data.materials.append(material)
+        obj.data.materials.append(mat)
 
-    apply_uv_relative(obj, center_x, center_y, args.scale_mm)
     setup_world_light()
-    setup_camera(center_x, center_y, bottom_z, args.scale_mm, args.fov_deg)
-    configure_render(str(out_path))
+    setup_camera(
+        cx,
+        cy,
+        z_top,
+        scale_m,
+        args.camera_mode,
+        args.base_fov_deg,
+        args.fixed_distance_m,
+        args.distance_safety,
+    )
+    configure_render(output_dir)
 
-    bpy.ops.render.render(write_still=True)
-    print(f"Rendered image to {out_path}")
+    textures = list_textures(textures_dir)
+    for tex_path in textures:
+        img = bpy.data.images.load(str(tex_path), check_existing=True)
+        img.colorspace_settings.name = "sRGB"
+        tex_node.image = img
+
+        out_file = output_dir / f"marker_{tex_path.stem}.jpg"
+        bpy.context.scene.render.filepath = str(out_file)
+        bpy.ops.render.render(write_still=True)
+        print(f"Rendered: {out_file}")
 
 
 if __name__ == "__main__":
@@ -437,162 +483,16 @@ if __name__ == "__main__":
 '''
 
 
-@dataclass(frozen=True)
-class EpisodeJob:
-    global_idx: int
-    indenter_name: str
-    repeat_idx: int
-
-
-@contextmanager
-def locked_file(lock_path: Path):
-    """Cross-process exclusive file lock."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w", encoding="utf-8") as lock_fp:
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate parallel-universe multiscale dataset from GenForce simulation."
-    )
-    parser.add_argument(
-        "--repo-root",
-        type=Path,
-        default=Path(__file__).resolve().parent,
-        help="Path to GenForce repository root.",
-    )
-    parser.add_argument("--particle", type=str, default="100000")
-    parser.add_argument("--episodes-per-indenter", type=int, default=1)
-    parser.add_argument("--scales-mm", type=int, nargs="+", default=DEFAULT_SCALES_MM)
-
-    parser.add_argument("--x-min", type=int, default=-4)
-    parser.add_argument("--x-max", type=int, default=4)
-    parser.add_argument("--y-min", type=int, default=-4)
-    parser.add_argument("--y-max", type=int, default=4)
-    parser.add_argument("--xy-step", type=int, default=1)
-
-    parser.add_argument("--depth-min", type=float, default=0.3)
-    parser.add_argument("--depth-max", type=float, default=1.5)
-    parser.add_argument("--depth-step", type=float, default=0.1)
-
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fov-deg", type=float, default=DEFAULT_FOV_DEG)
-    parser.add_argument(
-        "--uv-black-border-ratio",
-        type=float,
-        default=0.02,
-        help="Fraction of marker texture border (per side) forced to black before rendering.",
-    )
-    parser.add_argument(
-        "--scale-mode",
-        type=str,
-        default="virtual",
-        choices=["virtual", "physical"],
-        help="`virtual`: one physics run per episode, per-scale camera/marker remap only; "
-        "`physical`: rerun physics for every scale with elastomer size patching.",
-    )
-    parser.add_argument(
-        "--press-position-mode",
-        type=str,
-        default="absolute",
-        choices=["absolute", "scaled"],
-        help="`absolute`: same x/y(mm) across scales; "
-        "`scaled`: x/y(mm) scale linearly with target scale using a reference scale.",
-    )
-    parser.add_argument(
-        "--press-reference-scale-mm",
-        type=int,
-        default=None,
-        help="Reference scale for `--press-position-mode scaled`. "
-        "If omitted, uses `--physics-scale-mm` in virtual mode (if set) else max(scales).",
-    )
-    parser.add_argument(
-        "--physics-scale-mm",
-        type=int,
-        default=None,
-        help="Only used in `virtual` mode. If set, force elastomer.size.l/w to this value before physics.",
-    )
-
-    parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        default=Path("adapter_dataset"),
-        help="Relative to repo root unless absolute path is provided.",
-    )
-
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=1,
-        help="Shard total jobs for multi-process execution.",
-    )
-    parser.add_argument(
-        "--worker-id",
-        type=int,
-        default=0,
-        help="Current worker id in [0, num_workers-1].",
-    )
-
-    parser.add_argument(
-        "--episode-offset",
-        type=int,
-        default=0,
-        help="Additive offset for episode index in folder naming.",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip episode folder if it already exists.",
-    )
-    parser.add_argument(
-        "--keep-intermediates",
-        action="store_true",
-        help="Keep temporary npz/stl and temp scripts for debugging.",
-    )
-    parser.add_argument(
-        "--blender-cmd",
-        type=str,
-        default="blender",
-        help="Blender executable command.",
-    )
-    parser.add_argument(
-        "--python-cmd",
-        type=str,
-        default=sys.executable,
-        help="Python executable used for subprocess scripts.",
-    )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
-
-    args = parser.parse_args()
-
-    if args.episodes_per_indenter <= 0:
-        parser.error("--episodes-per-indenter must be > 0")
-    if args.xy_step <= 0:
-        parser.error("--xy-step must be > 0")
-    if args.depth_step <= 0:
-        parser.error("--depth-step must be > 0")
-    if args.num_workers <= 0:
-        parser.error("--num-workers must be > 0")
-    if not (0 <= args.worker_id < args.num_workers):
-        parser.error("--worker-id must satisfy 0 <= worker_id < num_workers")
-    if args.physics_scale_mm is not None and args.physics_scale_mm <= 0:
-        parser.error("--physics-scale-mm must be > 0 when provided")
-    if args.press_reference_scale_mm is not None and args.press_reference_scale_mm <= 0:
-        parser.error("--press-reference-scale-mm must be > 0 when provided")
-    if not (0.0 <= args.uv_black_border_ratio <= 0.2):
-        parser.error("--uv-black-border-ratio must be in [0.0, 0.2]")
-
-    return args
+@dataclass
+class EpisodeState:
+    episode_id: int
+    indenter: str
+    x_mm: float
+    y_mm: float
+    depth_mm: float
+    episode_dir: Path
+    scales: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
 
 
 def setup_logging(level: str) -> None:
@@ -603,158 +503,35 @@ def setup_logging(level: str) -> None:
     )
 
 
-def resolve_path(base_root: Path, path_value: Path) -> Path:
-    return path_value if path_value.is_absolute() else (base_root / path_value)
+def resolve_path(base: Path, value: Path) -> Path:
+    return value if value.is_absolute() else (base / value)
 
 
-def list_indenter_npys(indenter_npy_dir: Path) -> List[Path]:
-    npys = sorted(p for p in indenter_npy_dir.glob("*.npy") if p.is_file())
-    if not npys:
-        raise FileNotFoundError(
-            f"No .npy indenters found in {indenter_npy_dir}. "
-            "Run sim/deformation/1_stl2npy.py first."
-        )
-    return npys
-
-
-def list_marker_images(marker_dir: Path) -> List[Path]:
-    markers = sorted(
-        p
-        for p in marker_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"} and not p.name.startswith(".")
-    )
-    if not markers:
-        raise FileNotFoundError(f"No marker images found in {marker_dir}")
-    return markers
-
-
-def build_jobs(indenter_files: Sequence[Path], episodes_per_indenter: int) -> List[EpisodeJob]:
-    jobs: List[EpisodeJob] = []
-    global_idx = 0
-    for indenter in indenter_files:
-        indenter_name = indenter.stem
-        for repeat_idx in range(episodes_per_indenter):
-            jobs.append(EpisodeJob(global_idx=global_idx, indenter_name=indenter_name, repeat_idx=repeat_idx))
-            global_idx += 1
-    return jobs
-
-
-def split_jobs_for_worker(jobs: Sequence[EpisodeJob], worker_id: int, num_workers: int) -> List[EpisodeJob]:
-    return [job for i, job in enumerate(jobs) if i % num_workers == worker_id]
-
-
-def depth_candidates(depth_min: float, depth_max: float, depth_step: float) -> np.ndarray:
-    values = np.arange(depth_min, depth_max + 1e-8, depth_step, dtype=np.float64)
-    if values.size == 0:
-        raise ValueError("No depth candidates generated. Check depth range/step.")
-    return np.round(values, 1)
-
-
-def sample_contact(
-    rng: random.Random, xs: Sequence[int], ys: Sequence[int], depths: Sequence[float]
-) -> Tuple[float, float, float]:
-    x = float(rng.choice(xs))
-    y = float(rng.choice(ys))
-    depth = float(rng.choice(depths))
-    return x, y, round(depth, 1)
-
-
-def resolve_press_reference_scale_mm(args: argparse.Namespace, scales_mm: Sequence[int]) -> int:
-    if args.press_reference_scale_mm is not None:
-        return int(args.press_reference_scale_mm)
-    if args.scale_mode == "virtual" and args.physics_scale_mm is not None:
-        return int(args.physics_scale_mm)
-    return int(max(scales_mm))
-
-
-def press_xy_for_scale(
-    base_x_mm: float,
-    base_y_mm: float,
-    scale_mm: int,
-    reference_scale_mm: int,
-    mode: str,
-) -> Tuple[float, float]:
-    if mode == "absolute":
-        return float(base_x_mm), float(base_y_mm)
-    scale_ratio = float(scale_mm) / float(reference_scale_mm)
-    # Keep sub-mm coordinates in scaled mode to avoid cross-scale jump caused by int rounding.
-    x_mm = round(float(base_x_mm) * scale_ratio, 4)
-    y_mm = round(float(base_y_mm) * scale_ratio, 4)
-    return x_mm, y_mm
-
-
-def write_temp_script(script_text: str, prefix: str) -> Path:
-    fd, script_path = tempfile.mkstemp(prefix=prefix, suffix=".py")
-    os.close(fd)
-    path = Path(script_path)
-    path.write_text(script_text, encoding="utf-8")
-    return path
-
-
-def validate_embedded_script(script_text: str, script_name: str) -> None:
-    try:
-        ast.parse(script_text)
-    except SyntaxError as exc:
-        raise SyntaxError(f"Embedded script '{script_name}' has invalid syntax: {exc}") from exc
-
-
-def run_subprocess(cmd: Sequence[str], cwd: Path, stage_name: str) -> None:
-    logging.debug("Running [%s]: %s", stage_name, " ".join(cmd))
-    subprocess.run(cmd, cwd=str(cwd), check=True)
-
-
-def read_yaml(path: Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def write_yaml(path: Path, data: dict) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False)
-
-
-def set_elastomer_scale(parameters_yml: Path, scale_mm: int) -> None:
-    data = read_yaml(parameters_yml)
-    try:
-        data["elastomer"]["size"]["l"] = int(scale_mm)
-        data["elastomer"]["size"]["w"] = int(scale_mm)
-    except Exception as exc:
-        raise KeyError("Expected keys elastomer.size.l and elastomer.size.w in parameters.yml") from exc
-    write_yaml(parameters_yml, data)
-
-
-def patch_coords_16x16(scale_mm: int) -> List[List[List[float]]]:
-    axis = np.linspace(-scale_mm / 2.0, scale_mm / 2.0, 16, dtype=np.float64)
-    xx, yy = np.meshgrid(axis, axis, indexing="xy")
-    coords = np.stack([xx, yy], axis=-1)
-    coords = np.round(coords, 6)
-    return coords.tolist()
-
-
-def format_coord_for_suffix(v: float) -> str:
+def format_coord_suffix(v: float) -> str:
     if abs(v - round(v)) < 1e-9:
         return str(int(round(v)))
     s = f"{float(v):.4f}".rstrip("0").rstrip(".")
     return "0" if s == "-0" else s
 
 
-def expected_npz_path(npz_output_root: Path, indenter_name: str, x: float, y: float, depth: float) -> Path:
-    suffix = f"{format_coord_for_suffix(x)}_{format_coord_for_suffix(y)}_{round(depth, 1)}.npz"
-    return npz_output_root / indenter_name / suffix
+def expected_npz_path(npz_root: Path, indenter: str, x_mm: float, y_mm: float, depth_mm: float) -> Path:
+    suffix = f"{format_coord_suffix(x_mm)}_{format_coord_suffix(y_mm)}_{round(depth_mm, 1)}.npz"
+    return npz_root / indenter / suffix
 
 
 def npz_deformation_stats(npz_path: Path) -> Dict[str, float]:
     data = np.load(npz_path)
-    pz = np.asarray(data["p_zpos_list"], dtype=np.float64)
-    if pz.ndim != 2 or pz.shape[0] < 2:
+    z = np.asarray(data["p_zpos_list"], dtype=np.float64)
+    if z.ndim != 2 or z.shape[0] < 2:
         return {
             "surface_max_down_mm": 0.0,
             "surface_mean_down_mm": 0.0,
-            "surface_min_z_start_mm": float(np.min(pz)) if pz.size else 0.0,
-            "surface_min_z_end_mm": float(np.min(pz)) if pz.size else 0.0,
+            "surface_min_z_start_mm": float(np.min(z)) if z.size else 0.0,
+            "surface_min_z_end_mm": float(np.min(z)) if z.size else 0.0,
         }
-    start = pz[0]
-    end = pz[-1]
+
+    start = z[0]
+    end = z[-1]
     down = start - end
     return {
         "surface_max_down_mm": float(np.max(down)),
@@ -764,317 +541,317 @@ def npz_deformation_stats(npz_path: Path) -> Dict[str, float]:
     }
 
 
-def safe_unlink(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
+def patch_coords_16x16(scale_mm: int) -> List[List[List[float]]]:
+    axis = np.linspace(-scale_mm / 2.0, scale_mm / 2.0, 16, dtype=np.float64)
+    xx, yy = np.meshgrid(axis, axis, indexing="xy")
+    coords = np.stack([xx, yy], axis=-1)
+    return np.round(coords, 6).tolist()
 
 
-def to_metadata_path(path: Path, base: Path) -> str:
-    try:
-        return str(path.relative_to(base))
-    except ValueError:
-        return str(path)
+def run_cmd_checked(cmd: Sequence[str], cwd: Path, timeout_sec: int, stage: str) -> None:
+    proc = subprocess.run(
+        list(cmd),
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+    combined = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    blender_python_error = "Error: Python:" in combined
+
+    # Blender can return exit code 0 even when its embedded Python script crashed.
+    if proc.returncode != 0 or blender_python_error:
+        stderr_tail = (proc.stderr or "")[-2000:]
+        stdout_tail = (proc.stdout or "")[-1200:]
+        raise RuntimeError(
+            f"{stage} failed (exit={proc.returncode}, blender_python_error={blender_python_error})\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"STDERR(tail):\n{stderr_tail}\n"
+            f"STDOUT(tail):\n{stdout_tail}"
+        )
 
 
-def run_episode(
-    repo_root: Path,
-    job: EpisodeJob,
-    episode_id: int,
-    scales_mm: Sequence[int],
-    marker_path: Path,
-    x: float,
-    y: float,
-    depth: float,
-    args: argparse.Namespace,
-    parameters_yml: Path,
-    lock_path: Path,
-    npz2stl_script: Path,
-    blender_script: Path,
-    output_root: Path,
-) -> None:
-    episode_dir = output_root / f"episode_{episode_id:06d}"
-    if episode_dir.exists() and args.skip_existing:
-        logging.info("Skipping existing episode folder: %s", episode_dir)
-        return
-    episode_dir.mkdir(parents=True, exist_ok=True)
-
-    work_dir = Path(tempfile.mkdtemp(prefix=f"multiscale_ep_{episode_id:06d}_"))
-    npz_output_root = work_dir / "npz"
-    press_ref_scale_mm = resolve_press_reference_scale_mm(args, scales_mm)
-
-    metadata: Dict[str, object] = {
-        "episode_id": episode_id,
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "worker": {"worker_id": args.worker_id, "num_workers": args.num_workers},
-        "indenter": job.indenter_name,
-        "particle": str(args.particle),
-        "scale_mode": args.scale_mode,
-        "press_position_mode": args.press_position_mode,
-        "press_reference_scale_mm": press_ref_scale_mm,
-        "physics_scale_mm": args.physics_scale_mm,
-        "contact": {"x_mm": x, "y_mm": y, "depth_mm": depth},
-        "marker_image": to_metadata_path(marker_path, repo_root),
-        "scales": {},
-    }
+def write_scaled_config(base_cfg: Path, out_cfg: Path, scale_mm: int) -> None:
+    with open(base_cfg, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
 
     try:
-        if args.scale_mode == "virtual":
-            # In virtual mode, run one physics simulation and render it with multiple
-            # virtual physical windows (`scale_mm`) via UV/camera remapping.
-            if args.press_position_mode == "scaled":
-                logging.warning(
-                    "Episode %06d uses `virtual` mode with `press-position-mode=scaled`: "
-                    "physics runs once at reference-scale coordinates (x=%.4f, y=%.4f), "
-                    "so rendered normalized position varies with scale.",
-                    episode_id,
-                    x,
-                    y,
-                )
-            logging.info(
-                "Episode %06d | indenter=%s | virtual physics | contact=(x=%.4f, y=%.4f, d=%.1f)",
-                episode_id,
-                job.indenter_name,
-                x,
-                y,
-                depth,
-            )
-            with locked_file(lock_path):
-                if args.physics_scale_mm is not None:
-                    set_elastomer_scale(parameters_yml, int(args.physics_scale_mm))
-                run_subprocess(
-                    [
-                        args.python_cmd,
-                        "sim/deformation/gel_press.py",
-                        "--config",
-                        "sim/parameters.yml",
-                        "--particle",
-                        str(args.particle),
-                        "--dir_output",
-                        str(npz_output_root),
-                        "--dataset",
-                        "sim/assets/indenters/input",
-                        "--object",
-                        job.indenter_name,
-                        "--x",
-                        str(x),
-                        "--y",
-                        str(y),
-                        "--depth",
-                        f"{depth:.1f}",
-                    ],
-                    cwd=repo_root,
-                    stage_name="gel_press",
-                )
+        data["elastomer"]["size"]["l"] = int(scale_mm)
+        data["elastomer"]["size"]["w"] = int(scale_mm)
+    except Exception as exc:
+        raise KeyError("Missing elastomer.size.l/w in parameters yaml") from exc
 
-            npz_path = expected_npz_path(npz_output_root, job.indenter_name, x, y, depth)
-            if not npz_path.exists():
-                x_tag = format_coord_for_suffix(x)
-                y_tag = format_coord_for_suffix(y)
-                fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x_tag}_{y_tag}_*.npz"))
-                if not fallback:
-                    raise FileNotFoundError(f"Expected deformation npz not found at {npz_path}")
-                npz_path = fallback[-1]
-            deform_stats = npz_deformation_stats(npz_path)
-            logging.info(
-                "Episode %06d | virtual physics deformation max_down=%.4fmm mean_down=%.4fmm",
-                episode_id,
-                deform_stats["surface_max_down_mm"],
-                deform_stats["surface_mean_down_mm"],
-            )
+    with open(out_cfg, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, sort_keys=False)
 
-            stl_path = work_dir / f"{job.indenter_name}_ep{episode_id:06d}.stl"
-            run_subprocess(
-                [
-                    args.python_cmd,
-                    str(npz2stl_script),
-                    "--input-npz",
-                    str(npz_path),
-                    "--output-stl",
-                    str(stl_path),
-                    "--poisson-depth",
-                    "9",
-                ],
-                cwd=repo_root,
-                stage_name="npz_to_stl",
-            )
 
-            for scale_mm in scales_mm:
-                scale_dir = episode_dir / f"scale_{scale_mm}mm"
-                scale_dir.mkdir(parents=True, exist_ok=True)
-                render_path = scale_dir / "render.jpg"
+def run_physics_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    episode_id = int(task["episode_id"])
+    scale_mm = int(task["scale_mm"])
+    indenter = str(task["indenter"])
+    x_mm = float(task["x_mm"])
+    y_mm = float(task["y_mm"])
+    depth_mm = float(task["depth_mm"])
 
-                logging.info(
-                    "Episode %06d | indenter=%s | render scale=%dmm",
-                    episode_id,
-                    job.indenter_name,
-                    scale_mm,
-                )
-                run_subprocess(
-                    [
-                        args.blender_cmd,
-                        "-b",
-                        "--python",
-                        str(blender_script),
-                        "--",
-                        "--stl",
-                        str(stl_path),
-                        "--marker",
-                        str(marker_path),
-                        "--output",
-                        str(render_path),
-                        "--scale-mm",
-                        str(scale_mm),
-                        "--fov-deg",
-                        str(args.fov_deg),
-                        "--uv-black-border-ratio",
-                        str(args.uv_black_border_ratio),
-                    ],
-                    cwd=repo_root,
-                    stage_name="blender_render",
-                )
+    repo_root = Path(task["repo_root"])
+    temp_scale_dir = Path(task["temp_scale_dir"])
+    temp_scale_dir.mkdir(parents=True, exist_ok=True)
 
-                metadata["scales"][f"{scale_mm}mm"] = {
-                    "scale_mm": int(scale_mm),
-                    "contact_x_mm": float(x),
-                    "contact_y_mm": float(y),
-                    "deformation_stats": deform_stats,
-                    "render_image": str(render_path.relative_to(episode_dir)),
-                    "patch_coords_16x16": patch_coords_16x16(int(scale_mm)),
-                }
+    base_cfg = Path(task["base_parameters"])
+    temp_cfg = temp_scale_dir / "parameters_scaled.yml"
+    npz_root = temp_scale_dir / "npz"
+    npz_root.mkdir(parents=True, exist_ok=True)
 
-            if not args.keep_intermediates:
-                safe_unlink(npz_path)
-                safe_unlink(stl_path)
+    try:
+        write_scaled_config(base_cfg, temp_cfg, scale_mm)
 
-        else:
-            for scale_mm in scales_mm:
-                x_scale_mm, y_scale_mm = press_xy_for_scale(
-                    x,
-                    y,
-                    int(scale_mm),
-                    press_ref_scale_mm,
-                    args.press_position_mode,
-                )
-                scale_dir = episode_dir / f"scale_{scale_mm}mm"
-                scale_dir.mkdir(parents=True, exist_ok=True)
-                render_path = scale_dir / "render.jpg"
+        gel_cmd = [
+            str(task["python_cmd"]),
+            "sim/deformation/gel_press.py",
+            "--config",
+            str(temp_cfg),
+            "--particle",
+            str(task["particle"]),
+            "--dir_output",
+            str(npz_root),
+            "--dataset",
+            "sim/assets/indenters/input",
+            "--object",
+            indenter,
+            "--x",
+            f"{x_mm:.4f}",
+            "--y",
+            f"{y_mm:.4f}",
+            "--depth",
+            f"{depth_mm:.1f}",
+        ]
+        run_cmd_checked(gel_cmd, cwd=repo_root, timeout_sec=int(task["physics_timeout_sec"]), stage="gel_press")
 
-                logging.info(
-                    "Episode %06d | indenter=%s | physical scale=%dmm | contact=(x=%.4f, y=%.4f, d=%.1f)",
-                    episode_id,
-                    job.indenter_name,
-                    scale_mm,
-                    x_scale_mm,
-                    y_scale_mm,
-                    depth,
-                )
+        npz_path = expected_npz_path(npz_root, indenter, x_mm, y_mm, depth_mm)
+        if not npz_path.exists():
+            x_tag = format_coord_suffix(x_mm)
+            y_tag = format_coord_suffix(y_mm)
+            candidates = sorted((npz_root / indenter).glob(f"{x_tag}_{y_tag}_*.npz"))
+            if not candidates:
+                raise FileNotFoundError(f"No deformation npz found for {indenter} at {npz_root}")
+            npz_path = candidates[-1]
 
-                # Step A + B are inside one lock so multiple workers do not race on sim/parameters.yml.
-                with locked_file(lock_path):
-                    set_elastomer_scale(parameters_yml, scale_mm)
-                    run_subprocess(
-                        [
-                            args.python_cmd,
-                            "sim/deformation/gel_press.py",
-                            "--config",
-                            "sim/parameters.yml",
-                            "--particle",
-                            str(args.particle),
-                            "--dir_output",
-                            str(npz_output_root),
-                            "--dataset",
-                            "sim/assets/indenters/input",
-                            "--object",
-                            job.indenter_name,
-                            "--x",
-                            str(x_scale_mm),
-                            "--y",
-                            str(y_scale_mm),
-                            "--depth",
-                            f"{depth:.1f}",
-                        ],
-                        cwd=repo_root,
-                        stage_name="gel_press",
-                    )
+        stl_path = temp_scale_dir / f"{indenter}_ep{episode_id:06d}_s{scale_mm}.stl"
+        mesh_cmd = [
+            str(task["python_cmd"]),
+            str(task["open3d_script"]),
+            "--input-npz",
+            str(npz_path),
+            "--output-stl",
+            str(stl_path),
+        ]
+        run_cmd_checked(mesh_cmd, cwd=repo_root, timeout_sec=int(task["physics_timeout_sec"]), stage="npz_to_stl")
 
-                npz_path = expected_npz_path(npz_output_root, job.indenter_name, x_scale_mm, y_scale_mm, depth)
-                if not npz_path.exists():
-                    x_tag = format_coord_for_suffix(x_scale_mm)
-                    y_tag = format_coord_for_suffix(y_scale_mm)
-                    fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x_tag}_{y_tag}_*.npz"))
-                    if not fallback:
-                        raise FileNotFoundError(f"Expected deformation npz not found at {npz_path}")
-                    npz_path = fallback[-1]
-                deform_stats = npz_deformation_stats(npz_path)
-                logging.info(
-                    "Episode %06d | physical scale=%dmm deformation max_down=%.4fmm mean_down=%.4fmm",
-                    episode_id,
-                    int(scale_mm),
-                    deform_stats["surface_max_down_mm"],
-                    deform_stats["surface_mean_down_mm"],
-                )
+        deform = npz_deformation_stats(npz_path)
 
-                stl_path = work_dir / f"{job.indenter_name}_ep{episode_id:06d}_s{scale_mm}.stl"
-                run_subprocess(
-                    [
-                        args.python_cmd,
-                        str(npz2stl_script),
-                        "--input-npz",
-                        str(npz_path),
-                        "--output-stl",
-                        str(stl_path),
-                        "--poisson-depth",
-                        "9",
-                    ],
-                    cwd=repo_root,
-                    stage_name="npz_to_stl",
-                )
-                run_subprocess(
-                    [
-                        args.blender_cmd,
-                        "-b",
-                        "--python",
-                        str(blender_script),
-                        "--",
-                        "--stl",
-                        str(stl_path),
-                        "--marker",
-                        str(marker_path),
-                        "--output",
-                        str(render_path),
-                        "--scale-mm",
-                        str(scale_mm),
-                        "--fov-deg",
-                        str(args.fov_deg),
-                        "--uv-black-border-ratio",
-                        str(args.uv_black_border_ratio),
-                    ],
-                    cwd=repo_root,
-                    stage_name="blender_render",
-                )
+        return {
+            "status": "ok",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "indenter": indenter,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "depth_mm": depth_mm,
+            "temp_scale_dir": str(temp_scale_dir),
+            "stl_path": str(stl_path),
+            "deformation_stats": deform,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "indenter": indenter,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "depth_mm": depth_mm,
+            "temp_scale_dir": str(temp_scale_dir),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
 
-                metadata["scales"][f"{scale_mm}mm"] = {
-                    "scale_mm": int(scale_mm),
-                    "contact_x_mm": float(x_scale_mm),
-                    "contact_y_mm": float(y_scale_mm),
-                    "deformation_stats": deform_stats,
-                    "render_image": str(render_path.relative_to(episode_dir)),
-                    "patch_coords_16x16": patch_coords_16x16(int(scale_mm)),
-                }
 
-                if not args.keep_intermediates:
-                    safe_unlink(npz_path)
-                    safe_unlink(stl_path)
+def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    episode_id = int(task["episode_id"])
+    scale_mm = int(task["scale_mm"])
+    repo_root = Path(task["repo_root"])
+    scale_dir = Path(task["scale_dir"])
+    scale_dir.mkdir(parents=True, exist_ok=True)
 
-        metadata_path = episode_dir / "metadata.json"
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
+    stl_path = Path(task["stl_path"])
+    temp_scale_dir = Path(task["temp_scale_dir"])
+    keep_intermediates = bool(task["keep_intermediates"])
 
+    try:
+        render_cmd = [
+            str(task["blender_cmd"]),
+            "-b",
+            "--python",
+            str(task["blender_script"]),
+            "--",
+            "--stl",
+            str(stl_path),
+            "--textures-dir",
+            str(task["textures_dir"]),
+            "--output-dir",
+            str(scale_dir),
+            "--scale-mm",
+            str(scale_mm),
+            "--camera-mode",
+            str(task["camera_mode"]),
+            "--base-fov-deg",
+            str(task["base_fov_deg"]),
+            "--fixed-distance-m",
+            str(task["fixed_distance_m"]),
+            "--distance-safety",
+            str(task["distance_safety"]),
+        ]
+        run_cmd_checked(
+            render_cmd,
+            cwd=repo_root,
+            timeout_sec=int(task["render_timeout_sec"]),
+            stage="blender_render",
+        )
+
+        patch_path = scale_dir / "patch_coords_16x16.json"
+        with open(patch_path, "w", encoding="utf-8") as f:
+            json.dump(patch_coords_16x16(scale_mm), f, indent=2)
+
+        rendered = sorted(p.name for p in scale_dir.glob("marker_*.jpg"))
+        if not rendered:
+            raise RuntimeError(f"No marker renders produced in {scale_dir}")
+
+        return {
+            "status": "ok",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "scale_dir": str(scale_dir),
+            "patch_path": str(patch_path),
+            "rendered_markers": rendered,
+            "temp_scale_dir": str(temp_scale_dir),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "scale_dir": str(scale_dir),
+            "temp_scale_dir": str(temp_scale_dir),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
     finally:
-        if not args.keep_intermediates:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        if not keep_intermediates:
+            shutil.rmtree(temp_scale_dir, ignore_errors=True)
+
+
+def discover_indenter_names(indenter_dir: Path, subset: Sequence[str] | None) -> List[str]:
+    names = sorted(p.stem for p in indenter_dir.glob("*.npy") if p.is_file())
+    if not names:
+        raise FileNotFoundError(f"No indenter npy files found in {indenter_dir}")
+
+    if subset:
+        subset_set = set(subset)
+        filtered = [n for n in names if n in subset_set]
+        if not filtered:
+            raise ValueError(f"Requested objects not found. Available: {names}")
+        return filtered
+    return names
+
+
+def discover_textures(texture_dir: Path) -> List[Path]:
+    textures = sorted(
+        p for p in texture_dir.iterdir() if p.is_file() and p.suffix.lower() in TEXTURE_EXTS
+    )
+    if not textures:
+        raise FileNotFoundError(f"No marker textures found in {texture_dir}")
+    return textures
+
+
+def create_backup(parameters_path: Path) -> Path:
+    backup_path = parameters_path.with_suffix(parameters_path.suffix + ".bak")
+    if backup_path.exists():
+        # Recover from previous interrupted run.
+        shutil.copy2(backup_path, parameters_path)
+        backup_path.unlink()
+
+    shutil.copy2(parameters_path, backup_path)
+    return backup_path
+
+
+def restore_backup(parameters_path: Path, backup_path: Path) -> None:
+    if backup_path.exists():
+        shutil.copy2(backup_path, parameters_path)
+        backup_path.unlink()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Generate large multiscale tactile dataset.")
+    p.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parent)
+    p.add_argument("--dataset-root", type=Path, default=Path("adapter_dataset_ultimate"))
+
+    p.add_argument("--particle", type=str, default="100000")
+    p.add_argument("--episodes-per-indenter", type=int, default=1)
+    p.add_argument("--scales-mm", type=int, nargs="+", default=DEFAULT_SCALES_MM)
+    p.add_argument("--objects", nargs="*", default=None, help="Optional subset of indenter names")
+
+    p.add_argument("--x-min", type=float, default=DEFAULT_X_RANGE[0])
+    p.add_argument("--x-max", type=float, default=DEFAULT_X_RANGE[1])
+    p.add_argument("--y-min", type=float, default=DEFAULT_Y_RANGE[0])
+    p.add_argument("--y-max", type=float, default=DEFAULT_Y_RANGE[1])
+    p.add_argument("--depth-min", type=float, default=DEFAULT_DEPTH_RANGE[0])
+    p.add_argument("--depth-max", type=float, default=DEFAULT_DEPTH_RANGE[1])
+
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--camera-mode",
+        choices=["fixed_distance_variable_fov", "fixed_fov_variable_distance"],
+        default="fixed_distance_variable_fov",
+        help="Camera policy for scale adaptation.",
+    )
+    p.add_argument(
+        "--fov-deg",
+        type=float,
+        default=DEFAULT_FOV_DEG,
+        help="Base FOV (deg). Used directly in fixed_fov mode; used as reference in fixed_distance mode.",
+    )
+    p.add_argument(
+        "--reference-scale-mm",
+        type=float,
+        default=DEFAULT_REFERENCE_SCALE_MM,
+        help="Reference scale used to derive fixed distance when --camera-distance-m is not provided.",
+    )
+    p.add_argument(
+        "--camera-distance-m",
+        type=float,
+        default=None,
+        help="Fixed camera distance in meters. If omitted, derived from reference-scale and fov.",
+    )
+    p.add_argument(
+        "--distance-safety",
+        type=float,
+        default=DEFAULT_DISTANCE_SAFETY,
+        help="Safety multiplier used when deriving camera distance (and in legacy fixed_fov mode).",
+    )
+
+    p.add_argument("--max-physics-workers", type=int, default=7)
+    p.add_argument("--max-render-workers", type=int, default=max(1, (os.cpu_count() or 8) - 1))
+    p.add_argument("--physics-timeout-sec", type=int, default=240)
+    p.add_argument("--render-timeout-sec", type=int, default=300)
+
+    p.add_argument("--python-cmd", type=str, default=sys.executable)
+    p.add_argument("--blender-cmd", type=str, default="blender")
+
+    p.add_argument("--clean-output", action="store_true")
+    p.add_argument("--keep-intermediates", action="store_true")
+    p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+    return p.parse_args()
 
 
 def main() -> None:
@@ -1082,123 +859,352 @@ def main() -> None:
     setup_logging(args.log_level)
 
     repo_root = args.repo_root.resolve()
-    output_root = resolve_path(repo_root, args.dataset_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    dataset_root = resolve_path(repo_root, args.dataset_root)
 
-    parameters_yml = repo_root / "sim" / "parameters.yml"
-    backup_path = parameters_yml.with_suffix(parameters_yml.suffix + ".bak")
-    lock_path = parameters_yml.with_suffix(parameters_yml.suffix + ".lock")
+    if args.episodes_per_indenter <= 0:
+        raise ValueError("--episodes-per-indenter must be > 0")
+    if args.max_physics_workers <= 0:
+        raise ValueError("--max-physics-workers must be > 0")
+    if args.max_render_workers <= 0:
+        raise ValueError("--max-render-workers must be > 0")
+    if args.depth_min <= 0 or args.depth_max <= 0 or args.depth_min > args.depth_max:
+        raise ValueError("Invalid depth range")
+    if args.reference_scale_mm <= 0:
+        raise ValueError("--reference-scale-mm must be > 0")
+    if args.distance_safety <= 0:
+        raise ValueError("--distance-safety must be > 0")
+    if args.fov_deg <= 0 or args.fov_deg >= 179.0:
+        raise ValueError("--fov-deg must be in (0, 179)")
 
-    marker_dir = repo_root / "sim" / "marker" / "marker_pattern"
-    indenter_npy_dir = repo_root / "sim" / "assets" / "indenters" / "input" / f"npy_{args.particle}"
+    if args.camera_distance_m is not None:
+        if args.camera_distance_m <= 0:
+            raise ValueError("--camera-distance-m must be > 0")
+        fixed_camera_distance_m = float(args.camera_distance_m)
+    else:
+        ref_scale_m = float(args.reference_scale_mm) / 1000.0
+        ref_fov_rad = math.radians(float(args.fov_deg))
+        fixed_camera_distance_m = (ref_scale_m / 2.0) / math.tan(ref_fov_rad / 2.0)
+        fixed_camera_distance_m *= float(args.distance_safety)
 
-    if not parameters_yml.exists():
-        raise FileNotFoundError(f"Missing parameters.yml: {parameters_yml}")
-    if not indenter_npy_dir.exists():
-        raise FileNotFoundError(
-            f"Missing indenter npy directory: {indenter_npy_dir}. "
-            "Run sim/deformation/1_stl2npy.py first."
-        )
+    parameters_path = repo_root / "sim" / "parameters.yml"
+    texture_dir = repo_root / "sim" / "marker" / "marker_pattern"
+    indenter_dir = repo_root / "sim" / "assets" / "indenters" / "input" / f"npy_{args.particle}"
 
-    indenter_npys = list_indenter_npys(indenter_npy_dir)
-    markers = list_marker_images(marker_dir)
+    if not parameters_path.exists():
+        raise FileNotFoundError(f"Missing {parameters_path}")
+    if not indenter_dir.exists():
+        raise FileNotFoundError(f"Missing indenter directory: {indenter_dir}")
+    if not texture_dir.exists():
+        raise FileNotFoundError(f"Missing marker texture directory: {texture_dir}")
 
-    x_candidates = list(range(args.x_min, args.x_max + 1, args.xy_step))
-    y_candidates = list(range(args.y_min, args.y_max + 1, args.xy_step))
-    if not x_candidates or not y_candidates:
-        raise ValueError("Empty x/y candidate list. Check x/y range and xy-step.")
-    z_candidates = depth_candidates(args.depth_min, args.depth_max, args.depth_step).tolist()
+    indenter_names = discover_indenter_names(indenter_dir, args.objects)
+    textures = discover_textures(texture_dir)
 
-    all_jobs = build_jobs(indenter_npys, args.episodes_per_indenter)
-    jobs = split_jobs_for_worker(all_jobs, args.worker_id, args.num_workers)
+    if args.clean_output and dataset_root.exists():
+        shutil.rmtree(dataset_root)
+    dataset_root.mkdir(parents=True, exist_ok=True)
 
-    if not jobs:
-        logging.warning("No jobs assigned to worker_id=%d (num_workers=%d)", args.worker_id, args.num_workers)
-        return
+    backup_path = create_backup(parameters_path)
+    logging.info("Backup created: %s", backup_path)
 
-    logging.info("Repo root: %s", repo_root)
-    logging.info("Total jobs: %d | This worker jobs: %d", len(all_jobs), len(jobs))
-    logging.info("Scales(mm): %s", list(args.scales_mm))
-    logging.info("Scale mode: %s | physics_scale_mm=%s", args.scale_mode, args.physics_scale_mm)
+    script_tmp_dir = Path(tempfile.mkdtemp(prefix="multiscale_scripts_"))
+    work_tmp_root = Path(tempfile.mkdtemp(prefix="multiscale_work_"))
+
+    open3d_script = script_tmp_dir / "tmp_npz2stl.py"
+    blender_script = script_tmp_dir / "tmp_blender_multirender.py"
+    open3d_script.write_text(OPEN3D_TEMP_SCRIPT, encoding="utf-8")
+    blender_script.write_text(BLENDER_TEMP_SCRIPT, encoding="utf-8")
+
+    rng = random.Random(args.seed)
+
+    episode_states: Dict[int, EpisodeState] = {}
+    physics_tasks: List[Dict[str, Any]] = []
+
+    episode_id = 0
+    for indenter in indenter_names:
+        for _ in range(args.episodes_per_indenter):
+            x_mm = round(rng.uniform(args.x_min, args.x_max), 4)
+            y_mm = round(rng.uniform(args.y_min, args.y_max), 4)
+            depth_mm = round(rng.uniform(args.depth_min, args.depth_max), 1)
+
+            episode_dir = dataset_root / f"episode_{episode_id:06d}"
+            episode_dir.mkdir(parents=True, exist_ok=True)
+
+            episode_states[episode_id] = EpisodeState(
+                episode_id=episode_id,
+                indenter=indenter,
+                x_mm=x_mm,
+                y_mm=y_mm,
+                depth_mm=depth_mm,
+                episode_dir=episode_dir,
+            )
+
+            for scale_mm in args.scales_mm:
+                physics_tasks.append(
+                    {
+                        "episode_id": episode_id,
+                        "scale_mm": int(scale_mm),
+                        "indenter": indenter,
+                        "x_mm": x_mm,
+                        "y_mm": y_mm,
+                        "depth_mm": depth_mm,
+                        "repo_root": str(repo_root),
+                        "particle": str(args.particle),
+                        "python_cmd": str(args.python_cmd),
+                        "open3d_script": str(open3d_script),
+                        "base_parameters": str(parameters_path),
+                        "temp_scale_dir": str(
+                            work_tmp_root / f"episode_{episode_id:06d}" / f"scale_{int(scale_mm)}mm"
+                        ),
+                        "physics_timeout_sec": int(args.physics_timeout_sec),
+                    }
+                )
+
+            logging.info(
+                "Prepared episode_%06d | indenter=%s | contact=(x=%.4f, y=%.4f, d=%.1f)",
+                episode_id,
+                indenter,
+                x_mm,
+                y_mm,
+                depth_mm,
+            )
+            episode_id += 1
+
+    total_episodes = len(episode_states)
+    total_scale_tasks = len(physics_tasks)
+
+    logging.info("=" * 72)
+    logging.info("Dataset root: %s", dataset_root)
+    logging.info("Indenters: %d", len(indenter_names))
+    logging.info("Episodes: %d", total_episodes)
+    logging.info("Scales: %s", args.scales_mm)
+    logging.info("Total (episode,scale) physics tasks: %d", total_scale_tasks)
+    logging.info("Marker textures: %d (%s)", len(textures), texture_dir)
+    logging.info("Workers: physics=%d (GPU), render=%d (CPU)", args.max_physics_workers, args.max_render_workers)
     logging.info(
-        "Press position mode: %s | press_reference_scale_mm=%d",
-        args.press_position_mode,
-        resolve_press_reference_scale_mm(args, args.scales_mm),
+        "Camera: mode=%s fixed_distance=%.6fm base_fov=%.3fdeg ref_scale=%.2fmm",
+        args.camera_mode,
+        fixed_camera_distance_m,
+        float(args.fov_deg),
+        float(args.reference_scale_mm),
     )
-    logging.info("Found %d markers in %s", len(markers), marker_dir)
+    logging.info("=" * 72)
 
-    validate_embedded_script(OPEN3D_TEMP_SCRIPT, "OPEN3D_TEMP_SCRIPT")
-    validate_embedded_script(BLENDER_TEMP_SCRIPT, "BLENDER_TEMP_SCRIPT")
-    npz2stl_script = write_temp_script(OPEN3D_TEMP_SCRIPT, prefix="tmp_npz2stl_")
-    blender_script = write_temp_script(BLENDER_TEMP_SCRIPT, prefix="tmp_blender_render_")
-
-    if backup_path.exists():
-        raise FileExistsError(
-            f"Backup already exists at {backup_path}. Resolve/remove it before running to avoid overwriting." 
-        )
-
-    with locked_file(lock_path):
-        shutil.copy2(parameters_yml, backup_path)
-        logging.info("Created backup: %s", backup_path)
+    physics_ok = 0
+    render_ok = 0
 
     try:
-        for idx, job in enumerate(jobs, start=1):
-            # Deterministic episode sampling by global index, independent of worker sharding.
-            rng = random.Random(args.seed + job.global_idx)
-            marker_path = rng.choice(markers)
-            x, y, depth = sample_contact(rng, x_candidates, y_candidates, z_candidates)
+        with cf.ProcessPoolExecutor(max_workers=args.max_physics_workers) as physics_pool, cf.ProcessPoolExecutor(
+            max_workers=args.max_render_workers
+        ) as render_pool:
+            physics_futures: Dict[cf.Future, Dict[str, Any]] = {}
+            for task in physics_tasks:
+                f = physics_pool.submit(run_physics_task, task)
+                physics_futures[f] = task
 
-            episode_id = args.episode_offset + job.global_idx
-            logging.info(
-                "[%d/%d] episode_%06d | indenter=%s | repeat=%d | marker=%s",
-                idx,
-                len(jobs),
-                episode_id,
-                job.indenter_name,
-                job.repeat_idx,
-                marker_path.name,
+            render_futures: Dict[cf.Future, Dict[str, Any]] = {}
+
+            for f in cf.as_completed(physics_futures):
+                task = physics_futures[f]
+                episode_id = int(task["episode_id"])
+                scale_mm = int(task["scale_mm"])
+                ep_state = episode_states[episode_id]
+
+                try:
+                    result = f.result()
+                except Exception as exc:
+                    msg = f"physics future crashed: ep={episode_id} scale={scale_mm} err={exc}"
+                    ep_state.errors.append(msg)
+                    logging.error(msg)
+                    continue
+
+                if result.get("status") != "ok":
+                    msg = (
+                        f"physics failed: ep={episode_id} scale={scale_mm} err={result.get('error')}\n"
+                        f"{result.get('traceback', '')}"
+                    )
+                    ep_state.errors.append(msg)
+                    logging.error("Physics failed | ep=%06d scale=%d", episode_id, scale_mm)
+                    continue
+
+                physics_ok += 1
+                logging.info(
+                    "Physics OK | ep=%06d scale=%d | max_down=%.4fmm mean_down=%.4fmm",
+                    episode_id,
+                    scale_mm,
+                    result["deformation_stats"]["surface_max_down_mm"],
+                    result["deformation_stats"]["surface_mean_down_mm"],
+                )
+
+                scale_dir = ep_state.episode_dir / f"scale_{scale_mm}mm"
+                scale_dir.mkdir(parents=True, exist_ok=True)
+
+                render_task = {
+                    "episode_id": episode_id,
+                    "scale_mm": scale_mm,
+                    "repo_root": str(repo_root),
+                    "blender_cmd": str(args.blender_cmd),
+                    "blender_script": str(blender_script),
+                    "textures_dir": str(texture_dir),
+                    "scale_dir": str(scale_dir),
+                    "stl_path": result["stl_path"],
+                    "temp_scale_dir": result["temp_scale_dir"],
+                    "camera_mode": str(args.camera_mode),
+                    "base_fov_deg": float(args.fov_deg),
+                    "fixed_distance_m": float(fixed_camera_distance_m),
+                    "distance_safety": float(args.distance_safety),
+                    "render_timeout_sec": int(args.render_timeout_sec),
+                    "keep_intermediates": bool(args.keep_intermediates),
+                }
+
+                rf = render_pool.submit(run_render_task, render_task)
+                render_futures[rf] = {
+                    "physics_result": result,
+                    "render_task": render_task,
+                }
+
+            for rf in cf.as_completed(render_futures):
+                payload = render_futures[rf]
+                physics_result = payload["physics_result"]
+                episode_id = int(physics_result["episode_id"])
+                scale_mm = int(physics_result["scale_mm"])
+                ep_state = episode_states[episode_id]
+
+                try:
+                    rr = rf.result()
+                except Exception as exc:
+                    msg = f"render future crashed: ep={episode_id} scale={scale_mm} err={exc}"
+                    ep_state.errors.append(msg)
+                    logging.error(msg)
+                    continue
+
+                if rr.get("status") != "ok":
+                    msg = (
+                        f"render failed: ep={episode_id} scale={scale_mm} err={rr.get('error')}\n"
+                        f"{rr.get('traceback', '')}"
+                    )
+                    ep_state.errors.append(msg)
+                    logging.error("Render failed | ep=%06d scale=%d", episode_id, scale_mm)
+                    continue
+
+                render_ok += 1
+                scale_key = f"scale_{scale_mm}mm"
+                scale_dir = Path(rr["scale_dir"])
+                if args.camera_mode == "fixed_distance_variable_fov":
+                    render_fov_deg = math.degrees(
+                        2.0 * math.atan((float(scale_mm) / 1000.0 / 2.0) / float(fixed_camera_distance_m))
+                    )
+                    render_distance_m = float(fixed_camera_distance_m)
+                else:
+                    render_fov_deg = float(args.fov_deg)
+                    render_distance_m = (
+                        (float(scale_mm) / 1000.0 / 2.0) / math.tan(math.radians(float(args.fov_deg)) / 2.0)
+                    )
+                    render_distance_m *= float(args.distance_safety)
+
+                ep_state.scales[scale_key] = {
+                    "scale_mm": scale_mm,
+                    "contact_x_mm": float(physics_result["x_mm"]),
+                    "contact_y_mm": float(physics_result["y_mm"]),
+                    "contact_depth_mm": float(physics_result["depth_mm"]),
+                    "deformation_stats": physics_result["deformation_stats"],
+                    "camera_mode": str(args.camera_mode),
+                    "camera_distance_m": float(render_distance_m),
+                    "camera_fov_deg": float(render_fov_deg),
+                    "rendered_markers": rr["rendered_markers"],
+                    "patch_coords_16x16": str((scale_dir / "patch_coords_16x16.json").relative_to(ep_state.episode_dir)),
+                }
+
+                logging.info(
+                    "Render OK | ep=%06d scale=%d | markers=%d",
+                    episode_id,
+                    scale_mm,
+                    len(rr["rendered_markers"]),
+                )
+
+        manifest_episodes: List[Dict[str, Any]] = []
+        failed_episodes: List[Dict[str, Any]] = []
+
+        for episode_id in sorted(episode_states):
+            state = episode_states[episode_id]
+            expected_scales = len(args.scales_mm)
+            is_ok = (len(state.errors) == 0) and (len(state.scales) == expected_scales)
+
+            if not is_ok:
+                failed_episodes.append(
+                    {
+                        "episode_id": state.episode_id,
+                        "indenter": state.indenter,
+                        "errors": state.errors,
+                    }
+                )
+                if state.episode_dir.exists():
+                    shutil.rmtree(state.episode_dir, ignore_errors=True)
+                continue
+
+            metadata = {
+                "episode_id": state.episode_id,
+                "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "indenter": state.indenter,
+                "particle": str(args.particle),
+                "contact": {
+                    "x_mm": state.x_mm,
+                    "y_mm": state.y_mm,
+                    "depth_mm": state.depth_mm,
+                },
+                "image_resolution": {"width": DEFAULT_IMAGE_RES[0], "height": DEFAULT_IMAGE_RES[1]},
+                "scales": state.scales,
+            }
+            with open(state.episode_dir / "metadata.json", "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+            manifest_episodes.append(
+                {
+                    "episode_id": state.episode_id,
+                    "path": state.episode_dir.name,
+                    "indenter": state.indenter,
+                    "contact": {
+                        "x_mm": state.x_mm,
+                        "y_mm": state.y_mm,
+                        "depth_mm": state.depth_mm,
+                    },
+                }
             )
 
-            run_episode(
-                repo_root=repo_root,
-                job=job,
-                episode_id=episode_id,
-                scales_mm=args.scales_mm,
-                marker_path=marker_path,
-                x=x,
-                y=y,
-                depth=depth,
-                args=args,
-                parameters_yml=parameters_yml,
-                lock_path=lock_path,
-                npz2stl_script=npz2stl_script,
-                blender_script=blender_script,
-                output_root=output_root,
-            )
+        manifest = {
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "dataset_root": str(dataset_root),
+            "particle": str(args.particle),
+            "scales_mm": [int(s) for s in args.scales_mm],
+            "episodes_per_indenter": int(args.episodes_per_indenter),
+            "indenter_count": len(indenter_names),
+            "texture_count": len(textures),
+            "total_episodes_planned": total_episodes,
+            "total_scale_tasks_planned": total_scale_tasks,
+            "physics_tasks_succeeded": physics_ok,
+            "render_tasks_succeeded": render_ok,
+            "successful_episodes": len(manifest_episodes),
+            "failed_episodes": failed_episodes,
+            "episodes": manifest_episodes,
+        }
+
+        with open(dataset_root / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        logging.info("=" * 72)
+        logging.info("DONE | successful episodes: %d | failed episodes: %d", len(manifest_episodes), len(failed_episodes))
+        logging.info("Manifest: %s", dataset_root / "manifest.json")
+        logging.info("=" * 72)
 
     finally:
-        # Restore parameters.yml from .bak backup.
-        with locked_file(lock_path):
-            if backup_path.exists():
-                shutil.copy2(backup_path, parameters_yml)
-                if not args.keep_intermediates:
-                    safe_unlink(backup_path)
-                logging.info("Restored %s from backup", parameters_yml)
+        restore_backup(parameters_path, backup_path)
+        logging.info("Restored %s from backup", parameters_path)
 
-        if not args.keep_intermediates:
-            safe_unlink(npz2stl_script)
-            safe_unlink(blender_script)
+        if script_tmp_dir.exists():
+            shutil.rmtree(script_tmp_dir, ignore_errors=True)
+        if work_tmp_root.exists() and not args.keep_intermediates:
+            shutil.rmtree(work_tmp_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logging.error("Interrupted by user")
-        sys.exit(130)
-    except subprocess.CalledProcessError as exc:
-        logging.error("Subprocess failed (exit=%s): %s", exc.returncode, exc.cmd)
-        sys.exit(exc.returncode)
-    except Exception as exc:
-        logging.exception("Generation failed: %s", exc)
-        sys.exit(1)
+    main()

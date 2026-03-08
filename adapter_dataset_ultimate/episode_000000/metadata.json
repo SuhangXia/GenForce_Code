@@ -1,0 +1,257 @@
+{
+  "episode_id": 0,
+  "generated_at": "2026-03-08T19:04:58.812488+00:00",
+  "indenter": "cylinder",
+  "particle": "100000",
+  "contact": {
+    "x_mm": 0.8366,
+    "y_mm": -2.8499,
+    "depth_mm": 2.2
+  },
+  "image_resolution": {
+    "width": 640,
+    "height": 480
+  },
+  "scales": {
+    "scale_15mm": {
+      "scale_mm": 15,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.2123613357543945,
+        "surface_mean_down_mm": 0.3641655385032634,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.787638664245605
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 25.124949291127102,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_15mm/patch_coords_16x16.json"
+    },
+    "scale_25mm": {
+      "scale_mm": 25,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.210695266723633,
+        "surface_mean_down_mm": 0.12915140459928054,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.789304733276367
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 40.74981184118078,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_25mm/patch_coords_16x16.json"
+    },
+    "scale_22mm": {
+      "scale_mm": 22,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.2116241455078125,
+        "surface_mean_down_mm": 0.17269349647449425,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.788375854492188
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 36.19793276068726,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_22mm/patch_coords_16x16.json"
+    },
+    "scale_28mm": {
+      "scale_mm": 28,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.213602066040039,
+        "surface_mean_down_mm": 0.09830507817496016,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.786397933959961
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 45.171297930196246,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_28mm/patch_coords_16x16.json"
+    },
+    "scale_16mm": {
+      "scale_mm": 16,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.210721969604492,
+        "surface_mean_down_mm": 0.33307846143378683,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.789278030395508
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 26.741571588475125,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_16mm/patch_coords_16x16.json"
+    },
+    "scale_20mm": {
+      "scale_mm": 20,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.2105445861816406,
+        "surface_mean_down_mm": 0.22060016454078324,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.78945541381836
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 33.09532318398165,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_20mm/patch_coords_16x16.json"
+    },
+    "scale_18mm": {
+      "scale_mm": 18,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.2122678756713867,
+        "surface_mean_down_mm": 0.2887027721967829,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.787732124328613
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 29.941991644716627,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_18mm/patch_coords_16x16.json"
+    },
+    "scale_30mm": {
+      "scale_mm": 30,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 2.2,
+      "deformation_stats": {
+        "surface_max_down_mm": 2.213663101196289,
+        "surface_mean_down_mm": 0.08410737140776305,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 9.786336898803711
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 48.04294714967595,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "patch_coords_16x16": "scale_30mm/patch_coords_16x16.json"
+    }
+  }
+}
