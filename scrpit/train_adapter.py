@@ -377,6 +377,17 @@ def cosine_similarity(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (pred_n * target_n).sum(dim=1).mean()
 
 
+def feature_alignment_terms(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      mse_loss, cosine_loss(=1-cos_sim), cos_sim
+    """
+    mse = F.mse_loss(pred, target)
+    cos_sim = cosine_similarity(pred, target)
+    cos_loss = 1.0 - cos_sim
+    return mse, cos_loss, cos_sim
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -384,6 +395,8 @@ def cosine_similarity(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
+    if args.lambda_mse < 0 or args.lambda_cos < 0:
+        raise ValueError("lambda_mse and lambda_cos must be >= 0")
 
     dataset_root = Path(args.dataset)
     manifest_path = dataset_root / "manifest.json"
@@ -528,6 +541,11 @@ def train(args):
 
     log.info("USA parameters: %d",
              sum(p.numel() for p in adapter.parameters() if p.requires_grad))
+    log.info(
+        "Loss weights: lambda_mse=%.4f lambda_cos=%.4f",
+        args.lambda_mse,
+        args.lambda_cos,
+    )
 
     optimizer = torch.optim.AdamW(
         adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -560,6 +578,8 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         adapter.train()
         epoch_loss = 0.0
+        epoch_mse_component = 0.0
+        epoch_cos_component = 0.0
         epoch_cos = 0.0
         n_batches = 0
 
@@ -591,17 +611,29 @@ def train(args):
                 context_coord_map_mm=coord_context,
                 query_coord_map_mm=coord_query,
             )
-            loss_context_to_query = F.mse_loss(pred_query, feat_query)
+            mse_context_to_query, cos_loss_context_to_query, cos_sim_query = feature_alignment_terms(
+                pred_query, feat_query
+            )
+            loss_context_to_query = (
+                args.lambda_mse * mse_context_to_query + args.lambda_cos * cos_loss_context_to_query
+            )
 
             pred_context = adapter(
                 context_feat=feat_query,
                 context_coord_map_mm=coord_query,
                 query_coord_map_mm=coord_context,
             )
-            loss_query_to_context = F.mse_loss(pred_context, feat_context)
+            mse_query_to_context, cos_loss_query_to_context, _ = feature_alignment_terms(
+                pred_context, feat_context
+            )
+            loss_query_to_context = (
+                args.lambda_mse * mse_query_to_context + args.lambda_cos * cos_loss_query_to_context
+            )
 
+            mse_component = mse_context_to_query + mse_query_to_context
+            cos_component = cos_loss_context_to_query + cos_loss_query_to_context
             loss = loss_context_to_query + loss_query_to_context
-            cos = cosine_similarity(pred_query, feat_query).item()
+            cos = cos_sim_query.item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -609,25 +641,44 @@ def train(args):
             optimizer.step()
 
             epoch_loss += loss.item()
+            epoch_mse_component += mse_component.item()
+            epoch_cos_component += cos_component.item()
             epoch_cos += cos
             n_batches += 1
             step += 1
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}", cos=f"{cos:.4f}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                mse=f"{mse_component.item():.4f}",
+                cos_l=f"{cos_component.item():.4f}",
+                cos=f"{cos:.4f}",
+            )
 
             if not args.sanity_check and n_batches % max(1, args.log_every * 10) == 0:
-                log.info("  [%d/%d] loss=%.6f  cos=%.4f", n_batches, batches_per_epoch, loss.item(), cos)
+                log.info(
+                    "  [%d/%d] loss=%.6f mse=%.6f cos_loss=%.6f cos=%.4f",
+                    n_batches,
+                    batches_per_epoch,
+                    loss.item(),
+                    mse_component.item(),
+                    cos_component.item(),
+                    cos,
+                )
 
             if not args.sanity_check:
                 scheduler.step()
 
         avg_loss = epoch_loss / max(n_batches, 1)
+        avg_mse_component = epoch_mse_component / max(n_batches, 1)
+        avg_cos_component = epoch_cos_component / max(n_batches, 1)
         avg_train_cos = epoch_cos / max(n_batches, 1)
 
         # Validation
         if val_loader and not args.sanity_check:
             adapter.eval()
             val_loss = 0.0
+            val_mse_component = 0.0
+            val_cos_component = 0.0
             val_cos = 0.0
             val_n = 0
             with torch.no_grad():
@@ -650,12 +701,24 @@ def train(args):
                         context_coord_map_mm=coord_query,
                         query_coord_map_mm=coord_context,
                     )
-                    loss = F.mse_loss(pred_query, feat_query) + F.mse_loss(pred_context, feat_context)
-                    cos = cosine_similarity(pred_query, feat_query)
+                    mse_context_to_query, cos_loss_context_to_query, cos_sim_query = feature_alignment_terms(
+                        pred_query, feat_query
+                    )
+                    mse_query_to_context, cos_loss_query_to_context, _ = feature_alignment_terms(
+                        pred_context, feat_context
+                    )
+                    mse_component = mse_context_to_query + mse_query_to_context
+                    cos_component = cos_loss_context_to_query + cos_loss_query_to_context
+                    loss = args.lambda_mse * mse_component + args.lambda_cos * cos_component
+                    cos = cos_sim_query
                     val_loss += loss.item() * img_context.size(0)
+                    val_mse_component += mse_component.item() * img_context.size(0)
+                    val_cos_component += cos_component.item() * img_context.size(0)
                     val_cos += cos.item() * img_context.size(0)
                     val_n += img_context.size(0)
             val_loss /= max(val_n, 1)
+            val_mse_component /= max(val_n, 1)
+            val_cos_component /= max(val_n, 1)
             val_cos /= max(val_n, 1)
             adapter.train()
 
@@ -671,12 +734,34 @@ def train(args):
 
             if epoch % args.log_every == 0 or epoch == 1:
                 lr_now = optimizer.param_groups[0]["lr"]
-                log.info("Epoch %3d/%d  train_loss=%.6f  train_cos=%.4f  val_loss=%.6f  val_cos=%.4f  lr=%.2e",
-                         epoch, args.epochs, avg_loss, avg_train_cos, val_loss, val_cos, lr_now)
+                log.info(
+                    "Epoch %3d/%d  train_loss=%.6f train_mse=%.6f train_cos_loss=%.6f train_cos=%.4f  "
+                    "val_loss=%.6f val_mse=%.6f val_cos_loss=%.6f val_cos=%.4f  lr=%.2e",
+                    epoch,
+                    args.epochs,
+                    avg_loss,
+                    avg_mse_component,
+                    avg_cos_component,
+                    avg_train_cos,
+                    val_loss,
+                    val_mse_component,
+                    val_cos_component,
+                    val_cos,
+                    lr_now,
+                )
         else:
             if epoch % args.log_every == 0 or epoch == 1:
                 lr_now = optimizer.param_groups[0]["lr"]
-                log.info("Epoch %3d/%d  loss=%.6f  cos=%.4f  lr=%.2e", epoch, args.epochs, avg_loss, avg_train_cos, lr_now)
+                log.info(
+                    "Epoch %3d/%d  loss=%.6f mse=%.6f cos_loss=%.6f cos=%.4f  lr=%.2e",
+                    epoch,
+                    args.epochs,
+                    avg_loss,
+                    avg_mse_component,
+                    avg_cos_component,
+                    avg_train_cos,
+                    lr_now,
+                )
 
             if args.sanity_check and avg_loss < 0.001:
                 log.info("Sanity check PASSED: loss -> 0")
@@ -719,6 +804,8 @@ def train(args):
             )
             test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
             test_loss = 0.0
+            test_mse_component = 0.0
+            test_cos_component = 0.0
             test_cos = 0.0
             test_n = 0
             with torch.no_grad():
@@ -736,15 +823,32 @@ def train(args):
                         context_coord_map_mm=coord_query,
                         query_coord_map_mm=coord_context,
                     )
-                    loss = F.mse_loss(pred_query, feat_query) + F.mse_loss(pred_context, feat_context)
-                    cos = cosine_similarity(pred_query, feat_query)
+                    mse_context_to_query, cos_loss_context_to_query, cos_sim_query = feature_alignment_terms(
+                        pred_query, feat_query
+                    )
+                    mse_query_to_context, cos_loss_query_to_context, _ = feature_alignment_terms(
+                        pred_context, feat_context
+                    )
+                    mse_component = mse_context_to_query + mse_query_to_context
+                    cos_component = cos_loss_context_to_query + cos_loss_query_to_context
+                    loss = args.lambda_mse * mse_component + args.lambda_cos * cos_component
+                    cos = cos_sim_query
                     test_loss += loss.item() * img_context.size(0)
+                    test_mse_component += mse_component.item() * img_context.size(0)
+                    test_cos_component += cos_component.item() * img_context.size(0)
                     test_cos += cos.item() * img_context.size(0)
                     test_n += img_context.size(0)
             test_loss /= max(test_n, 1)
+            test_mse_component /= max(test_n, 1)
+            test_cos_component /= max(test_n, 1)
             test_cos /= max(test_n, 1)
-            log.info("TEST (zero-shot indenters): loss=%.6f  cos_sim=%.4f",
-                     test_loss, test_cos)
+            log.info(
+                "TEST (zero-shot indenters): loss=%.6f mse=%.6f cos_loss=%.6f cos_sim=%.4f",
+                test_loss,
+                test_mse_component,
+                test_cos_component,
+                test_cos,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +864,10 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--lambda_mse", type=float, default=1.0,
+                   help="Weight for MSE feature-matching term.")
+    p.add_argument("--lambda_cos", type=float, default=0.5,
+                   help="Weight for cosine feature-alignment term (1-cosine_similarity).")
     p.add_argument("--train_ratio", type=float, default=0.85,
                    help="Train ratio for non-test indenters (val = 1 - train_ratio)")
     p.add_argument("--pairs_per_epoch", type=int, default=2000)
