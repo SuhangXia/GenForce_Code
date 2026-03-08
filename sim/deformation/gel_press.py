@@ -83,7 +83,10 @@ grid_v = ti.Vector.field(n=3, dtype=float, shape=(n_grid, n_grid, n_grid)) # gri
 grid_m = ti.field(dtype=float, shape=(n_grid, n_grid, n_grid)) # grid node mass
 
 # particle initialization
-particle_dis = l/(num_l-1) # particle distance
+# Use axis-specific spacing so elastomer thickness stays consistent when l/w change.
+particle_dis_l = l / (num_l - 1)
+particle_dis_w = w / (num_w - 1)
+particle_dis_h = h / (num_h - 1)
 n_particles = num_l*num_w*num_h+np.shape(data)[0]
 x = ti.Vector.field(3, dtype=float, shape=n_particles) # position
 x_2d = ti.Vector.field(2, dtype=float, shape=n_particles) # 2d positions - this is necessary for circle visualization
@@ -216,7 +219,11 @@ def initialize(data: ti.types.ndarray(),data_len: ti.i32):
         # offset for elastomer
         offest = ti.Vector([x_offset-l/2,y_offset-w/2,z_offset-h/2])
         # offest = ti.Vector([0,0,h/2])
-        x[m] = ti.Vector([i,j,k])*particle_dis+offest
+        x[m] = ti.Vector([
+            i * particle_dis_l,
+            j * particle_dis_w,
+            k * particle_dis_h
+        ]) + offest
         x_2d[m] = [x[m][0], x[m][1]]
         v[m] = [0, 0, 0]
         material[m] = 0

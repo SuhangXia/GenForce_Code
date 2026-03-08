@@ -53,7 +53,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_points(npz_path: Path) -> np.ndarray:
+def load_points(npz_path: Path):
     data = np.load(npz_path)
     required = ["p_xpos_list", "p_ypos_list", "p_zpos_list"]
     for key in required:
@@ -71,13 +71,40 @@ def load_points(npz_path: Path) -> np.ndarray:
     if not (x_last.shape == y_last.shape == z_last.shape):
         raise ValueError("Shape mismatch among x/y/z arrays in npz data")
 
+    n_points = int(x_last.shape[0])
+    grid_n = int(round(np.sqrt(n_points)))
+    if grid_n * grid_n != n_points:
+        grid_n = None
+
     # Convert mm -> m so Blender camera trig uses physical metric units.
     points = np.stack([x_last, y_last, z_last], axis=1).astype(np.float64) / 1000.0
     mask = np.isfinite(points).all(axis=1)
     points = points[mask]
     if points.shape[0] < 100:
         raise ValueError(f"Too few valid points ({points.shape[0]}) in {npz_path}")
-    return points
+    if mask.sum() != n_points:
+        # Non-finite points break grid connectivity assumptions.
+        grid_n = None
+    return points, grid_n
+
+
+def grid_mesh_from_surface(points: np.ndarray, grid_n: int) -> o3d.geometry.TriangleMesh:
+    triangles = []
+    for j in range(grid_n - 1):
+        row = j * grid_n
+        row_next = (j + 1) * grid_n
+        for i in range(grid_n - 1):
+            v00 = row + i
+            v10 = row + i + 1
+            v01 = row_next + i
+            v11 = row_next + i + 1
+            triangles.append([v00, v01, v10])
+            triangles.append([v10, v01, v11])
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(points)
+    mesh.triangles = o3d.utility.Vector3iVector(np.asarray(triangles, dtype=np.int32))
+    mesh.compute_vertex_normals()
+    return mesh
 
 
 def main() -> None:
@@ -86,40 +113,43 @@ def main() -> None:
     stl_path = Path(args.output_stl)
     stl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    points = load_points(npz_path)
+    points, grid_n = load_points(npz_path)
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+    if grid_n is not None:
+        mesh = grid_mesh_from_surface(points, grid_n)
+    else:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
 
-    span = points.max(axis=0) - points.min(axis=0)
-    diag = float(np.linalg.norm(span))
-    radius = max(diag * 0.03, 1e-4)
+        span = points.max(axis=0) - points.min(axis=0)
+        diag = float(np.linalg.norm(span))
+        radius = max(diag * 0.03, 1e-4)
 
-    pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60)
-    )
-    try:
-        pcd.orient_normals_consistent_tangent_plane(50)
-    except RuntimeError:
-        # Some point clouds are sparse near borders; continue with estimated normals.
-        pass
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60)
+        )
+        try:
+            pcd.orient_normals_consistent_tangent_plane(50)
+        except RuntimeError:
+            # Some point clouds are sparse near borders; continue with estimated normals.
+            pass
 
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=args.poisson_depth
-    )
-    if len(mesh.triangles) == 0:
-        raise RuntimeError("Poisson reconstruction produced an empty mesh")
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=args.poisson_depth
+        )
+        if len(mesh.triangles) == 0:
+            raise RuntimeError("Poisson reconstruction produced an empty mesh")
 
-    densities = np.asarray(densities)
-    if densities.size:
-        threshold = float(np.quantile(densities, 0.02))
-        mesh.remove_vertices_by_mask(densities < threshold)
+        densities = np.asarray(densities)
+        if densities.size:
+            threshold = float(np.quantile(densities, 0.02))
+            mesh.remove_vertices_by_mask(densities < threshold)
 
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_duplicated_vertices()
-    mesh.remove_non_manifold_edges()
-    mesh.compute_vertex_normals()
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+        mesh.compute_vertex_normals()
 
     ok = o3d.io.write_triangle_mesh(str(stl_path), mesh, write_ascii=False)
     if not ok:
@@ -278,9 +308,6 @@ def apply_uv_relative(
     center_y: float,
     scale_mm: float,
 ):
-    scale_m = max(scale_mm / 1000.0, 1e-8)
-    min_x = center_x - scale_m * 0.5
-    min_y = center_y - scale_m * 0.5
     me = obj.data
     bm = bmesh.new()
     bm.from_mesh(me)
@@ -289,12 +316,30 @@ def apply_uv_relative(
     if uv_layer is None:
         uv_layer = bm.loops.layers.uv.new("UVMap")
 
-    for face in bm.faces:
-        for loop in face.loops:
-            world_co = obj.matrix_world @ loop.vert.co
-            u = (world_co.x - min_x) / scale_m
-            v = (world_co.y - min_y) / scale_m
-            loop[uv_layer].uv = (u, v)
+    # Prefer material-coordinate UVs derived from vertex index on regular grids.
+    # This preserves marker deformation instead of re-projecting onto deformed XY.
+    n_verts = len(me.vertices)
+    grid_n = int(round(math.sqrt(n_verts)))
+    if grid_n * grid_n == n_verts and grid_n > 1:
+        inv = 1.0 / float(grid_n - 1)
+        for face in bm.faces:
+            for loop in face.loops:
+                vidx = loop.vert.index
+                i = vidx % grid_n
+                j = vidx // grid_n
+                u = float(i) * inv
+                v = float(j) * inv
+                loop[uv_layer].uv = (u, v)
+    else:
+        scale_m = max(scale_mm / 1000.0, 1e-8)
+        min_x = center_x - scale_m * 0.5
+        min_y = center_y - scale_m * 0.5
+        for face in bm.faces:
+            for loop in face.loops:
+                world_co = obj.matrix_world @ loop.vert.co
+                u = (world_co.x - min_x) / scale_m
+                v = (world_co.y - min_y) / scale_m
+                loop[uv_layer].uv = (u, v)
 
     bm.to_mesh(me)
     bm.free()
@@ -452,6 +497,21 @@ def parse_args() -> argparse.Namespace:
         "`physical`: rerun physics for every scale with elastomer size patching.",
     )
     parser.add_argument(
+        "--press-position-mode",
+        type=str,
+        default="absolute",
+        choices=["absolute", "scaled"],
+        help="`absolute`: same x/y(mm) across scales; "
+        "`scaled`: x/y(mm) scale linearly with target scale using a reference scale.",
+    )
+    parser.add_argument(
+        "--press-reference-scale-mm",
+        type=int,
+        default=None,
+        help="Reference scale for `--press-position-mode scaled`. "
+        "If omitted, uses `--physics-scale-mm` in virtual mode (if set) else max(scales).",
+    )
+    parser.add_argument(
         "--physics-scale-mm",
         type=int,
         default=None,
@@ -527,6 +587,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--worker-id must satisfy 0 <= worker_id < num_workers")
     if args.physics_scale_mm is not None and args.physics_scale_mm <= 0:
         parser.error("--physics-scale-mm must be > 0 when provided")
+    if args.press_reference_scale_mm is not None and args.press_reference_scale_mm <= 0:
+        parser.error("--press-reference-scale-mm must be > 0 when provided")
     if not (0.0 <= args.uv_black_border_ratio <= 0.2):
         parser.error("--uv-black-border-ratio must be in [0.0, 0.2]")
 
@@ -595,6 +657,29 @@ def sample_contact(rng: random.Random, xs: Sequence[int], ys: Sequence[int], dep
     return x, y, round(depth, 1)
 
 
+def resolve_press_reference_scale_mm(args: argparse.Namespace, scales_mm: Sequence[int]) -> int:
+    if args.press_reference_scale_mm is not None:
+        return int(args.press_reference_scale_mm)
+    if args.scale_mode == "virtual" and args.physics_scale_mm is not None:
+        return int(args.physics_scale_mm)
+    return int(max(scales_mm))
+
+
+def press_xy_for_scale(
+    base_x_mm: int,
+    base_y_mm: int,
+    scale_mm: int,
+    reference_scale_mm: int,
+    mode: str,
+) -> Tuple[int, int]:
+    if mode == "absolute":
+        return int(base_x_mm), int(base_y_mm)
+    scale_ratio = float(scale_mm) / float(reference_scale_mm)
+    x_mm = int(round(base_x_mm * scale_ratio))
+    y_mm = int(round(base_y_mm * scale_ratio))
+    return x_mm, y_mm
+
+
 def write_temp_script(script_text: str, prefix: str) -> Path:
     fd, script_path = tempfile.mkstemp(prefix=prefix, suffix=".py")
     os.close(fd)
@@ -648,6 +733,27 @@ def expected_npz_path(npz_output_root: Path, indenter_name: str, x: int, y: int,
     return npz_output_root / indenter_name / suffix
 
 
+def npz_deformation_stats(npz_path: Path) -> Dict[str, float]:
+    data = np.load(npz_path)
+    pz = np.asarray(data["p_zpos_list"], dtype=np.float64)
+    if pz.ndim != 2 or pz.shape[0] < 2:
+        return {
+            "surface_max_down_mm": 0.0,
+            "surface_mean_down_mm": 0.0,
+            "surface_min_z_start_mm": float(np.min(pz)) if pz.size else 0.0,
+            "surface_min_z_end_mm": float(np.min(pz)) if pz.size else 0.0,
+        }
+    start = pz[0]
+    end = pz[-1]
+    down = start - end
+    return {
+        "surface_max_down_mm": float(np.max(down)),
+        "surface_mean_down_mm": float(np.mean(down)),
+        "surface_min_z_start_mm": float(np.min(start)),
+        "surface_min_z_end_mm": float(np.min(end)),
+    }
+
+
 def safe_unlink(path: Path) -> None:
     try:
         path.unlink()
@@ -686,6 +792,7 @@ def run_episode(
 
     work_dir = Path(tempfile.mkdtemp(prefix=f"multiscale_ep_{episode_id:06d}_"))
     npz_output_root = work_dir / "npz"
+    press_ref_scale_mm = resolve_press_reference_scale_mm(args, scales_mm)
 
     metadata: Dict[str, object] = {
         "episode_id": episode_id,
@@ -694,6 +801,8 @@ def run_episode(
         "indenter": job.indenter_name,
         "particle": str(args.particle),
         "scale_mode": args.scale_mode,
+        "press_position_mode": args.press_position_mode,
+        "press_reference_scale_mm": press_ref_scale_mm,
         "physics_scale_mm": args.physics_scale_mm,
         "contact": {"x_mm": x, "y_mm": y, "depth_mm": depth},
         "marker_image": to_metadata_path(marker_path, repo_root),
@@ -704,6 +813,15 @@ def run_episode(
         if args.scale_mode == "virtual":
             # In virtual mode, run one physics simulation and render it with multiple
             # virtual physical windows (`scale_mm`) via UV/camera remapping.
+            if args.press_position_mode == "scaled":
+                logging.warning(
+                    "Episode %06d uses `virtual` mode with `press-position-mode=scaled`: "
+                    "physics runs once at reference-scale coordinates (x=%d, y=%d), "
+                    "so rendered normalized position varies with scale.",
+                    episode_id,
+                    x,
+                    y,
+                )
             logging.info(
                 "Episode %06d | indenter=%s | virtual physics | contact=(x=%d, y=%d, d=%.1f)",
                 episode_id,
@@ -746,6 +864,13 @@ def run_episode(
                 if not fallback:
                     raise FileNotFoundError(f"Expected deformation npz not found at {npz_path}")
                 npz_path = fallback[-1]
+            deform_stats = npz_deformation_stats(npz_path)
+            logging.info(
+                "Episode %06d | virtual physics deformation max_down=%.4fmm mean_down=%.4fmm",
+                episode_id,
+                deform_stats["surface_max_down_mm"],
+                deform_stats["surface_mean_down_mm"],
+            )
 
             stl_path = work_dir / f"{job.indenter_name}_ep{episode_id:06d}.stl"
             run_subprocess(
@@ -800,6 +925,9 @@ def run_episode(
 
                 metadata["scales"][f"{scale_mm}mm"] = {
                     "scale_mm": int(scale_mm),
+                    "contact_x_mm": int(x),
+                    "contact_y_mm": int(y),
+                    "deformation_stats": deform_stats,
                     "render_image": str(render_path.relative_to(episode_dir)),
                     "patch_coords_16x16": patch_coords_16x16(int(scale_mm)),
                 }
@@ -810,6 +938,13 @@ def run_episode(
 
         else:
             for scale_mm in scales_mm:
+                x_scale_mm, y_scale_mm = press_xy_for_scale(
+                    x,
+                    y,
+                    int(scale_mm),
+                    press_ref_scale_mm,
+                    args.press_position_mode,
+                )
                 scale_dir = episode_dir / f"scale_{scale_mm}mm"
                 scale_dir.mkdir(parents=True, exist_ok=True)
                 render_path = scale_dir / "render.jpg"
@@ -819,8 +954,8 @@ def run_episode(
                     episode_id,
                     job.indenter_name,
                     scale_mm,
-                    x,
-                    y,
+                    x_scale_mm,
+                    y_scale_mm,
                     depth,
                 )
 
@@ -842,9 +977,9 @@ def run_episode(
                             "--object",
                             job.indenter_name,
                             "--x",
-                            str(x),
+                            str(x_scale_mm),
                             "--y",
-                            str(y),
+                            str(y_scale_mm),
                             "--depth",
                             f"{depth:.1f}",
                         ],
@@ -852,12 +987,20 @@ def run_episode(
                         stage_name="gel_press",
                     )
 
-                npz_path = expected_npz_path(npz_output_root, job.indenter_name, x, y, depth)
+                npz_path = expected_npz_path(npz_output_root, job.indenter_name, x_scale_mm, y_scale_mm, depth)
                 if not npz_path.exists():
-                    fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x}_{y}_*.npz"))
+                    fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x_scale_mm}_{y_scale_mm}_*.npz"))
                     if not fallback:
                         raise FileNotFoundError(f"Expected deformation npz not found at {npz_path}")
                     npz_path = fallback[-1]
+                deform_stats = npz_deformation_stats(npz_path)
+                logging.info(
+                    "Episode %06d | physical scale=%dmm deformation max_down=%.4fmm mean_down=%.4fmm",
+                    episode_id,
+                    int(scale_mm),
+                    deform_stats["surface_max_down_mm"],
+                    deform_stats["surface_mean_down_mm"],
+                )
 
                 stl_path = work_dir / f"{job.indenter_name}_ep{episode_id:06d}_s{scale_mm}.stl"
                 run_subprocess(
@@ -900,6 +1043,9 @@ def run_episode(
 
                 metadata["scales"][f"{scale_mm}mm"] = {
                     "scale_mm": int(scale_mm),
+                    "contact_x_mm": int(x_scale_mm),
+                    "contact_y_mm": int(y_scale_mm),
+                    "deformation_stats": deform_stats,
                     "render_image": str(render_path.relative_to(episode_dir)),
                     "patch_coords_16x16": patch_coords_16x16(int(scale_mm)),
                 }
@@ -960,6 +1106,11 @@ def main() -> None:
     logging.info("Total jobs: %d | This worker jobs: %d", len(all_jobs), len(jobs))
     logging.info("Scales(mm): %s", list(args.scales_mm))
     logging.info("Scale mode: %s | physics_scale_mm=%s", args.scale_mode, args.physics_scale_mm)
+    logging.info(
+        "Press position mode: %s | press_reference_scale_mm=%d",
+        args.press_position_mode,
+        resolve_press_reference_scale_mm(args, args.scales_mm),
+    )
     logging.info("Found %d markers in %s", len(markers), marker_dir)
 
     validate_embedded_script(OPEN3D_TEMP_SCRIPT, "OPEN3D_TEMP_SCRIPT")
