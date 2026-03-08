@@ -650,9 +650,11 @@ def depth_candidates(depth_min: float, depth_max: float, depth_step: float) -> n
     return np.round(values, 1)
 
 
-def sample_contact(rng: random.Random, xs: Sequence[int], ys: Sequence[int], depths: Sequence[float]) -> Tuple[int, int, float]:
-    x = rng.choice(xs)
-    y = rng.choice(ys)
+def sample_contact(
+    rng: random.Random, xs: Sequence[int], ys: Sequence[int], depths: Sequence[float]
+) -> Tuple[float, float, float]:
+    x = float(rng.choice(xs))
+    y = float(rng.choice(ys))
     depth = float(rng.choice(depths))
     return x, y, round(depth, 1)
 
@@ -666,17 +668,18 @@ def resolve_press_reference_scale_mm(args: argparse.Namespace, scales_mm: Sequen
 
 
 def press_xy_for_scale(
-    base_x_mm: int,
-    base_y_mm: int,
+    base_x_mm: float,
+    base_y_mm: float,
     scale_mm: int,
     reference_scale_mm: int,
     mode: str,
-) -> Tuple[int, int]:
+) -> Tuple[float, float]:
     if mode == "absolute":
-        return int(base_x_mm), int(base_y_mm)
+        return float(base_x_mm), float(base_y_mm)
     scale_ratio = float(scale_mm) / float(reference_scale_mm)
-    x_mm = int(round(base_x_mm * scale_ratio))
-    y_mm = int(round(base_y_mm * scale_ratio))
+    # Keep sub-mm coordinates in scaled mode to avoid cross-scale jump caused by int rounding.
+    x_mm = round(float(base_x_mm) * scale_ratio, 4)
+    y_mm = round(float(base_y_mm) * scale_ratio, 4)
     return x_mm, y_mm
 
 
@@ -728,8 +731,15 @@ def patch_coords_16x16(scale_mm: int) -> List[List[List[float]]]:
     return coords.tolist()
 
 
-def expected_npz_path(npz_output_root: Path, indenter_name: str, x: int, y: int, depth: float) -> Path:
-    suffix = f"{x}_{y}_{round(depth, 1)}.npz"
+def format_coord_for_suffix(v: float) -> str:
+    if abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    s = f"{float(v):.4f}".rstrip("0").rstrip(".")
+    return "0" if s == "-0" else s
+
+
+def expected_npz_path(npz_output_root: Path, indenter_name: str, x: float, y: float, depth: float) -> Path:
+    suffix = f"{format_coord_for_suffix(x)}_{format_coord_for_suffix(y)}_{round(depth, 1)}.npz"
     return npz_output_root / indenter_name / suffix
 
 
@@ -774,8 +784,8 @@ def run_episode(
     episode_id: int,
     scales_mm: Sequence[int],
     marker_path: Path,
-    x: int,
-    y: int,
+    x: float,
+    y: float,
     depth: float,
     args: argparse.Namespace,
     parameters_yml: Path,
@@ -816,14 +826,14 @@ def run_episode(
             if args.press_position_mode == "scaled":
                 logging.warning(
                     "Episode %06d uses `virtual` mode with `press-position-mode=scaled`: "
-                    "physics runs once at reference-scale coordinates (x=%d, y=%d), "
+                    "physics runs once at reference-scale coordinates (x=%.4f, y=%.4f), "
                     "so rendered normalized position varies with scale.",
                     episode_id,
                     x,
                     y,
                 )
             logging.info(
-                "Episode %06d | indenter=%s | virtual physics | contact=(x=%d, y=%d, d=%.1f)",
+                "Episode %06d | indenter=%s | virtual physics | contact=(x=%.4f, y=%.4f, d=%.1f)",
                 episode_id,
                 job.indenter_name,
                 x,
@@ -860,7 +870,9 @@ def run_episode(
 
             npz_path = expected_npz_path(npz_output_root, job.indenter_name, x, y, depth)
             if not npz_path.exists():
-                fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x}_{y}_*.npz"))
+                x_tag = format_coord_for_suffix(x)
+                y_tag = format_coord_for_suffix(y)
+                fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x_tag}_{y_tag}_*.npz"))
                 if not fallback:
                     raise FileNotFoundError(f"Expected deformation npz not found at {npz_path}")
                 npz_path = fallback[-1]
@@ -925,8 +937,8 @@ def run_episode(
 
                 metadata["scales"][f"{scale_mm}mm"] = {
                     "scale_mm": int(scale_mm),
-                    "contact_x_mm": int(x),
-                    "contact_y_mm": int(y),
+                    "contact_x_mm": float(x),
+                    "contact_y_mm": float(y),
                     "deformation_stats": deform_stats,
                     "render_image": str(render_path.relative_to(episode_dir)),
                     "patch_coords_16x16": patch_coords_16x16(int(scale_mm)),
@@ -950,7 +962,7 @@ def run_episode(
                 render_path = scale_dir / "render.jpg"
 
                 logging.info(
-                    "Episode %06d | indenter=%s | physical scale=%dmm | contact=(x=%d, y=%d, d=%.1f)",
+                    "Episode %06d | indenter=%s | physical scale=%dmm | contact=(x=%.4f, y=%.4f, d=%.1f)",
                     episode_id,
                     job.indenter_name,
                     scale_mm,
@@ -989,7 +1001,9 @@ def run_episode(
 
                 npz_path = expected_npz_path(npz_output_root, job.indenter_name, x_scale_mm, y_scale_mm, depth)
                 if not npz_path.exists():
-                    fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x_scale_mm}_{y_scale_mm}_*.npz"))
+                    x_tag = format_coord_for_suffix(x_scale_mm)
+                    y_tag = format_coord_for_suffix(y_scale_mm)
+                    fallback = sorted((npz_output_root / job.indenter_name).glob(f"{x_tag}_{y_tag}_*.npz"))
                     if not fallback:
                         raise FileNotFoundError(f"Expected deformation npz not found at {npz_path}")
                     npz_path = fallback[-1]
@@ -1043,8 +1057,8 @@ def run_episode(
 
                 metadata["scales"][f"{scale_mm}mm"] = {
                     "scale_mm": int(scale_mm),
-                    "contact_x_mm": int(x_scale_mm),
-                    "contact_y_mm": int(y_scale_mm),
+                    "contact_x_mm": float(x_scale_mm),
+                    "contact_y_mm": float(y_scale_mm),
                     "deformation_stats": deform_stats,
                     "render_image": str(render_path.relative_to(episode_dir)),
                     "patch_coords_16x16": patch_coords_16x16(int(scale_mm)),

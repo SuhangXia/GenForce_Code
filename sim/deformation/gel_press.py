@@ -15,8 +15,8 @@ def get_args():
     parser.add_argument("--dir_output", default="sim/assets/indenters/output/npz")  
     parser.add_argument("--dataset", default="sim/assets/indenters/input")  
     parser.add_argument("--object", default="wave")    
-    parser.add_argument("--x", type=int, default=0)    
-    parser.add_argument("--y", type=int, default=0)    
+    parser.add_argument("--x", type=float, default=0.0)    
+    parser.add_argument("--y", type=float, default=0.0)    
     parser.add_argument("--depth", type=float, default=1.5)    
 
     args = parser.parse_args()  
@@ -32,6 +32,13 @@ def read_yaml_config(file_path):
         print(f"Error: The file {file_path} was not found.")  
     except yaml.YAMLError as exc:  
         print(f"Error parsing YAML file: {exc}")  
+
+
+def format_coord_suffix(v):
+    if abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    s = f"{float(v):.4f}".rstrip("0").rstrip(".")
+    return "0" if s == "-0" else s
 
     
 args = get_args()
@@ -65,7 +72,7 @@ h = config["elastomer"]["size"]["h"]
 pose_x, pose_y, pose_z = config["indenter"]["pose"]["x"], config["indenter"]["pose"]["y"], config["indenter"]["pose"]["z"]
 pose_R, pose_P, pose_Y = config["indenter"]["pose"]["R"], config["indenter"]["pose"]["P"], config["indenter"]["pose"]["Y"]
 indenting_depth = round(args.depth,1)
-suffix = f"{args.x}_{args.y}_{indenting_depth}"
+suffix = f"{format_coord_suffix(args.x)}_{format_coord_suffix(args.y)}_{indenting_depth}"
 obj_name = os.path.join(args.dataset,"npy_" + args.particle, args.object + ".npy")
 data = np.load(obj_name)
 rotation_m = rotations.matrix_from_euler((pose_R, pose_P, pose_Y),0,1,2,True) # use extrinsic
