@@ -2,7 +2,7 @@
 """
 Training script for the Universal Scale Adapter (USA).
 
-Reads adapter_dataset_ultimate/manifest.json with physically isolated Train/Val/Test splits:
+Reads datasets/usa_static_v1/manifest.json with physically isolated Train/Val/Test splits:
   - Test: 4 indenters (pacman, wave, torus, hexagon) — zero-shot generalization
   - Train/Val: remaining indenters, 85% / 15% split
 
@@ -11,7 +11,7 @@ Pairing modes:
   - val/test: target fixed to 15mm, source from [18,20,22,25]
 
 Usage:
-    python scrpit/train_adapter.py --dataset adapter_dataset_ultimate
+    python scrpit/train_adapter.py --dataset datasets/usa_static_v1
     python scrpit/train_adapter.py --sanity-check   # overfit 1 batch
     python scrpit/train_adapter.py --epochs 200 --lr 5e-5
 """
@@ -21,6 +21,7 @@ import itertools
 import json
 import logging
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +41,7 @@ from usa_adapter import UniversalScaleAdapter
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATASET = PROJECT_ROOT / "adapter_dataset_ultimate"
+DEFAULT_DATASET = PROJECT_ROOT / "datasets" / "usa_static_v1"
 
 # Indenters held out EXCLUSIVELY for test (zero-shot)
 TEST_INDENTERS = frozenset({"pacman", "wave", "torus", "hexagon"})
@@ -58,7 +59,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# MultiscaleTactileDataset — adapter_dataset_ultimate format
+# MultiscaleTactileDataset — datasets/usa_static_v1 format
 # ---------------------------------------------------------------------------
 
 class MultiscaleTactileDataset(Dataset):
@@ -388,6 +389,15 @@ def feature_alignment_terms(pred: torch.Tensor, target: torch.Tensor) -> tuple[t
     return mse, cos_loss, cos_sim
 
 
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    return f"{minutes:02d}m{secs:02d}s"
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -574,8 +584,11 @@ def train(args):
     best_val_loss = float("inf")
     best_val_cos = -1.0
     step = 0
+    train_start_time = time.time()
+    epoch_durations: list[float] = []
 
     for epoch in range(1, args.epochs + 1):
+        epoch_start_time = time.time()
         adapter.train()
         epoch_loss = 0.0
         epoch_mse_component = 0.0
@@ -672,6 +685,17 @@ def train(args):
         avg_mse_component = epoch_mse_component / max(n_batches, 1)
         avg_cos_component = epoch_cos_component / max(n_batches, 1)
         avg_train_cos = epoch_cos / max(n_batches, 1)
+        epoch_elapsed = time.time() - epoch_start_time
+        epoch_durations.append(epoch_elapsed)
+        avg_epoch_time = sum(epoch_durations) / max(len(epoch_durations), 1)
+        remaining_epochs = max(args.epochs - epoch, 0)
+        eta_seconds = remaining_epochs * avg_epoch_time
+        total_elapsed = time.time() - train_start_time
+        time_suffix = (
+            f"epoch_t={_format_duration(epoch_elapsed)} "
+            f"elapsed={_format_duration(total_elapsed)} "
+            f"eta={_format_duration(eta_seconds)}"
+        )
 
         # Validation
         if val_loader and not args.sanity_check:
@@ -736,7 +760,7 @@ def train(args):
                 lr_now = optimizer.param_groups[0]["lr"]
                 log.info(
                     "Epoch %3d/%d  train_loss=%.6f train_mse=%.6f train_cos_loss=%.6f train_cos=%.4f  "
-                    "val_loss=%.6f val_mse=%.6f val_cos_loss=%.6f val_cos=%.4f  lr=%.2e",
+                    "val_loss=%.6f val_mse=%.6f val_cos_loss=%.6f val_cos=%.4f  lr=%.2e  %s",
                     epoch,
                     args.epochs,
                     avg_loss,
@@ -748,12 +772,13 @@ def train(args):
                     val_cos_component,
                     val_cos,
                     lr_now,
+                    time_suffix,
                 )
         else:
             if epoch % args.log_every == 0 or epoch == 1:
                 lr_now = optimizer.param_groups[0]["lr"]
                 log.info(
-                    "Epoch %3d/%d  loss=%.6f mse=%.6f cos_loss=%.6f cos=%.4f  lr=%.2e",
+                    "Epoch %3d/%d  loss=%.6f mse=%.6f cos_loss=%.6f cos=%.4f  lr=%.2e  %s",
                     epoch,
                     args.epochs,
                     avg_loss,
@@ -761,6 +786,7 @@ def train(args):
                     avg_cos_component,
                     avg_train_cos,
                     lr_now,
+                    time_suffix,
                 )
 
             if args.sanity_check and avg_loss < 0.001:
@@ -856,9 +882,9 @@ def train(args):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train USA adapter (adapter_dataset_ultimate)")
+    p = argparse.ArgumentParser(description="Train USA adapter (datasets/usa_static_v1)")
     p.add_argument("--dataset", type=str, default=str(DEFAULT_DATASET),
-                   help="Path to adapter_dataset_ultimate")
+                   help="Path to datasets/usa_static_v1")
     p.add_argument("--scales", nargs="+", type=int, default=[15, 18, 20, 22, 25])
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)

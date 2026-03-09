@@ -1,7 +1,7 @@
 {
   "episode_id": 0,
-  "generated_at": "2026-03-08T21:09:27.547092+00:00",
-  "indenter": "cylinder",
+  "generated_at": "2026-03-08T23:30:26.782877+00:00",
+  "indenter": "cone",
   "particle": "100000",
   "contact": {
     "x_mm": 0.8366,
@@ -19,10 +19,10 @@
       "contact_y_mm": -2.8499,
       "contact_depth_mm": 0.9,
       "deformation_stats": {
-        "surface_max_down_mm": 0.9129638671875,
-        "surface_mean_down_mm": 0.16974267332288123,
+        "surface_max_down_mm": 0.9105434417724609,
+        "surface_mean_down_mm": 0.030534502595397212,
         "surface_min_z_start_mm": 12.0,
-        "surface_min_z_end_mm": 11.0870361328125
+        "surface_min_z_end_mm": 11.089456558227539
       },
       "camera_mode": "fixed_distance_variable_fov",
       "camera_distance_m": 0.03365659838831912,
@@ -43,8 +43,43 @@
       ],
       "adapter_coord_map": "scale_15mm/adapter_coord_map.npy",
       "adapter_coord_map_shape": [
-        16,
-        16,
+        14,
+        14,
+        2
+      ]
+    },
+    "scale_25mm": {
+      "scale_mm": 25,
+      "contact_x_mm": 0.8366,
+      "contact_y_mm": -2.8499,
+      "contact_depth_mm": 0.9,
+      "deformation_stats": {
+        "surface_max_down_mm": 0.9136838912963867,
+        "surface_mean_down_mm": 0.006018259048274938,
+        "surface_min_z_start_mm": 12.0,
+        "surface_min_z_end_mm": 11.086316108703613
+      },
+      "camera_mode": "fixed_distance_variable_fov",
+      "camera_distance_m": 0.03365659838831912,
+      "camera_fov_deg": 40.74981184118078,
+      "rendered_markers": [
+        "marker_Array1.jpg",
+        "marker_Array2.jpg",
+        "marker_Array3.jpg",
+        "marker_Array4.jpg",
+        "marker_Circle1.jpg",
+        "marker_Circle2.jpg",
+        "marker_Circle3.jpg",
+        "marker_Circle4.jpg",
+        "marker_Diamond1.jpg",
+        "marker_Diamond2.jpg",
+        "marker_Diamond3.jpg",
+        "marker_Diamond4.jpg"
+      ],
+      "adapter_coord_map": "scale_25mm/adapter_coord_map.npy",
+      "adapter_coord_map_shape": [
+        14,
+        14,
         2
       ]
     }
