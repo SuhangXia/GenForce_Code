@@ -59,6 +59,10 @@ DEFAULT_REFERENCE_SCALE_MM = 25.0
 DEFAULT_DISTANCE_SAFETY = 0.98
 DEFAULT_PATCH_GRID = "14x14"
 DEFAULT_FRAME_FRACTIONS = [0.4, 0.6, 0.8, 1.0]
+DEFAULT_FRAME_SAMPLING_MODE = "depth_random"
+DEFAULT_FRAME_COUNT = 4
+DEFAULT_FRAME_DEPTH_START_MM = 0.4
+DEFAULT_FRAME_DEPTH_END_MM = 2.2
 DEFAULT_IMAGE_RES = (640, 480)
 TEXTURE_EXTS = {".jpg", ".jpeg", ".png"}
 
@@ -755,6 +759,92 @@ def deformation_stats_for_frame(z_trajectory: np.ndarray, frame_index: int) -> D
     }
 
 
+def make_random_frame_depth_targets_mm(
+    frame_count: int,
+    depth_start_mm: float,
+    depth_end_mm: float,
+    rng: random.Random,
+) -> List[float]:
+    if frame_count <= 0:
+        raise ValueError(f"frame_count must be > 0, got {frame_count}")
+    if depth_start_mm <= 0:
+        raise ValueError(f"depth_start_mm must be > 0, got {depth_start_mm}")
+    if depth_end_mm <= depth_start_mm:
+        raise ValueError(
+            f"depth_end_mm must be > depth_start_mm, got {depth_end_mm} <= {depth_start_mm}"
+        )
+
+    # Start frame around shallow contact, final frame focused near max depth.
+    start_low = max(0.01, float(depth_start_mm) - 0.05)
+    start_high = float(depth_start_mm) + 0.05
+    d0 = float(rng.uniform(start_low, start_high))
+    d_last = float(depth_end_mm)
+    if d_last <= d0 + 1e-6:
+        d_last = d0 + 1e-3
+
+    if frame_count == 1:
+        return [round(d_last, 4)]
+
+    if frame_count == 2:
+        return [round(d0, 4), round(d_last, 4)]
+
+    mids = sorted(float(rng.uniform(d0, d_last)) for _ in range(frame_count - 2))
+    targets = [d0] + mids + [d_last]
+    return [round(v, 4) for v in targets]
+
+
+def max_down_trajectory_mm(z_trajectory: np.ndarray) -> np.ndarray:
+    if z_trajectory.ndim != 2:
+        raise ValueError(f"z_trajectory must be 2D [T,N], got {z_trajectory.shape}")
+    start = z_trajectory[0:1, :]
+    return np.max(start - z_trajectory, axis=1)
+
+
+def resolve_sampled_frames_by_depth(
+    z_trajectory: np.ndarray,
+    frame_depth_targets_mm: Sequence[float],
+    deduplicate: bool,
+) -> List[Dict[str, float | int]]:
+    if z_trajectory.ndim != 2:
+        raise ValueError(f"z_trajectory must be 2D [T,N], got {z_trajectory.shape}")
+    if not frame_depth_targets_mm:
+        raise ValueError("frame_depth_targets_mm cannot be empty in depth sampling mode")
+
+    max_down = max_down_trajectory_mm(z_trajectory)
+    t = int(max_down.shape[0])
+    t_last = max(t - 1, 0)
+    samples: List[Dict[str, float | int]] = []
+
+    for depth_target in frame_depth_targets_mm:
+        target = float(depth_target)
+        if target < 0:
+            raise ValueError(f"frame depth target must be >= 0, got {target}")
+
+        idx = int(np.argmin(np.abs(max_down - target)))
+
+        idx = max(0, min(t_last, idx))
+        frac = 1.0 if t_last == 0 else float(idx) / float(t_last)
+        samples.append(
+            {
+                "frame_index": idx,
+                "frame_fraction": frac,
+                "frame_fraction_requested": frac,
+                "frame_target_max_down_mm": target,
+                "frame_actual_max_down_mm": float(max_down[idx]),
+            }
+        )
+
+    samples.sort(key=lambda x: int(x["frame_index"]))
+    if deduplicate:
+        unique: Dict[int, Dict[str, float | int]] = {}
+        for s in samples:
+            idx = int(s["frame_index"])
+            if idx not in unique:
+                unique[idx] = s
+        samples = [unique[idx] for idx in sorted(unique.keys())]
+    return samples
+
+
 def resolve_sampled_frames(
     trajectory_length: int,
     frame_indices: Sequence[int] | None,
@@ -868,6 +958,8 @@ def validate_existing_scale_metadata(
     scale_key: str,
     scale_meta: Dict[str, Any],
     expected_marker_files: Sequence[str] | None = None,
+    expected_frame_sampling_mode: str | None = None,
+    expected_frame_depth_targets_mm: Sequence[float] | None = None,
 ) -> bool:
     if not isinstance(scale_meta, dict):
         return False
@@ -878,6 +970,21 @@ def validate_existing_scale_metadata(
     coord_map_path = episode_dir / rel
     if not coord_map_path.exists():
         return False
+
+    if expected_frame_sampling_mode is not None:
+        got_mode = str(scale_meta.get("frame_sampling_mode", "fraction"))
+        if got_mode != str(expected_frame_sampling_mode):
+            return False
+
+    if expected_frame_depth_targets_mm is not None:
+        got_targets = scale_meta.get("frame_depth_targets_mm")
+        if not isinstance(got_targets, list):
+            return False
+        if len(got_targets) != len(expected_frame_depth_targets_mm):
+            return False
+        for a, b in zip(got_targets, expected_frame_depth_targets_mm):
+            if abs(float(a) - float(b)) > 1e-3:
+                return False
 
     frames = scale_meta.get("frames")
     if not isinstance(frames, dict) or len(frames) == 0:
@@ -1057,12 +1164,22 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
         z_trajectory = _load_z_trajectory(npz_path)
         trajectory_length = int(z_trajectory.shape[0])
-        samples = resolve_sampled_frames(
-            trajectory_length=trajectory_length,
-            frame_indices=task.get("frame_indices"),
-            frame_fractions=task.get("frame_fractions"),
-            deduplicate=bool(task.get("deduplicate_frame_indices", True)),
-        )
+        frame_sampling_mode = str(task.get("frame_sampling_mode", "fraction"))
+        if frame_sampling_mode == "depth_random":
+            frame_depth_targets_mm = [float(v) for v in task.get("frame_depth_targets_mm", [])]
+            samples = resolve_sampled_frames_by_depth(
+                z_trajectory=z_trajectory,
+                frame_depth_targets_mm=frame_depth_targets_mm,
+                deduplicate=bool(task.get("deduplicate_frame_indices", True)),
+            )
+        else:
+            frame_depth_targets_mm = None
+            samples = resolve_sampled_frames(
+                trajectory_length=trajectory_length,
+                frame_indices=task.get("frame_indices"),
+                frame_fractions=task.get("frame_fractions"),
+                deduplicate=bool(task.get("deduplicate_frame_indices", True)),
+            )
 
         side_border_px = int(task.get("force_black_side_border_px", 0))
         frames: Dict[str, Dict[str, Any]] = {}
@@ -1071,8 +1188,8 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
         for sample_ord, sample in enumerate(samples):
             frame_index = int(sample["frame_index"])
-            frame_fraction = float(sample["frame_fraction"])
-            frame_fraction_requested = float(sample["frame_fraction_requested"])
+            frame_fraction = float(sample.get("frame_fraction", 0.0))
+            frame_fraction_requested = float(sample.get("frame_fraction_requested", frame_fraction))
             frame_name = f"frame_{sample_ord:03d}"
             frame_dir = scale_dir / frame_name
             frame_dir.mkdir(parents=True, exist_ok=True)
@@ -1156,7 +1273,7 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 rendered_frames += 1
 
-            frames[frame_name] = {
+            frame_meta = {
                 "frame_name": frame_name,
                 "frame_index": frame_index,
                 "frame_fraction": frame_fraction,
@@ -1165,6 +1282,11 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 "rendered_markers": rendered,
                 "deformation_stats": deformation_stats_for_frame(z_trajectory, frame_index),
             }
+            if "frame_target_max_down_mm" in sample:
+                frame_meta["frame_target_max_down_mm"] = float(sample["frame_target_max_down_mm"])
+            if "frame_actual_max_down_mm" in sample:
+                frame_meta["frame_actual_max_down_mm"] = float(sample["frame_actual_max_down_mm"])
+            frames[frame_name] = frame_meta
 
         render_success = True
         return {
@@ -1176,6 +1298,8 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "adapter_coord_map_shape": coord_map_shape,
             "trajectory_length": trajectory_length,
             "sampled_frame_indices": [int(s["frame_index"]) for s in samples],
+            "frame_sampling_mode": frame_sampling_mode,
+            "frame_depth_targets_mm": frame_depth_targets_mm,
             "frames": frames,
             "frames_reused": int(reused_frames),
             "frames_rendered": int(rendered_frames),
@@ -1259,18 +1383,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--depth-min", type=float, default=DEFAULT_DEPTH_RANGE[0])
     p.add_argument("--depth-max", type=float, default=DEFAULT_DEPTH_RANGE[1])
     p.add_argument(
+        "--frame-sampling-mode",
+        choices=["depth_random", "fraction"],
+        default=DEFAULT_FRAME_SAMPLING_MODE,
+        help="Frame sampling policy. depth_random: choose frames by max-down depth targets per episode.",
+    )
+    p.add_argument(
+        "--frame-count",
+        type=int,
+        default=DEFAULT_FRAME_COUNT,
+        help="Number of sampled frames per scale when using depth_random mode.",
+    )
+    p.add_argument(
+        "--frame-depth-start-mm",
+        type=float,
+        default=DEFAULT_FRAME_DEPTH_START_MM,
+        help="Shallow-depth anchor (mm) for random depth sampling per episode.",
+    )
+    p.add_argument(
+        "--frame-depth-end-mm",
+        type=float,
+        default=DEFAULT_FRAME_DEPTH_END_MM,
+        help="Deep-depth anchor (mm) for random depth sampling per episode (typically 2.2).",
+    )
+    p.add_argument(
         "--frame-fractions",
         type=float,
         nargs="+",
         default=DEFAULT_FRAME_FRACTIONS,
-        help="Sampled deformation fractions in (0,1], mapped to trajectory indices.",
+        help="Sampled deformation fractions in (0,1], mapped to trajectory indices (fraction mode only).",
     )
     p.add_argument(
         "--frame-indices",
         type=int,
         nargs="+",
         default=None,
-        help="Explicit deformation frame indices. If set, overrides --frame-fractions.",
+        help="Explicit deformation frame indices (fraction mode only). If set, overrides --frame-fractions.",
     )
     p.add_argument(
         "--deduplicate-frame-indices",
@@ -1382,14 +1530,27 @@ def main() -> None:
         raise ValueError("--force-black-side-border-px must be >= 0")
     if args.resume and args.clean_output:
         raise ValueError("--resume and --clean-output cannot be used together")
-    if args.frame_indices is not None and len(args.frame_indices) == 0:
-        raise ValueError("--frame-indices cannot be empty")
-    if args.frame_indices is None:
-        if args.frame_fractions is None or len(args.frame_fractions) == 0:
-            raise ValueError("--frame-fractions cannot be empty when --frame-indices is not set")
-        for f in args.frame_fractions:
-            if not (0.0 < float(f) <= 1.0):
-                raise ValueError(f"--frame-fractions values must be in (0, 1], got {f}")
+    if args.frame_sampling_mode == "depth_random":
+        if args.frame_count <= 0:
+            raise ValueError("--frame-count must be > 0 in depth_random mode")
+        if args.frame_depth_start_mm <= 0:
+            raise ValueError("--frame-depth-start-mm must be > 0")
+        if args.frame_depth_end_mm <= args.frame_depth_start_mm:
+            raise ValueError("--frame-depth-end-mm must be > --frame-depth-start-mm")
+        if args.depth_max < args.frame_depth_end_mm:
+            raise ValueError(
+                "--depth-max must be >= --frame-depth-end-mm in depth_random mode "
+                f"(got depth-max={args.depth_max}, frame-depth-end-mm={args.frame_depth_end_mm})"
+            )
+    else:
+        if args.frame_indices is not None and len(args.frame_indices) == 0:
+            raise ValueError("--frame-indices cannot be empty")
+        if args.frame_indices is None:
+            if args.frame_fractions is None or len(args.frame_fractions) == 0:
+                raise ValueError("--frame-fractions cannot be empty when --frame-indices is not set")
+            for f in args.frame_fractions:
+                if not (0.0 < float(f) <= 1.0):
+                    raise ValueError(f"--frame-fractions values must be in (0, 1], got {f}")
     patch_h, patch_w = parse_patch_grid(args.patch_grid)
 
     if args.camera_distance_m is not None:
@@ -1444,7 +1605,21 @@ def main() -> None:
         for _ in range(args.episodes_per_indenter):
             x_mm = round(rng.uniform(args.x_min, args.x_max), 4)
             y_mm = round(rng.uniform(args.y_min, args.y_max), 4)
-            depth_mm = round(rng.uniform(args.depth_min, args.depth_max), 1)
+            episode_frame_depth_targets_mm: List[float] | None = None
+            if args.frame_sampling_mode == "depth_random":
+                episode_frame_depth_targets_mm = make_random_frame_depth_targets_mm(
+                    frame_count=int(args.frame_count),
+                    depth_start_mm=float(args.frame_depth_start_mm),
+                    depth_end_mm=float(args.frame_depth_end_mm),
+                    rng=rng,
+                )
+                deep_target = float(episode_frame_depth_targets_mm[-1])
+                # Bias final press depth to be close to deep target (around 2.2mm by default).
+                depth_low = max(float(args.depth_min), deep_target - 0.2)
+                depth_high = max(depth_low, float(args.depth_max))
+                depth_mm = round(rng.uniform(depth_low, depth_high), 1)
+            else:
+                depth_mm = round(rng.uniform(args.depth_min, args.depth_max), 1)
 
             episode_dir = dataset_root / f"episode_{episode_id:06d}"
             episode_dir.mkdir(parents=True, exist_ok=True)
@@ -1481,6 +1656,8 @@ def main() -> None:
                         scale_key,
                         scale_meta,
                         expected_marker_files=expected_marker_files,
+                        expected_frame_sampling_mode=str(args.frame_sampling_mode),
+                        expected_frame_depth_targets_mm=episode_frame_depth_targets_mm,
                     ):
                         episode_states[episode_id].scales[scale_key] = scale_meta
                         resume_scales_from_metadata += 1
@@ -1504,12 +1681,18 @@ def main() -> None:
                         ),
                         "physics_timeout_sec": int(args.physics_timeout_sec),
                         "resume": bool(args.resume),
+                        "frame_sampling_mode": str(args.frame_sampling_mode),
+                        "frame_depth_targets_mm": (
+                            [float(v) for v in episode_frame_depth_targets_mm]
+                            if episode_frame_depth_targets_mm is not None
+                            else None
+                        ),
                     }
                 )
                 prepared_scales += 1
 
             logging.info(
-                "Prepared episode_%06d | indenter=%s | contact=(x=%.4f, y=%.4f, d=%.1f) | queued_scales=%d skipped_scales=%d",
+                "Prepared episode_%06d | indenter=%s | contact=(x=%.4f, y=%.4f, d=%.1f) | queued_scales=%d skipped_scales=%d%s",
                 episode_id,
                 indenter,
                 x_mm,
@@ -1517,6 +1700,11 @@ def main() -> None:
                 depth_mm,
                 prepared_scales,
                 skipped_scales,
+                (
+                    f" | depth_targets_mm={episode_frame_depth_targets_mm}"
+                    if episode_frame_depth_targets_mm is not None
+                    else ""
+                ),
             )
             episode_id += 1
 
@@ -1531,10 +1719,18 @@ def main() -> None:
     logging.info("Patch grid: %dx%d", patch_h, patch_w)
     logging.info("Resume mode: %s", args.resume)
     logging.info("Intermediates root: %s", work_tmp_root)
-    if args.frame_indices is not None:
-        logging.info("Frame sampling: explicit indices=%s deduplicate=%s", args.frame_indices, args.deduplicate_frame_indices)
+    if args.frame_sampling_mode == "depth_random":
+        logging.info(
+            "Frame sampling: mode=depth_random frame_count=%d start≈%.3fmm end≈%.3fmm deduplicate=%s",
+            int(args.frame_count),
+            float(args.frame_depth_start_mm),
+            float(args.frame_depth_end_mm),
+            args.deduplicate_frame_indices,
+        )
+    elif args.frame_indices is not None:
+        logging.info("Frame sampling: mode=fraction explicit indices=%s deduplicate=%s", args.frame_indices, args.deduplicate_frame_indices)
     else:
-        logging.info("Frame sampling: fractions=%s deduplicate=%s", args.frame_fractions, args.deduplicate_frame_indices)
+        logging.info("Frame sampling: mode=fraction fractions=%s deduplicate=%s", args.frame_fractions, args.deduplicate_frame_indices)
     logging.info("Total (episode,scale) physics tasks: %d", total_scale_tasks)
     if args.resume:
         logging.info("Scales restored directly from existing metadata: %d", resume_scales_from_metadata)
@@ -1638,8 +1834,22 @@ def main() -> None:
                     "uv_mode": str(args.uv_mode),
                     "uv_inset_ratio": float(args.uv_inset_ratio),
                     "force_black_side_border_px": int(args.force_black_side_border_px),
-                    "frame_fractions": None if args.frame_indices is not None else [float(v) for v in args.frame_fractions],
-                    "frame_indices": None if args.frame_indices is None else [int(v) for v in args.frame_indices],
+                    "frame_sampling_mode": str(args.frame_sampling_mode),
+                    "frame_fractions": (
+                        None
+                        if (args.frame_sampling_mode != "fraction" or args.frame_indices is not None)
+                        else [float(v) for v in args.frame_fractions]
+                    ),
+                    "frame_indices": (
+                        None
+                        if (args.frame_sampling_mode != "fraction" or args.frame_indices is None)
+                        else [int(v) for v in args.frame_indices]
+                    ),
+                    "frame_depth_targets_mm": (
+                        [float(v) for v in task.get("frame_depth_targets_mm", [])]
+                        if args.frame_sampling_mode == "depth_random"
+                        else None
+                    ),
                     "deduplicate_frame_indices": bool(args.deduplicate_frame_indices),
                     "patch_h": int(patch_h),
                     "patch_w": int(patch_w),
@@ -1711,6 +1921,8 @@ def main() -> None:
                     "contact_depth_mm": float(physics_result["depth_mm"]),
                     "deformation_stats_final": physics_result["deformation_stats_final"],
                     "trajectory_length": int(rr["trajectory_length"]),
+                    "frame_sampling_mode": str(rr.get("frame_sampling_mode", args.frame_sampling_mode)),
+                    "frame_depth_targets_mm": rr.get("frame_depth_targets_mm"),
                     "camera_mode": str(args.camera_mode),
                     "camera_distance_m": float(render_distance_m),
                     "camera_fov_deg": float(render_fov_deg),
@@ -1803,8 +2015,20 @@ def main() -> None:
             "scales_mm": [int(s) for s in args.scales_mm],
             "patch_grid": [int(patch_h), int(patch_w)],
             "coordinate_convention": "X right positive, Y down positive, row-major",
-            "frame_fractions": None if args.frame_indices is not None else [float(v) for v in args.frame_fractions],
-            "frame_indices": None if args.frame_indices is None else [int(v) for v in args.frame_indices],
+            "frame_sampling_mode": str(args.frame_sampling_mode),
+            "frame_count": int(args.frame_count),
+            "frame_depth_start_mm": float(args.frame_depth_start_mm),
+            "frame_depth_end_mm": float(args.frame_depth_end_mm),
+            "frame_fractions": (
+                None
+                if (args.frame_sampling_mode != "fraction" or args.frame_indices is not None)
+                else [float(v) for v in args.frame_fractions]
+            ),
+            "frame_indices": (
+                None
+                if (args.frame_sampling_mode != "fraction" or args.frame_indices is None)
+                else [int(v) for v in args.frame_indices]
+            ),
             "frames_per_scale": frames_per_scale,
             "episodes_per_indenter": int(args.episodes_per_indenter),
             "indenter_count": len(indenter_names),
