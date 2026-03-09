@@ -2,8 +2,9 @@
 """Generate a large multiscale tactile dataset with cheap marker diversification.
 
 Core idea (Simulation Economics):
-- Expensive stage: Taichi MPM deformation (.npz -> .stl) for each (episode, scale).
-- Cheap stage: Blender re-renders same deformed .stl with ALL marker textures.
+- Stage 1 (GPU): Taichi MPM deformation, one .npz per (episode, scale).
+- Stage 2 (CPU): Open3D meshing, one .stl per sampled frame.
+- Stage 3 (CPU): Blender re-renders each frame .stl with ALL marker textures.
 
 Output layout:
     datasets/usa_static_v1/
@@ -22,6 +23,7 @@ Output layout:
 
 This script is parallel-friendly:
 - Physics workers: capped (default 7) to avoid CUDA OOM.
+- Meshing workers: modest CPU pool for Open3D.
 - Render workers: CPU-oriented process pool.
 """
 
@@ -253,6 +255,7 @@ def parse_args():
         default="unwrap_genforce",
     )
     p.add_argument("--uv-inset-ratio", type=float, default=0.01)
+    p.add_argument("--render-samples", type=int, default=32)
     return p.parse_args(user_argv)
 
 
@@ -546,11 +549,11 @@ def setup_camera(
     )
 
 
-def configure_render(out_dir: Path):
+def configure_render(out_dir: Path, render_samples: int):
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
     if hasattr(scene, "cycles"):
-        scene.cycles.samples = 64
+        scene.cycles.samples = max(1, int(render_samples))
         scene.cycles.use_adaptive_sampling = True
         scene.cycles.max_bounces = 4
         scene.cycles.device = "CPU"
@@ -635,7 +638,7 @@ def main():
         args.fixed_distance_m,
         args.distance_safety,
     )
-    configure_render(output_dir)
+    configure_render(output_dir, int(args.render_samples))
 
     textures = list_textures(textures_dir)
     for tex_path in textures:
@@ -665,6 +668,34 @@ class EpisodeState:
     scales: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
 
+
+@dataclass
+class ScaleState:
+    episode_id: int
+    scale_mm: int
+    scale_key: str
+    scale_dir: Path
+    temp_scale_dir: Path
+    contact_x_mm: float
+    contact_y_mm: float
+    contact_depth_mm: float
+    trajectory_length: int
+    deformation_stats_final: Dict[str, float]
+    frame_sampling_mode: str
+    frame_depth_targets_mm: List[float] | None
+    sampled_frames: List[Dict[str, Any]]
+    camera_mode: str
+    camera_distance_m: float
+    camera_fov_deg: float
+    adapter_coord_map_path: Path
+    adapter_coord_map_shape: List[int]
+    frames: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    pending_mesh_count: int = 0
+    pending_render_count: int = 0
+    frames_reused: int = 0
+    frames_rendered: int = 0
+    failed: bool = False
+    sealed: bool = False
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -703,6 +734,12 @@ def _progress_eta_text(stage_start_ts: float, done: int, total: int) -> str:
         f"progress={done}/{total} elapsed={_format_duration(elapsed)} "
         f"eta={_format_duration(eta_sec)} eta_at={eta_at}"
     )
+
+
+def _throughput_text(stage_start_ts: float, done: int) -> str:
+    elapsed = max(1e-6, time.time() - float(stage_start_ts))
+    rate = float(done) / elapsed
+    return f"throughput={rate:.3f}/s"
 
 
 def resolve_path(base: Path, value: Path) -> Path:
@@ -897,6 +934,24 @@ def resolve_sampled_frames(
     if not samples:
         samples = [{"frame_index": t_last, "frame_fraction": 1.0, "frame_fraction_requested": 1.0}]
     return samples
+
+
+def make_frame_metadata(sample: Dict[str, Any], rendered_markers: Sequence[str]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "frame_index": int(sample["frame_index"]),
+        "frame_fraction": float(sample.get("frame_fraction", 0.0)),
+        "frame_fraction_requested": float(
+            sample.get("frame_fraction_requested", sample.get("frame_fraction", 0.0))
+        ),
+        "trajectory_length": int(sample["trajectory_length"]),
+        "rendered_markers": [str(v) for v in rendered_markers],
+        "deformation_stats": sample["deformation_stats"],
+    }
+    if "frame_target_max_down_mm" in sample:
+        meta["frame_target_max_down_mm"] = float(sample["frame_target_max_down_mm"])
+    if "frame_actual_max_down_mm" in sample:
+        meta["frame_actual_max_down_mm"] = float(sample["frame_actual_max_down_mm"])
+    return meta
 
 
 def parse_patch_grid(spec: str) -> Tuple[int, int]:
@@ -1108,62 +1163,6 @@ def run_physics_task(task: Dict[str, Any]) -> Dict[str, Any]:
         z_trajectory = _load_z_trajectory(npz_path)
         trajectory_length = int(z_trajectory.shape[0])
         deform_final = deformation_stats_for_frame(z_trajectory, trajectory_length - 1)
-
-        return {
-            "status": "ok",
-            "episode_id": episode_id,
-            "scale_mm": scale_mm,
-            "indenter": indenter,
-            "x_mm": x_mm,
-            "y_mm": y_mm,
-            "depth_mm": depth_mm,
-            "temp_scale_dir": str(temp_scale_dir),
-            "npz_path": str(npz_path),
-            "trajectory_length": trajectory_length,
-            "deformation_stats_final": deform_final,
-            "physics_reused": physics_reused,
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "episode_id": episode_id,
-            "scale_mm": scale_mm,
-            "indenter": indenter,
-            "x_mm": x_mm,
-            "y_mm": y_mm,
-            "depth_mm": depth_mm,
-            "temp_scale_dir": str(temp_scale_dir),
-            "error": str(exc),
-            "traceback": traceback.format_exc(),
-        }
-
-
-def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
-    episode_id = int(task["episode_id"])
-    scale_mm = int(task["scale_mm"])
-    repo_root = Path(task["repo_root"])
-    scale_dir = Path(task["scale_dir"])
-    scale_dir.mkdir(parents=True, exist_ok=True)
-
-    npz_path = Path(task["npz_path"])
-    temp_scale_dir = Path(task["temp_scale_dir"])
-    keep_intermediates = bool(task["keep_intermediates"])
-    resume_mode = bool(task.get("resume", False))
-    expected_marker_files = [str(v) for v in task.get("expected_marker_files", [])]
-    if not expected_marker_files:
-        raise ValueError("run_render_task requires non-empty expected_marker_files")
-    render_success = False
-
-    try:
-        patch_h = int(task["patch_h"])
-        patch_w = int(task["patch_w"])
-        coord_map = make_adapter_coord_map(float(scale_mm), patch_h, patch_w)
-        coord_map_path = scale_dir / "adapter_coord_map.npy"
-        np.save(coord_map_path, coord_map)
-        coord_map_shape = [int(coord_map.shape[0]), int(coord_map.shape[1]), int(coord_map.shape[2])]
-
-        z_trajectory = _load_z_trajectory(npz_path)
-        trajectory_length = int(z_trajectory.shape[0])
         frame_sampling_mode = str(task.get("frame_sampling_mode", "fraction"))
         if frame_sampling_mode == "depth_random":
             frame_depth_targets_mm = [float(v) for v in task.get("frame_depth_targets_mm", [])]
@@ -1181,143 +1180,214 @@ def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 deduplicate=bool(task.get("deduplicate_frame_indices", True)),
             )
 
-        side_border_px = int(task.get("force_black_side_border_px", 0))
-        frames: Dict[str, Dict[str, Any]] = {}
-        reused_frames = 0
-        rendered_frames = 0
-
+        sampled_frames: List[Dict[str, Any]] = []
         for sample_ord, sample in enumerate(samples):
             frame_index = int(sample["frame_index"])
-            frame_fraction = float(sample.get("frame_fraction", 0.0))
-            frame_fraction_requested = float(sample.get("frame_fraction_requested", frame_fraction))
-            frame_name = f"frame_{sample_ord:03d}"
-            frame_dir = scale_dir / frame_name
-            frame_dir.mkdir(parents=True, exist_ok=True)
-
-            frame_complete = frame_outputs_complete(frame_dir, expected_marker_files)
-            if resume_mode and frame_complete:
-                rendered = sorted(expected_marker_files)
-                reused_frames += 1
-            else:
-                stl_path = temp_scale_dir / f"frame_{frame_index:04d}.stl"
-                mesh_cmd = [
-                    str(task["python_cmd"]),
-                    str(task["open3d_script"]),
-                    "--input-npz",
-                    str(npz_path),
-                    "--output-stl",
-                    str(stl_path),
-                    "--frame-index",
-                    str(frame_index),
-                ]
-                run_cmd_checked(
-                    mesh_cmd,
-                    cwd=repo_root,
-                    timeout_sec=int(task["render_timeout_sec"]),
-                    stage=f"npz_to_stl[{frame_name}]",
-                )
-
-                render_cmd = [
-                    str(task["blender_cmd"]),
-                    "-b",
-                    "--python",
-                    str(task["blender_script"]),
-                    "--",
-                    "--stl",
-                    str(stl_path),
-                    "--textures-dir",
-                    str(task["textures_dir"]),
-                    "--output-dir",
-                    str(frame_dir),
-                    "--scale-mm",
-                    str(scale_mm),
-                    "--camera-mode",
-                    str(task["camera_mode"]),
-                    "--base-fov-deg",
-                    str(task["base_fov_deg"]),
-                    "--fixed-distance-m",
-                    str(task["fixed_distance_m"]),
-                    "--distance-safety",
-                    str(task["distance_safety"]),
-                    "--uv-mode",
-                    str(task["uv_mode"]),
-                    "--uv-inset-ratio",
-                    str(task["uv_inset_ratio"]),
-                ]
-                run_cmd_checked(
-                    render_cmd,
-                    cwd=repo_root,
-                    timeout_sec=int(task["render_timeout_sec"]),
-                    stage=f"blender_render[{frame_name}]",
-                )
-
-                rendered = sorted(p.name for p in frame_dir.glob("marker_*.jpg"))
-                if not rendered:
-                    raise RuntimeError(f"No marker renders produced in {frame_dir}")
-
-                if side_border_px > 0:
-                    for name in rendered:
-                        img_path = frame_dir / name
-                        with Image.open(img_path) as im:
-                            rgb = np.array(im.convert("RGB"), dtype=np.uint8)
-                        px = min(side_border_px, max(1, rgb.shape[1] // 2))
-                        rgb[:, :px, :] = 0
-                        rgb[:, -px:, :] = 0
-                        Image.fromarray(rgb, mode="RGB").save(img_path, format="JPEG", quality=100)
-
-                rendered = sorted(p.name for p in frame_dir.glob("marker_*.jpg"))
-                missing_after_render = [name for name in expected_marker_files if not (frame_dir / name).exists()]
-                if missing_after_render:
-                    raise RuntimeError(
-                        f"Missing marker renders after render for {frame_name}: {missing_after_render[:3]}"
-                    )
-                rendered_frames += 1
-
-            frame_meta = {
-                "frame_name": frame_name,
+            frame_meta: Dict[str, Any] = {
+                "frame_name": f"frame_{sample_ord:03d}",
                 "frame_index": frame_index,
-                "frame_fraction": frame_fraction,
-                "frame_fraction_requested": frame_fraction_requested,
+                "frame_fraction": float(sample.get("frame_fraction", 0.0)),
+                "frame_fraction_requested": float(
+                    sample.get("frame_fraction_requested", sample.get("frame_fraction", 0.0))
+                ),
                 "trajectory_length": trajectory_length,
-                "rendered_markers": rendered,
                 "deformation_stats": deformation_stats_for_frame(z_trajectory, frame_index),
             }
             if "frame_target_max_down_mm" in sample:
                 frame_meta["frame_target_max_down_mm"] = float(sample["frame_target_max_down_mm"])
             if "frame_actual_max_down_mm" in sample:
                 frame_meta["frame_actual_max_down_mm"] = float(sample["frame_actual_max_down_mm"])
-            frames[frame_name] = frame_meta
+            sampled_frames.append(frame_meta)
 
-        render_success = True
         return {
             "status": "ok",
             "episode_id": episode_id,
             "scale_mm": scale_mm,
-            "scale_dir": str(scale_dir),
-            "adapter_coord_map_path": str(coord_map_path),
-            "adapter_coord_map_shape": coord_map_shape,
+            "indenter": indenter,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "depth_mm": depth_mm,
+            "temp_scale_dir": str(temp_scale_dir),
+            "npz_path": str(npz_path),
             "trajectory_length": trajectory_length,
-            "sampled_frame_indices": [int(s["frame_index"]) for s in samples],
+            "deformation_stats_final": deform_final,
+            "physics_reused": physics_reused,
             "frame_sampling_mode": frame_sampling_mode,
             "frame_depth_targets_mm": frame_depth_targets_mm,
-            "frames": frames,
-            "frames_reused": int(reused_frames),
-            "frames_rendered": int(rendered_frames),
-            "temp_scale_dir": str(temp_scale_dir),
+            "sampled_frames": sampled_frames,
         }
     except Exception as exc:
         return {
             "status": "error",
             "episode_id": episode_id,
             "scale_mm": scale_mm,
-            "scale_dir": str(scale_dir),
+            "indenter": indenter,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "depth_mm": depth_mm,
             "temp_scale_dir": str(temp_scale_dir),
             "error": str(exc),
             "traceback": traceback.format_exc(),
         }
+
+
+def run_meshing_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    episode_id = int(task["episode_id"])
+    scale_mm = int(task["scale_mm"])
+    frame_name = str(task["frame_name"])
+    frame_index = int(task["frame_index"])
+    repo_root = Path(task["repo_root"])
+    stl_path = Path(task["stl_path"])
+    stl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        mesh_cmd = [
+            str(task["python_cmd"]),
+            str(task["open3d_script"]),
+            "--input-npz",
+            str(task["npz_path"]),
+            "--output-stl",
+            str(stl_path),
+            "--frame-index",
+            str(frame_index),
+        ]
+        run_cmd_checked(
+            mesh_cmd,
+            cwd=repo_root,
+            timeout_sec=int(task["meshing_timeout_sec"]),
+            stage=f"npz_to_stl[{frame_name}]",
+        )
+        return {
+            "status": "ok",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "frame_name": frame_name,
+            "frame_index": frame_index,
+            "stl_path": str(stl_path),
+            "sample": task["sample"],
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "frame_name": frame_name,
+            "frame_index": frame_index,
+            "stl_path": str(stl_path),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+
+def run_render_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    episode_id = int(task["episode_id"])
+    scale_mm = int(task["scale_mm"])
+    frame_name = str(task["frame_name"])
+    frame_dir = Path(task["frame_dir"])
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_root = Path(task["repo_root"])
+    stl_path = Path(task["stl_path"])
+    keep_intermediates = bool(task["keep_intermediates"])
+    resume_mode = bool(task.get("resume", False))
+    expected_marker_files = [str(v) for v in task.get("expected_marker_files", [])]
+    if not expected_marker_files:
+        raise ValueError("run_render_task requires non-empty expected_marker_files")
+
+    try:
+        frame_complete = frame_outputs_complete(frame_dir, expected_marker_files)
+        if resume_mode and frame_complete:
+            rendered = sorted(expected_marker_files)
+            return {
+                "status": "ok",
+                "episode_id": episode_id,
+                "scale_mm": scale_mm,
+                "frame_name": frame_name,
+                "rendered_markers": rendered,
+                "reused": True,
+            }
+
+        if not stl_path.exists():
+            raise FileNotFoundError(f"Missing STL for render: {stl_path}")
+
+        render_cmd = [
+            str(task["blender_cmd"]),
+            "-b",
+            "--python",
+            str(task["blender_script"]),
+            "--",
+            "--stl",
+            str(stl_path),
+            "--textures-dir",
+            str(task["textures_dir"]),
+            "--output-dir",
+            str(frame_dir),
+            "--scale-mm",
+            str(scale_mm),
+            "--camera-mode",
+            str(task["camera_mode"]),
+            "--base-fov-deg",
+            str(task["base_fov_deg"]),
+            "--fixed-distance-m",
+            str(task["fixed_distance_m"]),
+            "--distance-safety",
+            str(task["distance_safety"]),
+            "--uv-mode",
+            str(task["uv_mode"]),
+            "--uv-inset-ratio",
+            str(task["uv_inset_ratio"]),
+            "--render-samples",
+            str(task["render_samples"]),
+        ]
+        run_cmd_checked(
+            render_cmd,
+            cwd=repo_root,
+            timeout_sec=int(task["render_timeout_sec"]),
+            stage=f"blender_render[{frame_name}]",
+        )
+
+        rendered = sorted(p.name for p in frame_dir.glob("marker_*.jpg"))
+        if not rendered:
+            raise RuntimeError(f"No marker renders produced in {frame_dir}")
+
+        side_border_px = int(task.get("force_black_side_border_px", 0))
+        if side_border_px > 0:
+            for name in rendered:
+                img_path = frame_dir / name
+                with Image.open(img_path) as im:
+                    rgb = np.array(im.convert("RGB"), dtype=np.uint8)
+                px = min(side_border_px, max(1, rgb.shape[1] // 2))
+                rgb[:, :px, :] = 0
+                rgb[:, -px:, :] = 0
+                Image.fromarray(rgb, mode="RGB").save(img_path, format="JPEG", quality=100)
+
+        rendered = sorted(p.name for p in frame_dir.glob("marker_*.jpg"))
+        missing_after_render = [name for name in expected_marker_files if not (frame_dir / name).exists()]
+        if missing_after_render:
+            raise RuntimeError(
+                f"Missing marker renders after render for {frame_name}: {missing_after_render[:3]}"
+            )
+
+        return {
+            "status": "ok",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "frame_name": frame_name,
+            "rendered_markers": rendered,
+            "reused": False,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "episode_id": episode_id,
+            "scale_mm": scale_mm,
+            "frame_name": frame_name,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
     finally:
-        if render_success and (not keep_intermediates) and (not resume_mode):
-            shutil.rmtree(temp_scale_dir, ignore_errors=True)
+        if (not keep_intermediates) and stl_path.exists():
+            stl_path.unlink(missing_ok=True)
 
 
 def discover_indenter_names(indenter_dir: Path, subset: Sequence[str] | None) -> List[str]:
@@ -1485,9 +1555,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--max-physics-workers", type=int, default=7)
+    p.add_argument("--max-meshing-workers", type=int, default=3)
     p.add_argument("--max-render-workers", type=int, default=max(1, (os.cpu_count() or 8) - 1))
     p.add_argument("--physics-timeout-sec", type=int, default=240)
+    p.add_argument("--meshing-timeout-sec", type=int, default=240)
     p.add_argument("--render-timeout-sec", type=int, default=300)
+    p.add_argument("--render-samples", type=int, default=32)
 
     p.add_argument("--python-cmd", type=str, default=sys.executable)
     p.add_argument("--blender-cmd", type=str, default="blender")
@@ -1514,6 +1587,8 @@ def main() -> None:
         raise ValueError("--episodes-per-indenter must be > 0")
     if args.max_physics_workers <= 0:
         raise ValueError("--max-physics-workers must be > 0")
+    if args.max_meshing_workers <= 0:
+        raise ValueError("--max-meshing-workers must be > 0")
     if args.max_render_workers <= 0:
         raise ValueError("--max-render-workers must be > 0")
     if args.depth_min <= 0 or args.depth_max <= 0 or args.depth_min > args.depth_max:
@@ -1528,6 +1603,10 @@ def main() -> None:
         raise ValueError("--uv-inset-ratio must be in [0.0, 0.49)")
     if args.force_black_side_border_px < 0:
         raise ValueError("--force-black-side-border-px must be >= 0")
+    if args.meshing_timeout_sec <= 0:
+        raise ValueError("--meshing-timeout-sec must be > 0")
+    if args.render_samples <= 0:
+        raise ValueError("--render-samples must be > 0")
     if args.resume and args.clean_output:
         raise ValueError("--resume and --clean-output cannot be used together")
     if args.frame_sampling_mode == "depth_random":
@@ -1662,6 +1741,12 @@ def main() -> None:
                         episode_states[episode_id].scales[scale_key] = scale_meta
                         resume_scales_from_metadata += 1
                         skipped_scales += 1
+                        if not args.keep_intermediates:
+                            completed_scale_tmp_dir = (
+                                work_tmp_root / f"episode_{episode_id:06d}" / f"scale_{int(scale_mm)}mm"
+                            )
+                            if completed_scale_tmp_dir.exists():
+                                shutil.rmtree(completed_scale_tmp_dir, ignore_errors=True)
                         continue
 
                 physics_tasks.append(
@@ -1682,6 +1767,17 @@ def main() -> None:
                         "physics_timeout_sec": int(args.physics_timeout_sec),
                         "resume": bool(args.resume),
                         "frame_sampling_mode": str(args.frame_sampling_mode),
+                        "frame_fractions": (
+                            None
+                            if (args.frame_sampling_mode != "fraction" or args.frame_indices is not None)
+                            else [float(v) for v in args.frame_fractions]
+                        ),
+                        "frame_indices": (
+                            None
+                            if (args.frame_sampling_mode != "fraction" or args.frame_indices is None)
+                            else [int(v) for v in args.frame_indices]
+                        ),
+                        "deduplicate_frame_indices": bool(args.deduplicate_frame_indices),
                         "frame_depth_targets_mm": (
                             [float(v) for v in episode_frame_depth_targets_mm]
                             if episode_frame_depth_targets_mm is not None
@@ -1735,7 +1831,13 @@ def main() -> None:
     if args.resume:
         logging.info("Scales restored directly from existing metadata: %d", resume_scales_from_metadata)
     logging.info("Marker textures: %d (%s)", len(textures), texture_dir)
-    logging.info("Workers: physics=%d (GPU), render=%d (CPU)", args.max_physics_workers, args.max_render_workers)
+    logging.info(
+        "Workers: physics=%d (GPU), meshing=%d (CPU), render=%d (CPU)",
+        args.max_physics_workers,
+        args.max_meshing_workers,
+        args.max_render_workers,
+    )
+    logging.info("Render samples (Cycles CPU): %d", args.render_samples)
     logging.info(
         "Camera: mode=%s fixed_distance=%.6fm base_fov=%.3fdeg ref_scale=%.2fmm uv_mode=%s uv_inset=%.3f border_black_px=%d",
         args.camera_mode,
@@ -1749,198 +1851,429 @@ def main() -> None:
     logging.info("=" * 72)
 
     physics_ok = 0
+    meshing_ok = 0
     render_ok = 0
+    total_meshing_tasks_planned = 0
+    total_render_tasks_planned = 0
+    total_frames_rendered = 0
+    total_frames_reused = 0
     allow_intermediate_cleanup = False
     run_start_ts = time.time()
     physics_stage_start_ts = run_start_ts
+    meshing_stage_start_ts: float | None = None
+    render_stage_start_ts: float | None = None
+
+    scale_states: Dict[Tuple[int, int], ScaleState] = {}
+
+    def maybe_finalize_scale(scale_state: ScaleState) -> None:
+        if scale_state.sealed or scale_state.failed:
+            return
+        if scale_state.pending_mesh_count != 0 or scale_state.pending_render_count != 0:
+            return
+        if len(scale_state.frames) != len(scale_state.sampled_frames):
+            return
+
+        ep_state = episode_states[scale_state.episode_id]
+        ordered_frames: Dict[str, Dict[str, Any]] = {}
+        for sample in scale_state.sampled_frames:
+            frame_name = str(sample["frame_name"])
+            if frame_name not in scale_state.frames:
+                return
+            ordered_frames[frame_name] = scale_state.frames[frame_name]
+
+        ep_state.scales[scale_state.scale_key] = {
+            "scale_mm": int(scale_state.scale_mm),
+            "contact_x_mm": float(scale_state.contact_x_mm),
+            "contact_y_mm": float(scale_state.contact_y_mm),
+            "contact_depth_mm": float(scale_state.contact_depth_mm),
+            "deformation_stats_final": scale_state.deformation_stats_final,
+            "trajectory_length": int(scale_state.trajectory_length),
+            "frame_sampling_mode": str(scale_state.frame_sampling_mode),
+            "frame_depth_targets_mm": scale_state.frame_depth_targets_mm,
+            "camera_mode": str(scale_state.camera_mode),
+            "camera_distance_m": float(scale_state.camera_distance_m),
+            "camera_fov_deg": float(scale_state.camera_fov_deg),
+            "adapter_coord_map": str(scale_state.adapter_coord_map_path.relative_to(ep_state.episode_dir)),
+            "adapter_coord_map_shape": [int(v) for v in scale_state.adapter_coord_map_shape],
+            "frames": ordered_frames,
+        }
+        scale_state.sealed = True
+
+        logging.info(
+            "Scale COMPLETE | ep=%06d scale=%d | frames=%d (rendered=%d reused=%d)",
+            scale_state.episode_id,
+            scale_state.scale_mm,
+            len(ordered_frames),
+            scale_state.frames_rendered,
+            scale_state.frames_reused,
+        )
+        if (not args.keep_intermediates) and scale_state.temp_scale_dir.exists():
+            shutil.rmtree(scale_state.temp_scale_dir, ignore_errors=True)
+            logging.info(
+                "Intermediates cleaned | ep=%06d scale=%d | dir=%s",
+                scale_state.episode_id,
+                scale_state.scale_mm,
+                scale_state.temp_scale_dir,
+            )
 
     try:
-        with cf.ProcessPoolExecutor(max_workers=args.max_physics_workers) as physics_pool, cf.ProcessPoolExecutor(
-            max_workers=args.max_render_workers
-        ) as render_pool:
+        with (
+            cf.ProcessPoolExecutor(max_workers=args.max_physics_workers) as physics_pool,
+            cf.ProcessPoolExecutor(max_workers=args.max_meshing_workers) as meshing_pool,
+            cf.ProcessPoolExecutor(max_workers=args.max_render_workers) as render_pool,
+        ):
             physics_futures: Dict[cf.Future, Dict[str, Any]] = {}
+            meshing_futures: Dict[cf.Future, Dict[str, Any]] = {}
+            render_futures: Dict[cf.Future, Dict[str, Any]] = {}
+
             for task in physics_tasks:
                 f = physics_pool.submit(run_physics_task, task)
                 physics_futures[f] = task
 
-            render_futures: Dict[cf.Future, Dict[str, Any]] = {}
             physics_done = 0
-
-            for f in cf.as_completed(physics_futures):
-                physics_done += 1
-                task = physics_futures[f]
-                episode_id = int(task["episode_id"])
-                scale_mm = int(task["scale_mm"])
-                ep_state = episode_states[episode_id]
-                physics_eta = _progress_eta_text(physics_stage_start_ts, physics_done, len(physics_futures))
-
-                try:
-                    result = f.result()
-                except Exception as exc:
-                    msg = f"physics future crashed: ep={episode_id} scale={scale_mm} err={exc}"
-                    ep_state.errors.append(msg)
-                    logging.error("%s | %s", msg, physics_eta)
-                    continue
-
-                if result.get("status") != "ok":
-                    msg = (
-                        f"physics failed: ep={episode_id} scale={scale_mm} err={result.get('error')}\n"
-                        f"{result.get('traceback', '')}"
-                    )
-                    ep_state.errors.append(msg)
-                    err_short = str(result.get("error", "")).strip().splitlines()[0] if result.get("error") else "(no error text)"
-                    logging.error("Physics failed | ep=%06d scale=%d | %s | %s", episode_id, scale_mm, err_short, physics_eta)
-                    continue
-
-                physics_ok += 1
-                if result.get("physics_reused"):
-                    logging.info(
-                        "Physics REUSE | ep=%06d scale=%d | max_down=%.4fmm mean_down=%.4fmm | %s",
-                        episode_id,
-                        scale_mm,
-                        result["deformation_stats_final"]["surface_max_down_mm"],
-                        result["deformation_stats_final"]["surface_mean_down_mm"],
-                        physics_eta,
-                    )
-                else:
-                    logging.info(
-                        "Physics OK | ep=%06d scale=%d | max_down=%.4fmm mean_down=%.4fmm | %s",
-                        episode_id,
-                        scale_mm,
-                        result["deformation_stats_final"]["surface_max_down_mm"],
-                        result["deformation_stats_final"]["surface_mean_down_mm"],
-                        physics_eta,
-                    )
-
-                scale_dir = ep_state.episode_dir / f"scale_{scale_mm}mm"
-                scale_dir.mkdir(parents=True, exist_ok=True)
-
-                render_task = {
-                    "episode_id": episode_id,
-                    "scale_mm": scale_mm,
-                    "repo_root": str(repo_root),
-                    "python_cmd": str(args.python_cmd),
-                    "open3d_script": str(open3d_script),
-                    "blender_cmd": str(args.blender_cmd),
-                    "blender_script": str(blender_script),
-                    "textures_dir": str(texture_dir),
-                    "scale_dir": str(scale_dir),
-                    "npz_path": result["npz_path"],
-                    "temp_scale_dir": result["temp_scale_dir"],
-                    "camera_mode": str(args.camera_mode),
-                    "base_fov_deg": float(args.fov_deg),
-                    "fixed_distance_m": float(fixed_camera_distance_m),
-                    "distance_safety": float(args.distance_safety),
-                    "uv_mode": str(args.uv_mode),
-                    "uv_inset_ratio": float(args.uv_inset_ratio),
-                    "force_black_side_border_px": int(args.force_black_side_border_px),
-                    "frame_sampling_mode": str(args.frame_sampling_mode),
-                    "frame_fractions": (
-                        None
-                        if (args.frame_sampling_mode != "fraction" or args.frame_indices is not None)
-                        else [float(v) for v in args.frame_fractions]
-                    ),
-                    "frame_indices": (
-                        None
-                        if (args.frame_sampling_mode != "fraction" or args.frame_indices is None)
-                        else [int(v) for v in args.frame_indices]
-                    ),
-                    "frame_depth_targets_mm": (
-                        [float(v) for v in task.get("frame_depth_targets_mm", [])]
-                        if args.frame_sampling_mode == "depth_random"
-                        else None
-                    ),
-                    "deduplicate_frame_indices": bool(args.deduplicate_frame_indices),
-                    "patch_h": int(patch_h),
-                    "patch_w": int(patch_w),
-                    "render_timeout_sec": int(args.render_timeout_sec),
-                    "keep_intermediates": bool(args.keep_intermediates),
-                    "resume": bool(args.resume),
-                    "expected_marker_files": list(expected_marker_files),
-                }
-
-                rf = render_pool.submit(run_render_task, render_task)
-                render_futures[rf] = {
-                    "physics_result": result,
-                    "render_task": render_task,
-                }
-
-            render_stage_start_ts = time.time()
-            logging.info(
-                "Physics stage done | succeeded=%d/%d | render_tasks=%d",
-                physics_ok,
-                len(physics_futures),
-                len(render_futures),
-            )
+            meshing_done = 0
             render_done = 0
-            for rf in cf.as_completed(render_futures):
-                render_done += 1
-                payload = render_futures[rf]
-                physics_result = payload["physics_result"]
-                episode_id = int(physics_result["episode_id"])
-                scale_mm = int(physics_result["scale_mm"])
-                ep_state = episode_states[episode_id]
-                render_eta = _progress_eta_text(render_stage_start_ts, render_done, len(render_futures))
 
-                try:
-                    rr = rf.result()
-                except Exception as exc:
-                    msg = f"render future crashed: ep={episode_id} scale={scale_mm} err={exc}"
-                    ep_state.errors.append(msg)
-                    logging.error("%s | %s", msg, render_eta)
-                    continue
+            while physics_futures or meshing_futures or render_futures:
+                pending: List[cf.Future] = []
+                pending.extend(list(physics_futures.keys()))
+                pending.extend(list(meshing_futures.keys()))
+                pending.extend(list(render_futures.keys()))
+                done_set, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
 
-                if rr.get("status") != "ok":
-                    msg = (
-                        f"render failed: ep={episode_id} scale={scale_mm} err={rr.get('error')}\n"
-                        f"{rr.get('traceback', '')}"
-                    )
-                    ep_state.errors.append(msg)
-                    logging.error("Render failed | ep=%06d scale=%d | %s", episode_id, scale_mm, render_eta)
-                    continue
+                for done_future in done_set:
+                    if done_future in physics_futures:
+                        task = physics_futures.pop(done_future)
+                        physics_done += 1
+                        episode_id = int(task["episode_id"])
+                        scale_mm = int(task["scale_mm"])
+                        ep_state = episode_states[episode_id]
+                        physics_eta = _progress_eta_text(physics_stage_start_ts, physics_done, max(total_scale_tasks, 1))
+                        physics_thr = _throughput_text(physics_stage_start_ts, physics_done)
 
-                render_ok += 1
-                scale_key = f"scale_{scale_mm}mm"
-                scale_dir = Path(rr["scale_dir"])
-                if args.camera_mode == "fixed_distance_variable_fov":
-                    render_fov_deg = math.degrees(
-                        2.0 * math.atan((float(scale_mm) / 1000.0 / 2.0) / float(fixed_camera_distance_m))
-                    )
-                    render_distance_m = float(fixed_camera_distance_m)
-                else:
-                    render_fov_deg = float(args.fov_deg)
-                    render_distance_m = (
-                        (float(scale_mm) / 1000.0 / 2.0) / math.tan(math.radians(float(args.fov_deg)) / 2.0)
-                    )
-                    render_distance_m *= float(args.distance_safety)
+                        try:
+                            result = done_future.result()
+                        except Exception as exc:
+                            msg = f"physics future crashed: ep={episode_id} scale={scale_mm} err={exc}"
+                            ep_state.errors.append(msg)
+                            logging.error("%s | %s | %s", msg, physics_eta, physics_thr)
+                            continue
 
-                ep_state.scales[scale_key] = {
-                    "scale_mm": scale_mm,
-                    "contact_x_mm": float(physics_result["x_mm"]),
-                    "contact_y_mm": float(physics_result["y_mm"]),
-                    "contact_depth_mm": float(physics_result["depth_mm"]),
-                    "deformation_stats_final": physics_result["deformation_stats_final"],
-                    "trajectory_length": int(rr["trajectory_length"]),
-                    "frame_sampling_mode": str(rr.get("frame_sampling_mode", args.frame_sampling_mode)),
-                    "frame_depth_targets_mm": rr.get("frame_depth_targets_mm"),
-                    "camera_mode": str(args.camera_mode),
-                    "camera_distance_m": float(render_distance_m),
-                    "camera_fov_deg": float(render_fov_deg),
-                    "adapter_coord_map": str(Path(rr["adapter_coord_map_path"]).relative_to(ep_state.episode_dir)),
-                    "adapter_coord_map_shape": rr["adapter_coord_map_shape"],
-                    "frames": rr["frames"],
-                }
+                        if result.get("status") != "ok":
+                            msg = (
+                                f"physics failed: ep={episode_id} scale={scale_mm} err={result.get('error')}\n"
+                                f"{result.get('traceback', '')}"
+                            )
+                            ep_state.errors.append(msg)
+                            err_short = (
+                                str(result.get("error", "")).strip().splitlines()[0]
+                                if result.get("error")
+                                else "(no error text)"
+                            )
+                            logging.error(
+                                "Physics failed | ep=%06d scale=%d | %s | %s | %s",
+                                episode_id,
+                                scale_mm,
+                                err_short,
+                                physics_eta,
+                                physics_thr,
+                            )
+                            continue
 
-                logging.info(
-                    "Render OK | ep=%06d scale=%d | frames=%d (rendered=%d reused=%d) indices=%s | %s",
-                    episode_id,
-                    scale_mm,
-                    len(rr["frames"]),
-                    int(rr.get("frames_rendered", 0)),
-                    int(rr.get("frames_reused", 0)),
-                    rr["sampled_frame_indices"],
-                    render_eta,
-                )
+                        physics_ok += 1
+                        if result.get("physics_reused"):
+                            logging.info(
+                                "Physics REUSE | ep=%06d scale=%d | max_down=%.4fmm mean_down=%.4fmm | %s | %s",
+                                episode_id,
+                                scale_mm,
+                                result["deformation_stats_final"]["surface_max_down_mm"],
+                                result["deformation_stats_final"]["surface_mean_down_mm"],
+                                physics_eta,
+                                physics_thr,
+                            )
+                        else:
+                            logging.info(
+                                "Physics OK | ep=%06d scale=%d | max_down=%.4fmm mean_down=%.4fmm | %s | %s",
+                                episode_id,
+                                scale_mm,
+                                result["deformation_stats_final"]["surface_max_down_mm"],
+                                result["deformation_stats_final"]["surface_mean_down_mm"],
+                                physics_eta,
+                                physics_thr,
+                            )
+
+                        scale_dir = ep_state.episode_dir / f"scale_{scale_mm}mm"
+                        scale_dir.mkdir(parents=True, exist_ok=True)
+
+                        coord_map = make_adapter_coord_map(float(scale_mm), int(patch_h), int(patch_w))
+                        adapter_coord_map_path = scale_dir / "adapter_coord_map.npy"
+                        np.save(adapter_coord_map_path, coord_map)
+                        adapter_coord_map_shape = [int(v) for v in coord_map.shape]
+
+                        if args.camera_mode == "fixed_distance_variable_fov":
+                            camera_fov_deg = math.degrees(
+                                2.0 * math.atan((float(scale_mm) / 1000.0 / 2.0) / float(fixed_camera_distance_m))
+                            )
+                            camera_distance_m = float(fixed_camera_distance_m)
+                        else:
+                            camera_fov_deg = float(args.fov_deg)
+                            camera_distance_m = (
+                                (float(scale_mm) / 1000.0 / 2.0) / math.tan(math.radians(float(args.fov_deg)) / 2.0)
+                            )
+                            camera_distance_m *= float(args.distance_safety)
+
+                        scale_id = (episode_id, scale_mm)
+                        scale_state = ScaleState(
+                            episode_id=episode_id,
+                            scale_mm=scale_mm,
+                            scale_key=f"scale_{scale_mm}mm",
+                            scale_dir=scale_dir,
+                            temp_scale_dir=Path(result["temp_scale_dir"]),
+                            contact_x_mm=float(result["x_mm"]),
+                            contact_y_mm=float(result["y_mm"]),
+                            contact_depth_mm=float(result["depth_mm"]),
+                            trajectory_length=int(result["trajectory_length"]),
+                            deformation_stats_final=result["deformation_stats_final"],
+                            frame_sampling_mode=str(result.get("frame_sampling_mode", args.frame_sampling_mode)),
+                            frame_depth_targets_mm=result.get("frame_depth_targets_mm"),
+                            sampled_frames=[dict(v) for v in result["sampled_frames"]],
+                            camera_mode=str(args.camera_mode),
+                            camera_distance_m=float(camera_distance_m),
+                            camera_fov_deg=float(camera_fov_deg),
+                            adapter_coord_map_path=adapter_coord_map_path,
+                            adapter_coord_map_shape=adapter_coord_map_shape,
+                        )
+                        scale_states[scale_id] = scale_state
+
+                        for sample in scale_state.sampled_frames:
+                            frame_name = str(sample["frame_name"])
+                            frame_dir = scale_dir / frame_name
+
+                            if args.resume and frame_outputs_complete(frame_dir, expected_marker_files):
+                                scale_state.frames[frame_name] = make_frame_metadata(sample, expected_marker_files)
+                                scale_state.frames_reused += 1
+                                logging.info(
+                                    "Render REUSE | ep=%06d scale=%d frame=%s | markers=%d",
+                                    episode_id,
+                                    scale_mm,
+                                    frame_name,
+                                    len(expected_marker_files),
+                                )
+                                continue
+
+                            stl_path = scale_state.temp_scale_dir / "stl_frames" / f"{frame_name}.stl"
+                            mesh_task = {
+                                "episode_id": episode_id,
+                                "scale_mm": scale_mm,
+                                "frame_name": frame_name,
+                                "frame_index": int(sample["frame_index"]),
+                                "sample": sample,
+                                "repo_root": str(repo_root),
+                                "python_cmd": str(args.python_cmd),
+                                "open3d_script": str(open3d_script),
+                                "npz_path": str(result["npz_path"]),
+                                "stl_path": str(stl_path),
+                                "meshing_timeout_sec": int(args.meshing_timeout_sec),
+                            }
+                            mf = meshing_pool.submit(run_meshing_task, mesh_task)
+                            meshing_futures[mf] = {
+                                "scale_id": scale_id,
+                            }
+                            scale_state.pending_mesh_count += 1
+                            total_meshing_tasks_planned += 1
+                            if meshing_stage_start_ts is None:
+                                meshing_stage_start_ts = time.time()
+
+                        maybe_finalize_scale(scale_state)
+
+                    elif done_future in meshing_futures:
+                        payload = meshing_futures.pop(done_future)
+                        meshing_done += 1
+                        meshing_stage_start = meshing_stage_start_ts if meshing_stage_start_ts is not None else run_start_ts
+                        meshing_eta = _progress_eta_text(
+                            meshing_stage_start,
+                            meshing_done,
+                            max(total_meshing_tasks_planned, meshing_done, 1),
+                        )
+                        meshing_thr = _throughput_text(meshing_stage_start, meshing_done)
+
+                        scale_id = payload["scale_id"]
+                        scale_state = scale_states.get(scale_id)
+                        if scale_state is None:
+                            continue
+                        ep_state = episode_states[scale_state.episode_id]
+                        scale_state.pending_mesh_count = max(0, scale_state.pending_mesh_count - 1)
+
+                        try:
+                            rr = done_future.result()
+                        except Exception as exc:
+                            msg = (
+                                f"meshing future crashed: ep={scale_state.episode_id} "
+                                f"scale={scale_state.scale_mm} err={exc}"
+                            )
+                            ep_state.errors.append(msg)
+                            scale_state.failed = True
+                            logging.error("%s | %s | %s", msg, meshing_eta, meshing_thr)
+                            maybe_finalize_scale(scale_state)
+                            continue
+
+                        if rr.get("status") != "ok":
+                            msg = (
+                                f"meshing failed: ep={scale_state.episode_id} scale={scale_state.scale_mm} "
+                                f"frame={rr.get('frame_name')} err={rr.get('error')}\n{rr.get('traceback', '')}"
+                            )
+                            ep_state.errors.append(msg)
+                            scale_state.failed = True
+                            logging.error(
+                                "Meshing failed | ep=%06d scale=%d frame=%s | %s | %s",
+                                scale_state.episode_id,
+                                scale_state.scale_mm,
+                                rr.get("frame_name"),
+                                meshing_eta,
+                                meshing_thr,
+                            )
+                            maybe_finalize_scale(scale_state)
+                            continue
+
+                        meshing_ok += 1
+                        frame_name = str(rr["frame_name"])
+                        frame_dir = scale_state.scale_dir / frame_name
+
+                        render_task = {
+                            "episode_id": int(scale_state.episode_id),
+                            "scale_mm": int(scale_state.scale_mm),
+                            "frame_name": frame_name,
+                            "frame_dir": str(frame_dir),
+                            "repo_root": str(repo_root),
+                            "stl_path": str(rr["stl_path"]),
+                            "keep_intermediates": bool(args.keep_intermediates),
+                            "resume": bool(args.resume),
+                            "expected_marker_files": list(expected_marker_files),
+                            "blender_cmd": str(args.blender_cmd),
+                            "blender_script": str(blender_script),
+                            "textures_dir": str(texture_dir),
+                            "camera_mode": str(args.camera_mode),
+                            "base_fov_deg": float(args.fov_deg),
+                            "fixed_distance_m": float(fixed_camera_distance_m),
+                            "distance_safety": float(args.distance_safety),
+                            "uv_mode": str(args.uv_mode),
+                            "uv_inset_ratio": float(args.uv_inset_ratio),
+                            "force_black_side_border_px": int(args.force_black_side_border_px),
+                            "render_samples": int(args.render_samples),
+                            "render_timeout_sec": int(args.render_timeout_sec),
+                        }
+
+                        rf = render_pool.submit(run_render_task, render_task)
+                        render_futures[rf] = {
+                            "scale_id": scale_id,
+                            "sample": rr["sample"],
+                        }
+                        total_render_tasks_planned += 1
+                        scale_state.pending_render_count += 1
+                        if render_stage_start_ts is None:
+                            render_stage_start_ts = time.time()
+
+                        logging.info(
+                            "Meshing OK | ep=%06d scale=%d frame=%s idx=%d | %s | %s",
+                            scale_state.episode_id,
+                            scale_state.scale_mm,
+                            frame_name,
+                            int(rr["frame_index"]),
+                            meshing_eta,
+                            meshing_thr,
+                        )
+
+                        maybe_finalize_scale(scale_state)
+
+                    elif done_future in render_futures:
+                        payload = render_futures.pop(done_future)
+                        render_done += 1
+                        render_stage_start = render_stage_start_ts if render_stage_start_ts is not None else run_start_ts
+                        render_eta = _progress_eta_text(
+                            render_stage_start,
+                            render_done,
+                            max(total_render_tasks_planned, render_done, 1),
+                        )
+                        render_thr = _throughput_text(render_stage_start, render_done)
+
+                        scale_id = payload["scale_id"]
+                        scale_state = scale_states.get(scale_id)
+                        if scale_state is None:
+                            continue
+                        ep_state = episode_states[scale_state.episode_id]
+                        scale_state.pending_render_count = max(0, scale_state.pending_render_count - 1)
+
+                        try:
+                            rr = done_future.result()
+                        except Exception as exc:
+                            msg = (
+                                f"render future crashed: ep={scale_state.episode_id} "
+                                f"scale={scale_state.scale_mm} err={exc}"
+                            )
+                            ep_state.errors.append(msg)
+                            scale_state.failed = True
+                            logging.error("%s | %s | %s", msg, render_eta, render_thr)
+                            maybe_finalize_scale(scale_state)
+                            continue
+
+                        if rr.get("status") != "ok":
+                            msg = (
+                                f"render failed: ep={scale_state.episode_id} scale={scale_state.scale_mm} "
+                                f"frame={rr.get('frame_name')} err={rr.get('error')}\n{rr.get('traceback', '')}"
+                            )
+                            ep_state.errors.append(msg)
+                            scale_state.failed = True
+                            logging.error(
+                                "Render failed | ep=%06d scale=%d frame=%s | %s | %s",
+                                scale_state.episode_id,
+                                scale_state.scale_mm,
+                                rr.get("frame_name"),
+                                render_eta,
+                                render_thr,
+                            )
+                            maybe_finalize_scale(scale_state)
+                            continue
+
+                        render_ok += 1
+                        frame_name = str(rr["frame_name"])
+                        sample = payload["sample"]
+                        rendered_markers = [str(v) for v in rr.get("rendered_markers", [])]
+                        scale_state.frames[frame_name] = make_frame_metadata(sample, rendered_markers)
+                        if rr.get("reused"):
+                            scale_state.frames_reused += 1
+                        else:
+                            scale_state.frames_rendered += 1
+
+                        logging.info(
+                            "Render OK | ep=%06d scale=%d frame=%s | markers=%d reused=%s | %s | %s",
+                            scale_state.episode_id,
+                            scale_state.scale_mm,
+                            frame_name,
+                            len(rendered_markers),
+                            bool(rr.get("reused", False)),
+                            render_eta,
+                            render_thr,
+                        )
+
+                        maybe_finalize_scale(scale_state)
+
+            total_frames_rendered = int(sum(s.frames_rendered for s in scale_states.values()))
+            total_frames_reused = int(sum(s.frames_reused for s in scale_states.values()))
+            logging.info(
+                "Stage summary | physics=%d/%d meshing=%d/%d render=%d/%d",
+                physics_ok,
+                total_scale_tasks,
+                meshing_ok,
+                total_meshing_tasks_planned,
+                render_ok,
+                total_render_tasks_planned,
+            )
+            logging.info(
+                "Frame summary | rendered=%d reused=%d total=%d",
+                total_frames_rendered,
+                total_frames_reused,
+                total_frames_rendered + total_frames_reused,
+            )
 
         manifest_episodes: List[Dict[str, Any]] = []
         failed_episodes: List[Dict[str, Any]] = []
@@ -2035,8 +2368,14 @@ def main() -> None:
             "texture_count": len(textures),
             "total_episodes_planned": total_episodes,
             "total_scale_tasks_planned": total_scale_tasks,
+            "total_meshing_tasks_planned": int(total_meshing_tasks_planned),
+            "total_render_tasks_planned": int(total_render_tasks_planned),
+            "scales_restored_from_metadata": int(resume_scales_from_metadata),
             "physics_tasks_succeeded": physics_ok,
+            "meshing_tasks_succeeded": meshing_ok,
             "render_tasks_succeeded": render_ok,
+            "frames_rendered": int(total_frames_rendered),
+            "frames_reused": int(total_frames_reused),
             "successful_episodes": len(manifest_episodes),
             "failed_episodes": failed_episodes,
             "episodes": manifest_episodes,
@@ -2061,7 +2400,6 @@ def main() -> None:
         if (
             work_tmp_root.exists()
             and (not args.keep_intermediates)
-            and (not args.resume)
             and allow_intermediate_cleanup
         ):
             shutil.rmtree(work_tmp_root, ignore_errors=True)
