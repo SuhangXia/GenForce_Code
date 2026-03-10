@@ -102,6 +102,8 @@ class MultiscaleTactileDataset(Dataset):
         self._warned_no_common: set[tuple[int, str, str]] = set()
         self._log_samples_done = 0
         self._max_sample_logs = 8
+        self._coord_logs_done = 0
+        self._max_coord_logs = 8
 
         img_size = 224
         if augment:
@@ -156,13 +158,28 @@ class MultiscaleTactileDataset(Dataset):
             raise RuntimeError(f"Episode {ep_id} has < 2 valid scales: {list(scales)}")
         return tuple(self._rng.sample(valid, 2))
 
-    def _choose_marker_pair(self, ep_id: int, key_context: str, key_query: str, meta_context: dict, meta_query: dict) -> tuple[str, str]:
-        markers_context = sorted(meta_context.get("rendered_markers", []))
-        markers_query = sorted(meta_query.get("rendered_markers", []))
+    @staticmethod
+    def _valid_frames(scale_meta: dict) -> dict[str, dict]:
+        frames = scale_meta.get("frames", {})
+        if not isinstance(frames, dict):
+            return {}
+        return {k: v for k, v in frames.items() if isinstance(v, dict)}
+
+    def _pick_markers(
+        self,
+        ep_id: int,
+        key_context: str,
+        key_query: str,
+        markers_context: list[str],
+        markers_query: list[str],
+        frame_context: str | None = None,
+        frame_query: str | None = None,
+    ) -> tuple[str, str]:
         if not markers_context or not markers_query:
             raise RuntimeError(
                 f"Missing rendered_markers for episode {ep_id}: "
-                f"{key_context}={len(markers_context)} {key_query}={len(markers_query)}"
+                f"{key_context}/{frame_context}={len(markers_context)} "
+                f"{key_query}/{frame_query}={len(markers_query)}"
             )
 
         common = sorted(set(markers_context).intersection(markers_query))
@@ -170,18 +187,75 @@ class MultiscaleTactileDataset(Dataset):
             marker_name = self._rng.choice(common)
             return marker_name, marker_name
 
-        warn_key = (ep_id, key_context, key_query)
+        warn_key = (
+            ep_id,
+            key_context,
+            key_query,
+            frame_context if frame_context else "-",
+            frame_query if frame_query else "-",
+        )
         if warn_key not in self._warned_no_common:
             self._warned_no_common.add(warn_key)
             log.warning(
-                "No common marker file for ep=%06d (%s,%s). Using fallback context=%s query=%s",
+                "No common marker file for ep=%06d (%s/%s,%s/%s). Using fallback context=%s query=%s",
                 ep_id,
                 key_context,
+                frame_context if frame_context else "-",
                 key_query,
+                frame_query if frame_query else "-",
                 markers_context[0],
                 markers_query[0],
             )
         return markers_context[0], markers_query[0]
+
+    def _choose_frame_and_marker_pair(
+        self,
+        ep_id: int,
+        key_context: str,
+        key_query: str,
+        meta_context: dict,
+        meta_query: dict,
+    ) -> tuple[str | None, str | None, str, str]:
+        frames_context = self._valid_frames(meta_context)
+        frames_query = self._valid_frames(meta_query)
+
+        # New multiframe format: choose frame pair first, then marker pair.
+        if frames_context and frames_query:
+            names_context = sorted(frames_context.keys())
+            names_query = sorted(frames_query.keys())
+            common_frames = sorted(set(names_context).intersection(names_query))
+            if common_frames:
+                frame_name = self._rng.choice(common_frames)
+                frame_context = frame_name
+                frame_query = frame_name
+            else:
+                frame_context = self._rng.choice(names_context)
+                frame_query = self._rng.choice(names_query)
+
+            markers_context = sorted(frames_context[frame_context].get("rendered_markers", []))
+            markers_query = sorted(frames_query[frame_query].get("rendered_markers", []))
+            marker_context, marker_query = self._pick_markers(
+                ep_id,
+                key_context,
+                key_query,
+                markers_context,
+                markers_query,
+                frame_context=frame_context,
+                frame_query=frame_query,
+            )
+            return frame_context, frame_query, marker_context, marker_query
+
+        # Legacy single-frame format: marker list stored at scale level.
+        markers_context = sorted(meta_context.get("rendered_markers", []))
+        markers_query = sorted(meta_query.get("rendered_markers", []))
+        marker_context, marker_query = self._pick_markers(
+            ep_id,
+            key_context,
+            key_query,
+            markers_context,
+            markers_query,
+        )
+        return None, None, marker_context, marker_query
 
     def _load_coord_map(self, episode_dir: Path, ep_id: int, scale_key: str, scale_meta: dict) -> torch.Tensor:
         rel = scale_meta.get("adapter_coord_map")
@@ -215,8 +289,14 @@ class MultiscaleTactileDataset(Dataset):
                 )
 
             self._coord_cache[abs_path] = coords
-            if self._should_log_from_worker():
-                log.info("Loaded coord map: %s shape=%s flattened=%s", abs_path, tuple(arr.shape), tuple(coords.shape))
+            if self._should_log_from_worker() and self._coord_logs_done < self._max_coord_logs:
+                self._coord_logs_done += 1
+                log.info(
+                    "Loaded coord map: %s shape=%s flattened=%s",
+                    abs_path,
+                    tuple(arr.shape),
+                    tuple(coords.shape),
+                )
 
         return self._coord_cache[abs_path]
 
@@ -231,16 +311,19 @@ class MultiscaleTactileDataset(Dataset):
         scale_meta_context = scales[key_context]
         scale_meta_query = scales[key_query]
 
-        marker_context, marker_query = self._choose_marker_pair(
+        frame_context, frame_query, marker_context, marker_query = self._choose_frame_and_marker_pair(
             ep_id,
             key_context,
             key_query,
             scale_meta_context,
             scale_meta_query,
         )
-
-        img_path_context = episode_dir / key_context / marker_context
-        img_path_query = episode_dir / key_query / marker_query
+        if frame_context is None:
+            img_path_context = episode_dir / key_context / marker_context
+            img_path_query = episode_dir / key_query / marker_query
+        else:
+            img_path_context = episode_dir / key_context / frame_context / marker_context
+            img_path_query = episode_dir / key_query / frame_query / marker_query
         if not img_path_context.exists():
             raise FileNotFoundError(f"Missing context image: {img_path_context}")
         if not img_path_query.exists():
@@ -255,10 +338,12 @@ class MultiscaleTactileDataset(Dataset):
         if self._should_log_from_worker() and self._log_samples_done < self._max_sample_logs:
             self._log_samples_done += 1
             log.info(
-                "Sample ep=%06d pair=(%s -> %s) markers=(%s, %s) coord_shapes=(%s, %s)",
+                "Sample ep=%06d pair=(%s -> %s) frames=(%s, %s) markers=(%s, %s) coord_shapes=(%s, %s)",
                 ep_id,
                 key_context,
                 key_query,
+                frame_context if frame_context else "-",
+                frame_query if frame_query else "-",
                 marker_context,
                 marker_query,
                 tuple(coord_context.shape),
@@ -407,6 +492,8 @@ def train(args):
     log.info("Device: %s", device)
     if args.lambda_mse < 0 or args.lambda_cos < 0:
         raise ValueError("lambda_mse and lambda_cos must be >= 0")
+    if args.test_only and args.sanity_check:
+        raise ValueError("--test-only cannot be used together with --sanity-check")
 
     dataset_root = Path(args.dataset)
     manifest_path = dataset_root / "manifest.json"
@@ -465,16 +552,41 @@ def train(args):
         if len(scales) < 2:
             return
         key_context, key_query = scales[0], scales[1]
-        markers_context = sorted(meta["scales"][key_context].get("rendered_markers", []))
-        markers_query = sorted(meta["scales"][key_query].get("rendered_markers", []))
+        scale_meta_context = meta["scales"][key_context]
+        scale_meta_query = meta["scales"][key_query]
+
+        frames_context = (
+            scale_meta_context.get("frames", {})
+            if isinstance(scale_meta_context.get("frames", {}), dict)
+            else {}
+        )
+        frames_query = (
+            scale_meta_query.get("frames", {})
+            if isinstance(scale_meta_query.get("frames", {}), dict)
+            else {}
+        )
+
+        if frames_context and frames_query:
+            frame_context = sorted(frames_context.keys())[0]
+            frame_query = sorted(frames_query.keys())[0]
+            markers_context = sorted(frames_context[frame_context].get("rendered_markers", []))
+            markers_query = sorted(frames_query[frame_query].get("rendered_markers", []))
+        else:
+            frame_context = "-"
+            frame_query = "-"
+            markers_context = sorted(scale_meta_context.get("rendered_markers", []))
+            markers_query = sorted(scale_meta_query.get("rendered_markers", []))
+
         common = sorted(set(markers_context).intersection(markers_query))
-        chosen = common[0] if common else (markers_context[0] if markers_context else "(none)")
+        chosen = common[0] if common else ((markers_context[0] if markers_context else "(none)"))
         log.info(
-            "Example pair: ep=%06d path=%s pair=(%s -> %s) marker=%s",
+            "Example pair: ep=%06d path=%s pair=(%s -> %s) frame=(%s -> %s) marker=%s",
             eid,
             meta.get("__episode_path", f"episode_{eid:06d}"),
             key_context,
             key_query,
+            frame_context,
+            frame_query,
             chosen,
         )
 
@@ -485,6 +597,90 @@ def train(args):
         scales_mm=scales_mm,
         expected_token_count=backbone_tokens,
     )
+
+    if args.test_only:
+        ckpt_dir = PROJECT_ROOT / "checkpoints" / "usa_adapter"
+        adapter = UniversalScaleAdapter(
+            embed_dim=vit.embed_dim, num_heads=8, num_layers=2
+        ).to(device)
+
+        ckpt_path_raw = args.test_checkpoint or args.resume_from
+        if ckpt_path_raw is None:
+            ckpt_path = ckpt_dir / "best.pt"
+        else:
+            ckpt_path = Path(ckpt_path_raw).expanduser()
+            if not ckpt_path.is_absolute():
+                ckpt_path = (PROJECT_ROOT / ckpt_path).resolve()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found for --test-only: {ckpt_path}")
+
+        log.info("TEST-ONLY mode: loading checkpoint %s", ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location=device)
+        if "model_state_dict" not in ckpt:
+            raise RuntimeError(f"Invalid checkpoint (missing model_state_dict): {ckpt_path}")
+        adapter.load_state_dict(ckpt["model_state_dict"])
+        adapter.eval()
+
+        if not test_ids:
+            log.warning("TEST-ONLY mode: test split is empty. Nothing to evaluate.")
+            return
+
+        test_ds = MultiscaleTactileDataset(
+            episode_ids=test_ids,
+            mode="test",
+            augment=False,
+            pairs_per_epoch=min(500, len(test_ids) * 2),
+            seed=args.seed + 2,
+            **dataset_common_kwargs,
+        )
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+        test_loss = 0.0
+        test_mse_component = 0.0
+        test_cos_component = 0.0
+        test_cos = 0.0
+        test_n = 0
+        with torch.no_grad():
+            for img_context, coord_context, img_query, coord_query in tqdm(test_loader, desc="Test"):
+                img_context, coord_context = img_context.to(device), coord_context.to(device)
+                img_query, coord_query = img_query.to(device), coord_query.to(device)
+                feat_context, feat_query = vit(img_context), vit(img_query)
+                pred_query = adapter(
+                    context_feat=feat_context,
+                    context_coord_map_mm=coord_context,
+                    query_coord_map_mm=coord_query,
+                )
+                pred_context = adapter(
+                    context_feat=feat_query,
+                    context_coord_map_mm=coord_query,
+                    query_coord_map_mm=coord_context,
+                )
+                mse_context_to_query, cos_loss_context_to_query, cos_sim_query = feature_alignment_terms(
+                    pred_query, feat_query
+                )
+                mse_query_to_context, cos_loss_query_to_context, _ = feature_alignment_terms(
+                    pred_context, feat_context
+                )
+                mse_component = mse_context_to_query + mse_query_to_context
+                cos_component = cos_loss_context_to_query + cos_loss_query_to_context
+                loss = args.lambda_mse * mse_component + args.lambda_cos * cos_component
+                cos = cos_sim_query
+                test_loss += loss.item() * img_context.size(0)
+                test_mse_component += mse_component.item() * img_context.size(0)
+                test_cos_component += cos_component.item() * img_context.size(0)
+                test_cos += cos.item() * img_context.size(0)
+                test_n += img_context.size(0)
+        test_loss /= max(test_n, 1)
+        test_mse_component /= max(test_n, 1)
+        test_cos_component /= max(test_n, 1)
+        test_cos /= max(test_n, 1)
+        log.info(
+            "TEST-ONLY (zero-shot indenters): loss=%.6f mse=%.6f cos_loss=%.6f cos_sim=%.4f",
+            test_loss,
+            test_mse_component,
+            test_cos_component,
+            test_cos,
+        )
+        return
 
     # ---- Sanity check: single fixed batch ----
     if args.sanity_check:
@@ -584,10 +780,96 @@ def train(args):
     best_val_loss = float("inf")
     best_val_cos = -1.0
     step = 0
+    start_epoch = 1
     train_start_time = time.time()
     epoch_durations: list[float] = []
 
-    for epoch in range(1, args.epochs + 1):
+    def save_checkpoint(
+        path: Path,
+        *,
+        epoch: int,
+        loss: float,
+        val_loss: float | None = None,
+        val_cos: float | None = None,
+    ) -> None:
+        payload = {
+            "epoch": int(epoch),
+            "global_step": int(step),
+            "model_state_dict": adapter.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "loss": float(loss),
+            "best_val_loss": float(best_val_loss),
+            "best_val_cos": float(best_val_cos),
+        }
+        if val_loss is not None:
+            payload["val_loss"] = float(val_loss)
+        if val_cos is not None:
+            payload["val_cos"] = float(val_cos)
+        torch.save(payload, path)
+
+    if args.resume_from is not None:
+        resume_path = Path(args.resume_from).expanduser()
+        if not resume_path.is_absolute():
+            resume_path = (PROJECT_ROOT / resume_path).resolve()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+
+        ckpt = torch.load(resume_path, map_location=device)
+        if "model_state_dict" not in ckpt:
+            raise RuntimeError(f"Invalid checkpoint (missing model_state_dict): {resume_path}")
+
+        adapter.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        else:
+            log.warning("Checkpoint missing optimizer_state_dict; optimizer state will be reinitialized.")
+
+        step = int(ckpt.get("global_step", ckpt.get("step", 0)))
+        ckpt_epoch = int(ckpt.get("epoch", 0))
+        start_epoch = ckpt_epoch + 1
+
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        elif step > 0:
+            # Backward compatibility for older checkpoints without scheduler state.
+            sched_state = scheduler.state_dict()
+            sched_state["last_epoch"] = step - 1
+            scheduler.load_state_dict(sched_state)
+            log.warning(
+                "Checkpoint missing scheduler_state_dict; approximated scheduler resume from global_step=%d.",
+                step,
+            )
+
+        if "best_val_loss" in ckpt:
+            best_val_loss = float(ckpt["best_val_loss"])
+        elif "val_loss" in ckpt:
+            best_val_loss = float(ckpt["val_loss"])
+        if "best_val_cos" in ckpt:
+            best_val_cos = float(ckpt["best_val_cos"])
+        elif "val_cos" in ckpt:
+            best_val_cos = float(ckpt["val_cos"])
+
+        log.info(
+            "Resumed from %s | epoch=%d -> start_epoch=%d | global_step=%d | best_val_loss=%.6f best_val_cos=%.4f",
+            resume_path,
+            ckpt_epoch,
+            start_epoch,
+            step,
+            best_val_loss,
+            best_val_cos,
+        )
+
+    if start_epoch > args.epochs:
+        log.warning(
+            "Nothing to train: start_epoch=%d is greater than target epochs=%d.",
+            start_epoch,
+            args.epochs,
+        )
+        log.info("Checkpoints: %s", ckpt_dir)
+        return
+
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_start_time = time.time()
         adapter.train()
         epoch_loss = 0.0
@@ -748,11 +1030,13 @@ def train(args):
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save({
-                    "epoch": epoch, "model_state_dict": adapter.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": avg_loss, "val_loss": val_loss, "val_cos": val_cos,
-                }, ckpt_dir / "best.pt")
+                save_checkpoint(
+                    ckpt_dir / "best.pt",
+                    epoch=epoch,
+                    loss=avg_loss,
+                    val_loss=val_loss,
+                    val_cos=val_cos,
+                )
             if val_cos > best_val_cos:
                 best_val_cos = val_cos
 
@@ -795,18 +1079,18 @@ def train(args):
 
             if avg_loss < best_val_loss and args.sanity_check:
                 best_val_loss = avg_loss
-                torch.save({
-                    "epoch": epoch, "model_state_dict": adapter.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": avg_loss,
-                }, ckpt_dir / "best.pt")
+                save_checkpoint(
+                    ckpt_dir / "best.pt",
+                    epoch=epoch,
+                    loss=avg_loss,
+                )
 
         if epoch % args.save_every == 0 and not args.sanity_check:
-            torch.save({
-                "epoch": epoch, "model_state_dict": adapter.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": avg_loss,
-            }, ckpt_dir / f"epoch_{epoch:04d}.pt")
+            save_checkpoint(
+                ckpt_dir / f"epoch_{epoch:04d}.pt",
+                epoch=epoch,
+                loss=avg_loss,
+            )
 
     log.info("Training finished. Best val_loss: %.6f  Best val_cos: %.4f",
              best_val_loss, best_val_cos)
@@ -900,7 +1184,13 @@ def parse_args():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--warmup_epochs", type=int, default=5)
     p.add_argument("--log_every", type=int, default=5)
-    p.add_argument("--save_every", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=5)
+    p.add_argument("--resume-from", type=str, default=None,
+                   help="Checkpoint path to resume training from (restores model/optimizer/scheduler/state).")
+    p.add_argument("--test-only", action="store_true",
+                   help="Skip training and run only held-out test evaluation from a checkpoint.")
+    p.add_argument("--test-checkpoint", type=str, default=None,
+                   help="Checkpoint path used by --test-only. Defaults to --resume-from or checkpoints/usa_adapter/best.pt.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sanity-check", action="store_true",
                    help="Overfit 1 batch to verify model can reach loss->0")

@@ -1865,6 +1865,23 @@ def main() -> None:
 
     scale_states: Dict[Tuple[int, int], ScaleState] = {}
 
+    def persist_episode_metadata(state: EpisodeState) -> None:
+        metadata = {
+            "episode_id": state.episode_id,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "indenter": state.indenter,
+            "particle": str(args.particle),
+            "contact": {
+                "x_mm": state.x_mm,
+                "y_mm": state.y_mm,
+                "depth_mm": state.depth_mm,
+            },
+            "image_resolution": {"width": DEFAULT_IMAGE_RES[0], "height": DEFAULT_IMAGE_RES[1]},
+            "scales": state.scales,
+        }
+        with open(state.episode_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
     def maybe_finalize_scale(scale_state: ScaleState) -> None:
         if scale_state.sealed or scale_state.failed:
             return
@@ -1897,6 +1914,18 @@ def main() -> None:
             "adapter_coord_map_shape": [int(v) for v in scale_state.adapter_coord_map_shape],
             "frames": ordered_frames,
         }
+        try:
+            # Persist per-scale progress immediately so resume can skip physics next time.
+            persist_episode_metadata(ep_state)
+        except Exception as exc:
+            msg = (
+                f"failed to persist metadata after scale complete: "
+                f"ep={scale_state.episode_id} scale={scale_state.scale_mm} err={exc}"
+            )
+            ep_state.errors.append(msg)
+            scale_state.failed = True
+            logging.error(msg)
+            return
         scale_state.sealed = True
 
         logging.info(
