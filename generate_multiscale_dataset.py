@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import csv
 import datetime as dt
 import json
 import logging
@@ -39,6 +40,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -67,6 +69,46 @@ DEFAULT_FRAME_DEPTH_START_MM = 0.4
 DEFAULT_FRAME_DEPTH_END_MM = 2.2
 DEFAULT_IMAGE_RES = (640, 480)
 TEXTURE_EXTS = {".jpg", ".jpeg", ".png"}
+IMAGE_INDEX_COLUMNS = [
+    "dataset_root",
+    "dataset_variant",
+    "episode_id",
+    "episode_dir",
+    "indenter_name",
+    "particle",
+    "command_x_mm",
+    "command_y_mm",
+    "command_depth_mm",
+    "scale_key",
+    "scale_mm",
+    "frame_name",
+    "frame_index",
+    "frame_fraction",
+    "frame_fraction_requested",
+    "frame_target_max_down_mm",
+    "frame_actual_max_down_mm",
+    "trajectory_length",
+    "frame_sampling_mode",
+    "surface_max_down_mm",
+    "surface_mean_down_mm",
+    "surface_min_z_start_mm",
+    "surface_min_z_frame_mm",
+    "camera_mode",
+    "camera_distance_m",
+    "camera_fov_deg",
+    "patch_grid_h",
+    "patch_grid_w",
+    "coordinate_convention",
+    "image_width",
+    "image_height",
+    "marker_name",
+    "image_relpath",
+    "image_abspath",
+    "adapter_coord_map_relpath",
+    "adapter_coord_map_abspath",
+    "split",
+    "is_unseen_indenter",
+]
 
 
 OPEN3D_TEMP_SCRIPT = r'''
@@ -697,6 +739,78 @@ class ScaleState:
     failed: bool = False
     sealed: bool = False
 
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def make_scale_progress_entry(
+    episode_id: int,
+    scale_mm: int,
+    indenter: str,
+    x_mm: float,
+    y_mm: float,
+    depth_mm: float,
+    frame_sampling_mode: str,
+    frame_depth_targets_mm: Sequence[float] | None,
+) -> Dict[str, Any]:
+    return {
+        "episode_id": int(episode_id),
+        "episode_dir": f"episode_{int(episode_id):06d}",
+        "scale_key": f"scale_{int(scale_mm)}mm",
+        "scale_mm": int(scale_mm),
+        "indenter": str(indenter),
+        "contact": {
+            "x_mm": float(x_mm),
+            "y_mm": float(y_mm),
+            "depth_mm": float(depth_mm),
+        },
+        "frame_sampling_mode": str(frame_sampling_mode),
+        "frame_depth_targets_mm": [float(v) for v in frame_depth_targets_mm] if frame_depth_targets_mm else [],
+        "physics": {
+            "status": "pending",
+            "trajectory_length": None,
+            "npz_path": "",
+            "reused": False,
+        },
+        "meshing": {
+            "status": "pending",
+            "planned_frames": 0,
+            "completed_frames": 0,
+            "failed_frames": 0,
+        },
+        "render": {
+            "status": "pending",
+            "planned_frames": 0,
+            "completed_frames": 0,
+            "reused_frames": 0,
+            "failed_frames": 0,
+        },
+        "scale_complete": False,
+        "restored_from_metadata": False,
+        "last_error": "",
+    }
+
+
+def make_scale_progress_key(episode_id: int, scale_mm: int) -> str:
+    return f"episode_{int(episode_id):06d}/scale_{int(scale_mm)}mm"
+
+
 def setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper()),
@@ -796,7 +910,7 @@ def deformation_stats_for_frame(z_trajectory: np.ndarray, frame_index: int) -> D
     }
 
 
-def make_random_frame_depth_targets_mm(
+def make_stratified_random_frame_depth_targets_mm(
     frame_count: int,
     depth_start_mm: float,
     depth_end_mm: float,
@@ -811,23 +925,176 @@ def make_random_frame_depth_targets_mm(
             f"depth_end_mm must be > depth_start_mm, got {depth_end_mm} <= {depth_start_mm}"
         )
 
-    # Start frame around shallow contact, final frame focused near max depth.
-    start_low = max(0.01, float(depth_start_mm) - 0.05)
-    start_high = float(depth_start_mm) + 0.05
-    d0 = float(rng.uniform(start_low, start_high))
-    d_last = float(depth_end_mm)
-    if d_last <= d0 + 1e-6:
-        d_last = d0 + 1e-3
-
-    if frame_count == 1:
-        return [round(d_last, 4)]
-
-    if frame_count == 2:
-        return [round(d0, 4), round(d_last, 4)]
-
-    mids = sorted(float(rng.uniform(d0, d_last)) for _ in range(frame_count - 2))
-    targets = [d0] + mids + [d_last]
+    # Sample one depth target per consecutive depth stage for shallow->deep coverage.
+    bin_edges = np.linspace(float(depth_start_mm), float(depth_end_mm), frame_count + 1, dtype=np.float64)
+    targets: List[float] = []
+    for bin_idx in range(frame_count):
+        low = float(bin_edges[bin_idx])
+        high = float(bin_edges[bin_idx + 1])
+        target = float(rng.uniform(low, high))
+        targets.append(round(target, 4))
+    targets.sort()
     return [round(v, 4) for v in targets]
+
+
+def _safe_relpath(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def _csv_cell(value: Any) -> Any:
+    return "" if value is None else value
+
+
+def build_image_index_csv(dataset_root: Path) -> Tuple[Path, int]:
+    dataset_root = dataset_root.resolve()
+    manifest_path = dataset_root / "manifest.json"
+    csv_path = dataset_root / "image_index.csv"
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    patch_grid = manifest.get("patch_grid")
+    patch_grid_h = ""
+    patch_grid_w = ""
+    if isinstance(patch_grid, (list, tuple)) and len(patch_grid) >= 2:
+        patch_grid_h = int(patch_grid[0])
+        patch_grid_w = int(patch_grid[1])
+
+    coordinate_convention = str(manifest.get("coordinate_convention", ""))
+    dataset_variant = str(manifest.get("dataset_variant", ""))
+    rows_written = 0
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=IMAGE_INDEX_COLUMNS)
+        writer.writeheader()
+
+        for episode_entry in manifest.get("episodes", []):
+            if not isinstance(episode_entry, dict):
+                continue
+
+            episode_dir_name = str(
+                episode_entry.get(
+                    "path",
+                    f"episode_{int(episode_entry.get('episode_id', 0)):06d}",
+                )
+            )
+            episode_dir = dataset_root / episode_dir_name
+            metadata_path = episode_dir / "metadata.json"
+            if not metadata_path.exists():
+                logging.warning("Skipping CSV indexing for missing metadata: %s", metadata_path)
+                continue
+
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as ep_f:
+                    episode_meta = json.load(ep_f)
+            except Exception as exc:
+                logging.warning("Skipping CSV indexing for unreadable metadata (%s): %s", metadata_path, exc)
+                continue
+
+            contact = episode_meta.get("contact", {})
+            image_resolution = episode_meta.get("image_resolution", {})
+            image_width = DEFAULT_IMAGE_RES[0]
+            image_height = DEFAULT_IMAGE_RES[1]
+            if isinstance(image_resolution, dict):
+                image_width = int(image_resolution.get("width", DEFAULT_IMAGE_RES[0]))
+                image_height = int(image_resolution.get("height", DEFAULT_IMAGE_RES[1]))
+
+            scales = episode_meta.get("scales", {})
+            if not isinstance(scales, dict):
+                logging.warning("Skipping CSV indexing for invalid scales block: %s", metadata_path)
+                continue
+
+            for scale_key, scale_meta in sorted(scales.items()):
+                if not isinstance(scale_meta, dict):
+                    logging.warning("Skipping invalid scale metadata in %s: %s", metadata_path, scale_key)
+                    continue
+
+                scale_mm = scale_meta.get("scale_mm", "")
+                adapter_rel = str(scale_meta.get("adapter_coord_map", "") or "")
+                adapter_abs = str((episode_dir / adapter_rel).resolve()) if adapter_rel else ""
+                frames = scale_meta.get("frames", {})
+                if not isinstance(frames, dict):
+                    logging.warning("Skipping invalid frames block in %s: %s", metadata_path, scale_key)
+                    continue
+
+                for frame_name, frame_meta in sorted(frames.items()):
+                    if not isinstance(frame_meta, dict):
+                        logging.warning(
+                            "Skipping invalid frame metadata in %s: %s/%s",
+                            metadata_path,
+                            scale_key,
+                            frame_name,
+                        )
+                        continue
+
+                    rendered_markers = frame_meta.get("rendered_markers", [])
+                    if not isinstance(rendered_markers, list):
+                        logging.warning(
+                            "Skipping invalid rendered_markers in %s: %s/%s",
+                            metadata_path,
+                            scale_key,
+                            frame_name,
+                        )
+                        continue
+
+                    deformation_stats = frame_meta.get("deformation_stats", {})
+                    if not isinstance(deformation_stats, dict):
+                        deformation_stats = {}
+
+                    for marker_name in rendered_markers:
+                        marker_str = str(marker_name)
+                        image_path = episode_dir / str(scale_key) / str(frame_name) / marker_str
+                        if not image_path.exists():
+                            logging.warning("Skipping missing image during CSV rebuild: %s", image_path)
+                            continue
+
+                        row = {
+                            "dataset_root": str(dataset_root),
+                            "dataset_variant": dataset_variant,
+                            "episode_id": episode_meta.get("episode_id", episode_entry.get("episode_id", "")),
+                            "episode_dir": episode_dir_name,
+                            "indenter_name": episode_meta.get("indenter", episode_entry.get("indenter", "")),
+                            "particle": episode_meta.get("particle", manifest.get("particle", "")),
+                            "command_x_mm": contact.get("x_mm", ""),
+                            "command_y_mm": contact.get("y_mm", ""),
+                            "command_depth_mm": contact.get("depth_mm", ""),
+                            "scale_key": scale_key,
+                            "scale_mm": scale_mm,
+                            "frame_name": frame_name,
+                            "frame_index": frame_meta.get("frame_index", ""),
+                            "frame_fraction": frame_meta.get("frame_fraction", ""),
+                            "frame_fraction_requested": frame_meta.get("frame_fraction_requested", ""),
+                            "frame_target_max_down_mm": frame_meta.get("frame_target_max_down_mm", ""),
+                            "frame_actual_max_down_mm": frame_meta.get("frame_actual_max_down_mm", ""),
+                            "trajectory_length": frame_meta.get("trajectory_length", scale_meta.get("trajectory_length", "")),
+                            "frame_sampling_mode": scale_meta.get("frame_sampling_mode", manifest.get("frame_sampling_mode", "")),
+                            "surface_max_down_mm": deformation_stats.get("surface_max_down_mm", ""),
+                            "surface_mean_down_mm": deformation_stats.get("surface_mean_down_mm", ""),
+                            "surface_min_z_start_mm": deformation_stats.get("surface_min_z_start_mm", ""),
+                            "surface_min_z_frame_mm": deformation_stats.get("surface_min_z_frame_mm", ""),
+                            "camera_mode": scale_meta.get("camera_mode", ""),
+                            "camera_distance_m": scale_meta.get("camera_distance_m", ""),
+                            "camera_fov_deg": scale_meta.get("camera_fov_deg", ""),
+                            "patch_grid_h": patch_grid_h,
+                            "patch_grid_w": patch_grid_w,
+                            "coordinate_convention": coordinate_convention,
+                            "image_width": image_width,
+                            "image_height": image_height,
+                            "marker_name": marker_str,
+                            "image_relpath": _safe_relpath(image_path, dataset_root),
+                            "image_abspath": str(image_path.resolve()),
+                            "adapter_coord_map_relpath": adapter_rel,
+                            "adapter_coord_map_abspath": adapter_abs,
+                            "split": episode_meta.get("split", manifest.get("split", "")),
+                            "is_unseen_indenter": episode_meta.get("is_unseen_indenter", ""),
+                        }
+                        writer.writerow({key: _csv_cell(row.get(key)) for key in IMAGE_INDEX_COLUMNS})
+                        rows_written += 1
+
+    return csv_path, rows_written
 
 
 def max_down_trajectory_mm(z_trajectory: np.ndarray) -> np.ndarray:
@@ -1456,7 +1723,7 @@ def parse_args() -> argparse.Namespace:
         "--frame-sampling-mode",
         choices=["depth_random", "fraction"],
         default=DEFAULT_FRAME_SAMPLING_MODE,
-        help="Frame sampling policy. depth_random: choose frames by max-down depth targets per episode.",
+        help="Frame sampling policy. depth_random: stratified-random max-down targets per episode.",
     )
     p.add_argument(
         "--frame-count",
@@ -1677,6 +1944,7 @@ def main() -> None:
 
     episode_states: Dict[int, EpisodeState] = {}
     physics_tasks: List[Dict[str, Any]] = []
+    scale_progress: Dict[str, Dict[str, Any]] = {}
     resume_scales_from_metadata = 0
 
     episode_id = 0
@@ -1686,7 +1954,7 @@ def main() -> None:
             y_mm = round(rng.uniform(args.y_min, args.y_max), 4)
             episode_frame_depth_targets_mm: List[float] | None = None
             if args.frame_sampling_mode == "depth_random":
-                episode_frame_depth_targets_mm = make_random_frame_depth_targets_mm(
+                episode_frame_depth_targets_mm = make_stratified_random_frame_depth_targets_mm(
                     frame_count=int(args.frame_count),
                     depth_start_mm=float(args.frame_depth_start_mm),
                     depth_end_mm=float(args.frame_depth_end_mm),
@@ -1728,6 +1996,17 @@ def main() -> None:
             skipped_scales = 0
             for scale_mm in args.scales_mm:
                 scale_key = f"scale_{int(scale_mm)}mm"
+                progress_key = make_scale_progress_key(episode_id, int(scale_mm))
+                scale_progress[progress_key] = make_scale_progress_entry(
+                    episode_id=episode_id,
+                    scale_mm=int(scale_mm),
+                    indenter=indenter,
+                    x_mm=x_mm,
+                    y_mm=y_mm,
+                    depth_mm=depth_mm,
+                    frame_sampling_mode=str(args.frame_sampling_mode),
+                    frame_depth_targets_mm=episode_frame_depth_targets_mm,
+                )
                 if args.resume and scale_key in existing_scales:
                     scale_meta = existing_scales[scale_key]
                     if validate_existing_scale_metadata(
@@ -1741,6 +2020,31 @@ def main() -> None:
                         episode_states[episode_id].scales[scale_key] = scale_meta
                         resume_scales_from_metadata += 1
                         skipped_scales += 1
+                        frame_count_existing = 0
+                        frames_existing = scale_meta.get("frames", {})
+                        if isinstance(frames_existing, dict):
+                            frame_count_existing = len(frames_existing)
+                        scale_progress[progress_key]["restored_from_metadata"] = True
+                        scale_progress[progress_key]["physics"] = {
+                            "status": "reused_from_metadata",
+                            "trajectory_length": scale_meta.get("trajectory_length"),
+                            "npz_path": "",
+                            "reused": True,
+                        }
+                        scale_progress[progress_key]["meshing"] = {
+                            "status": "reused_from_metadata",
+                            "planned_frames": int(frame_count_existing),
+                            "completed_frames": int(frame_count_existing),
+                            "failed_frames": 0,
+                        }
+                        scale_progress[progress_key]["render"] = {
+                            "status": "reused_from_metadata",
+                            "planned_frames": int(frame_count_existing),
+                            "completed_frames": int(frame_count_existing),
+                            "reused_frames": int(frame_count_existing),
+                            "failed_frames": 0,
+                        }
+                        scale_progress[progress_key]["scale_complete"] = True
                         if not args.keep_intermediates:
                             completed_scale_tmp_dir = (
                                 work_tmp_root / f"episode_{episode_id:06d}" / f"scale_{int(scale_mm)}mm"
@@ -1806,6 +2110,7 @@ def main() -> None:
 
     total_episodes = len(episode_states)
     total_scale_tasks = len(physics_tasks)
+    total_scale_slots = int(total_episodes * len(args.scales_mm))
 
     logging.info("=" * 72)
     logging.info("Dataset root: %s", dataset_root)
@@ -1817,7 +2122,7 @@ def main() -> None:
     logging.info("Intermediates root: %s", work_tmp_root)
     if args.frame_sampling_mode == "depth_random":
         logging.info(
-            "Frame sampling: mode=depth_random frame_count=%d start≈%.3fmm end≈%.3fmm deduplicate=%s",
+            "Frame sampling: mode=depth_random strategy=stratified_random frame_count=%d start=%.3fmm end=%.3fmm deduplicate=%s",
             int(args.frame_count),
             float(args.frame_depth_start_mm),
             float(args.frame_depth_end_mm),
@@ -1853,17 +2158,109 @@ def main() -> None:
     physics_ok = 0
     meshing_ok = 0
     render_ok = 0
+    physics_done = 0
+    meshing_done = 0
+    render_done = 0
+    physics_failed = 0
+    meshing_failed = 0
+    render_failed = 0
+    physics_reused = 0
     total_meshing_tasks_planned = 0
     total_render_tasks_planned = 0
     total_frames_rendered = 0
     total_frames_reused = 0
     allow_intermediate_cleanup = False
     run_start_ts = time.time()
+    run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     physics_stage_start_ts = run_start_ts
     meshing_stage_start_ts: float | None = None
     render_stage_start_ts: float | None = None
+    run_status_path = dataset_root / "run_status.json"
+    last_run_status_write_ts = 0.0
+    last_event: Dict[str, Any] = {}
+    stage_last_event: Dict[str, Dict[str, Any]] = {}
 
     scale_states: Dict[Tuple[int, int], ScaleState] = {}
+
+    def update_last_event(stage: str, status: str, **payload: Any) -> None:
+        nonlocal last_event
+        event = {
+            "time": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "stage": str(stage),
+            "status": str(status),
+            **_json_safe(payload),
+        }
+        last_event = event
+        stage_last_event[str(stage)] = event
+
+    def persist_run_status(run_status: str, force: bool = False, error: str | None = None) -> None:
+        nonlocal last_run_status_write_ts
+        now_ts = time.time()
+        if (not force) and (now_ts - last_run_status_write_ts < 2.0):
+            return
+
+        completed_scales = sum(1 for item in scale_progress.values() if item.get("scale_complete"))
+        failed_scales = sum(1 for item in scale_progress.values() if item.get("last_error"))
+        payload = {
+            "status": str(run_status),
+            "started_at": run_start_iso,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "completed_at": (
+                dt.datetime.now(dt.timezone.utc).isoformat()
+                if run_status in {"completed", "failed"}
+                else None
+            ),
+            "dataset_root": str(dataset_root),
+            "run_status_json": str(run_status_path),
+            "command": shlex.join([str(sys.executable), *sys.argv]),
+            "argv": list(sys.argv),
+            "args": _json_safe(vars(args)),
+            "paths": {
+                "manifest_json": str(dataset_root / "manifest.json"),
+                "image_index_csv": str(dataset_root / "image_index.csv"),
+                "run_status_json": str(run_status_path),
+                "intermediates_root": str(work_tmp_root),
+            },
+            "totals": {
+                "episodes": int(total_episodes),
+                "scale_slots": int(total_scale_slots),
+                "physics_tasks_planned": int(total_scale_tasks),
+                "meshing_tasks_planned": int(total_meshing_tasks_planned),
+                "render_tasks_planned": int(total_render_tasks_planned),
+                "textures": int(len(textures)),
+                "scales_per_episode": int(len(args.scales_mm)),
+            },
+            "progress": {
+                "resume_mode": bool(args.resume),
+                "scales_restored_from_metadata": int(resume_scales_from_metadata),
+                "completed_scales": int(completed_scales),
+                "failed_scales": int(failed_scales),
+                "physics": {
+                    "completed": int(physics_done),
+                    "succeeded": int(physics_ok),
+                    "failed": int(physics_failed),
+                    "reused": int(physics_reused),
+                },
+                "meshing": {
+                    "completed": int(meshing_done),
+                    "succeeded": int(meshing_ok),
+                    "failed": int(meshing_failed),
+                },
+                "render": {
+                    "completed": int(render_done),
+                    "succeeded": int(render_ok),
+                    "failed": int(render_failed),
+                    "frames_rendered": int(total_frames_rendered),
+                    "frames_reused": int(total_frames_reused),
+                },
+            },
+            "last_event": last_event,
+            "last_stage_event": stage_last_event,
+            "error": str(error) if error else "",
+            "scales": _json_safe(scale_progress),
+        }
+        write_json_atomic(run_status_path, payload)
+        last_run_status_write_ts = now_ts
 
     def persist_episode_metadata(state: EpisodeState) -> None:
         metadata = {
@@ -1891,6 +2288,7 @@ def main() -> None:
             return
 
         ep_state = episode_states[scale_state.episode_id]
+        progress_key = make_scale_progress_key(scale_state.episode_id, scale_state.scale_mm)
         ordered_frames: Dict[str, Dict[str, Any]] = {}
         for sample in scale_state.sampled_frames:
             frame_name = str(sample["frame_name"])
@@ -1925,8 +2323,29 @@ def main() -> None:
             ep_state.errors.append(msg)
             scale_state.failed = True
             logging.error(msg)
+            scale_progress[progress_key]["last_error"] = msg
+            update_last_event(
+                "metadata",
+                "error",
+                episode_id=scale_state.episode_id,
+                scale_mm=scale_state.scale_mm,
+                message=msg,
+            )
+            persist_run_status("running", force=True)
             return
         scale_state.sealed = True
+        scale_progress[progress_key]["scale_complete"] = True
+        scale_progress[progress_key]["meshing"]["status"] = "complete"
+        scale_progress[progress_key]["render"]["status"] = "complete"
+        update_last_event(
+            "scale",
+            "complete",
+            episode_id=scale_state.episode_id,
+            scale_mm=scale_state.scale_mm,
+            frames=len(ordered_frames),
+            rendered=scale_state.frames_rendered,
+            reused=scale_state.frames_reused,
+        )
 
         logging.info(
             "Scale COMPLETE | ep=%06d scale=%d | frames=%d (rendered=%d reused=%d)",
@@ -1944,6 +2363,9 @@ def main() -> None:
                 scale_state.scale_mm,
                 scale_state.temp_scale_dir,
             )
+        persist_run_status("running", force=True)
+
+    persist_run_status("running", force=True)
 
     try:
         with (
@@ -1959,10 +2381,6 @@ def main() -> None:
                 f = physics_pool.submit(run_physics_task, task)
                 physics_futures[f] = task
 
-            physics_done = 0
-            meshing_done = 0
-            render_done = 0
-
             while physics_futures or meshing_futures or render_futures:
                 pending: List[cf.Future] = []
                 pending.extend(list(physics_futures.keys()))
@@ -1976,6 +2394,7 @@ def main() -> None:
                         physics_done += 1
                         episode_id = int(task["episode_id"])
                         scale_mm = int(task["scale_mm"])
+                        progress_key = make_scale_progress_key(episode_id, scale_mm)
                         ep_state = episode_states[episode_id]
                         physics_eta = _progress_eta_text(physics_stage_start_ts, physics_done, max(total_scale_tasks, 1))
                         physics_thr = _throughput_text(physics_stage_start_ts, physics_done)
@@ -1985,7 +2404,12 @@ def main() -> None:
                         except Exception as exc:
                             msg = f"physics future crashed: ep={episode_id} scale={scale_mm} err={exc}"
                             ep_state.errors.append(msg)
+                            physics_failed += 1
+                            scale_progress[progress_key]["physics"]["status"] = "error"
+                            scale_progress[progress_key]["last_error"] = msg
+                            update_last_event("physics", "error", episode_id=episode_id, scale_mm=scale_mm, message=msg)
                             logging.error("%s | %s | %s", msg, physics_eta, physics_thr)
+                            persist_run_status("running", force=True)
                             continue
 
                         if result.get("status") != "ok":
@@ -1999,6 +2423,16 @@ def main() -> None:
                                 if result.get("error")
                                 else "(no error text)"
                             )
+                            physics_failed += 1
+                            scale_progress[progress_key]["physics"]["status"] = "error"
+                            scale_progress[progress_key]["last_error"] = err_short
+                            update_last_event(
+                                "physics",
+                                "error",
+                                episode_id=episode_id,
+                                scale_mm=scale_mm,
+                                message=err_short,
+                            )
                             logging.error(
                                 "Physics failed | ep=%06d scale=%d | %s | %s | %s",
                                 episode_id,
@@ -2007,9 +2441,28 @@ def main() -> None:
                                 physics_eta,
                                 physics_thr,
                             )
+                            persist_run_status("running", force=True)
                             continue
 
                         physics_ok += 1
+                        scale_progress[progress_key]["physics"]["status"] = "ok"
+                        scale_progress[progress_key]["physics"]["trajectory_length"] = int(result["trajectory_length"])
+                        scale_progress[progress_key]["physics"]["npz_path"] = str(result["npz_path"])
+                        scale_progress[progress_key]["physics"]["reused"] = bool(result.get("physics_reused"))
+                        frame_count = len(result["sampled_frames"])
+                        scale_progress[progress_key]["meshing"]["planned_frames"] = int(frame_count)
+                        scale_progress[progress_key]["render"]["planned_frames"] = int(frame_count)
+                        if result.get("physics_reused"):
+                            physics_reused += 1
+                        update_last_event(
+                            "physics",
+                            "ok",
+                            episode_id=episode_id,
+                            scale_mm=scale_mm,
+                            reused=bool(result.get("physics_reused")),
+                            trajectory_length=int(result["trajectory_length"]),
+                            sampled_frames=int(frame_count),
+                        )
                         if result.get("physics_reused"):
                             logging.info(
                                 "Physics REUSE | ep=%06d scale=%d | max_down=%.4fmm mean_down=%.4fmm | %s | %s",
@@ -2081,6 +2534,18 @@ def main() -> None:
                             if args.resume and frame_outputs_complete(frame_dir, expected_marker_files):
                                 scale_state.frames[frame_name] = make_frame_metadata(sample, expected_marker_files)
                                 scale_state.frames_reused += 1
+                                total_frames_reused += 1
+                                scale_progress[progress_key]["render"]["completed_frames"] += 1
+                                scale_progress[progress_key]["render"]["reused_frames"] += 1
+                                scale_progress[progress_key]["render"]["status"] = "reused"
+                                update_last_event(
+                                    "render",
+                                    "reused",
+                                    episode_id=episode_id,
+                                    scale_mm=scale_mm,
+                                    frame_name=frame_name,
+                                    markers=len(expected_marker_files),
+                                )
                                 logging.info(
                                     "Render REUSE | ep=%06d scale=%d frame=%s | markers=%d",
                                     episode_id,
@@ -2110,10 +2575,13 @@ def main() -> None:
                             }
                             scale_state.pending_mesh_count += 1
                             total_meshing_tasks_planned += 1
+                            scale_progress[progress_key]["meshing"]["status"] = "in_progress"
+                            scale_progress[progress_key]["render"]["status"] = "pending"
                             if meshing_stage_start_ts is None:
                                 meshing_stage_start_ts = time.time()
 
                         maybe_finalize_scale(scale_state)
+                        persist_run_status("running")
 
                     elif done_future in meshing_futures:
                         payload = meshing_futures.pop(done_future)
@@ -2130,6 +2598,7 @@ def main() -> None:
                         scale_state = scale_states.get(scale_id)
                         if scale_state is None:
                             continue
+                        progress_key = make_scale_progress_key(scale_state.episode_id, scale_state.scale_mm)
                         ep_state = episode_states[scale_state.episode_id]
                         scale_state.pending_mesh_count = max(0, scale_state.pending_mesh_count - 1)
 
@@ -2142,8 +2611,20 @@ def main() -> None:
                             )
                             ep_state.errors.append(msg)
                             scale_state.failed = True
+                            meshing_failed += 1
+                            scale_progress[progress_key]["meshing"]["failed_frames"] += 1
+                            scale_progress[progress_key]["meshing"]["status"] = "error"
+                            scale_progress[progress_key]["last_error"] = msg
+                            update_last_event(
+                                "meshing",
+                                "error",
+                                episode_id=scale_state.episode_id,
+                                scale_mm=scale_state.scale_mm,
+                                message=msg,
+                            )
                             logging.error("%s | %s | %s", msg, meshing_eta, meshing_thr)
                             maybe_finalize_scale(scale_state)
+                            persist_run_status("running", force=True)
                             continue
 
                         if rr.get("status") != "ok":
@@ -2153,6 +2634,18 @@ def main() -> None:
                             )
                             ep_state.errors.append(msg)
                             scale_state.failed = True
+                            meshing_failed += 1
+                            scale_progress[progress_key]["meshing"]["failed_frames"] += 1
+                            scale_progress[progress_key]["meshing"]["status"] = "error"
+                            scale_progress[progress_key]["last_error"] = str(rr.get("error", ""))
+                            update_last_event(
+                                "meshing",
+                                "error",
+                                episode_id=scale_state.episode_id,
+                                scale_mm=scale_state.scale_mm,
+                                frame_name=rr.get("frame_name"),
+                                message=rr.get("error", ""),
+                            )
                             logging.error(
                                 "Meshing failed | ep=%06d scale=%d frame=%s | %s | %s",
                                 scale_state.episode_id,
@@ -2162,11 +2655,22 @@ def main() -> None:
                                 meshing_thr,
                             )
                             maybe_finalize_scale(scale_state)
+                            persist_run_status("running", force=True)
                             continue
 
                         meshing_ok += 1
                         frame_name = str(rr["frame_name"])
                         frame_dir = scale_state.scale_dir / frame_name
+                        scale_progress[progress_key]["meshing"]["completed_frames"] += 1
+                        scale_progress[progress_key]["meshing"]["status"] = "in_progress"
+                        update_last_event(
+                            "meshing",
+                            "ok",
+                            episode_id=scale_state.episode_id,
+                            scale_mm=scale_state.scale_mm,
+                            frame_name=frame_name,
+                            frame_index=int(rr["frame_index"]),
+                        )
 
                         render_task = {
                             "episode_id": int(scale_state.episode_id),
@@ -2199,6 +2703,7 @@ def main() -> None:
                         }
                         total_render_tasks_planned += 1
                         scale_state.pending_render_count += 1
+                        scale_progress[progress_key]["render"]["status"] = "in_progress"
                         if render_stage_start_ts is None:
                             render_stage_start_ts = time.time()
 
@@ -2213,6 +2718,7 @@ def main() -> None:
                         )
 
                         maybe_finalize_scale(scale_state)
+                        persist_run_status("running")
 
                     elif done_future in render_futures:
                         payload = render_futures.pop(done_future)
@@ -2229,6 +2735,7 @@ def main() -> None:
                         scale_state = scale_states.get(scale_id)
                         if scale_state is None:
                             continue
+                        progress_key = make_scale_progress_key(scale_state.episode_id, scale_state.scale_mm)
                         ep_state = episode_states[scale_state.episode_id]
                         scale_state.pending_render_count = max(0, scale_state.pending_render_count - 1)
 
@@ -2241,8 +2748,20 @@ def main() -> None:
                             )
                             ep_state.errors.append(msg)
                             scale_state.failed = True
+                            render_failed += 1
+                            scale_progress[progress_key]["render"]["failed_frames"] += 1
+                            scale_progress[progress_key]["render"]["status"] = "error"
+                            scale_progress[progress_key]["last_error"] = msg
+                            update_last_event(
+                                "render",
+                                "error",
+                                episode_id=scale_state.episode_id,
+                                scale_mm=scale_state.scale_mm,
+                                message=msg,
+                            )
                             logging.error("%s | %s | %s", msg, render_eta, render_thr)
                             maybe_finalize_scale(scale_state)
+                            persist_run_status("running", force=True)
                             continue
 
                         if rr.get("status") != "ok":
@@ -2252,6 +2771,18 @@ def main() -> None:
                             )
                             ep_state.errors.append(msg)
                             scale_state.failed = True
+                            render_failed += 1
+                            scale_progress[progress_key]["render"]["failed_frames"] += 1
+                            scale_progress[progress_key]["render"]["status"] = "error"
+                            scale_progress[progress_key]["last_error"] = str(rr.get("error", ""))
+                            update_last_event(
+                                "render",
+                                "error",
+                                episode_id=scale_state.episode_id,
+                                scale_mm=scale_state.scale_mm,
+                                frame_name=rr.get("frame_name"),
+                                message=rr.get("error", ""),
+                            )
                             logging.error(
                                 "Render failed | ep=%06d scale=%d frame=%s | %s | %s",
                                 scale_state.episode_id,
@@ -2261,6 +2792,7 @@ def main() -> None:
                                 render_thr,
                             )
                             maybe_finalize_scale(scale_state)
+                            persist_run_status("running", force=True)
                             continue
 
                         render_ok += 1
@@ -2270,8 +2802,23 @@ def main() -> None:
                         scale_state.frames[frame_name] = make_frame_metadata(sample, rendered_markers)
                         if rr.get("reused"):
                             scale_state.frames_reused += 1
+                            total_frames_reused += 1
                         else:
                             scale_state.frames_rendered += 1
+                            total_frames_rendered += 1
+                        scale_progress[progress_key]["render"]["completed_frames"] += 1
+                        if rr.get("reused"):
+                            scale_progress[progress_key]["render"]["reused_frames"] += 1
+                        scale_progress[progress_key]["render"]["status"] = "in_progress"
+                        update_last_event(
+                            "render",
+                            "ok" if not rr.get("reused") else "reused",
+                            episode_id=scale_state.episode_id,
+                            scale_mm=scale_state.scale_mm,
+                            frame_name=frame_name,
+                            markers=len(rendered_markers),
+                            reused=bool(rr.get("reused", False)),
+                        )
 
                         logging.info(
                             "Render OK | ep=%06d scale=%d frame=%s | markers=%d reused=%s | %s | %s",
@@ -2285,6 +2832,7 @@ def main() -> None:
                         )
 
                         maybe_finalize_scale(scale_state)
+                        persist_run_status("running")
 
             total_frames_rendered = int(sum(s.frames_rendered for s in scale_states.values()))
             total_frames_reused = int(sum(s.frames_reused for s in scale_states.values()))
@@ -2373,6 +2921,8 @@ def main() -> None:
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "dataset_root": str(dataset_root),
             "dataset_variant": "static_multiframe_v1",
+            "run_status_json": str(run_status_path.relative_to(dataset_root)),
+            "command": shlex.join([str(sys.executable), *sys.argv]),
             "particle": str(args.particle),
             "scales_mm": [int(s) for s in args.scales_mm],
             "patch_grid": [int(patch_h), int(patch_w)],
@@ -2412,14 +2962,35 @@ def main() -> None:
 
         with open(dataset_root / "manifest.json", "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
+
+        image_index_path, image_index_rows = build_image_index_csv(dataset_root)
+        manifest["image_index_csv"] = str(image_index_path.relative_to(dataset_root))
+        manifest["image_index_rows"] = int(image_index_rows)
+        with open(dataset_root / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        update_last_event(
+            "dataset",
+            "completed",
+            successful_episodes=len(manifest_episodes),
+            failed_episodes=len(failed_episodes),
+            image_index_rows=image_index_rows,
+        )
+        persist_run_status("completed", force=True)
+
         allow_intermediate_cleanup = (len(failed_episodes) == 0)
 
         logging.info("=" * 72)
         logging.info("DONE | successful episodes: %d | failed episodes: %d", len(manifest_episodes), len(failed_episodes))
         logging.info("Total wall time: %s", _format_duration(time.time() - run_start_ts))
         logging.info("Manifest: %s", dataset_root / "manifest.json")
+        logging.info("Image index: %s (%d rows)", image_index_path, image_index_rows)
         logging.info("=" * 72)
 
+    except BaseException as exc:
+        err_text = str(exc) if str(exc) else exc.__class__.__name__
+        update_last_event("dataset", "failed", message=err_text)
+        persist_run_status("failed", force=True, error=err_text)
+        raise
     finally:
         restore_backup(parameters_path, backup_path)
         logging.info("Restored %s from backup", parameters_path)
