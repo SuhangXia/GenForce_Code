@@ -3,8 +3,9 @@
 Training script for the Universal Scale Adapter (USA).
 
 Reads datasets/usa_static_v1/manifest.json with physically isolated Train/Val/Test splits:
-  - Test: 4 indenters (pacman, wave, torus, hexagon) — zero-shot generalization
-  - Train/Val: remaining indenters, 85% / 15% split
+  - Train: 12 seen indenters
+  - Val: 2 seen indenters
+  - Test: 4 unseen indenters (pacman, wave, torus, hexagon) — zero-shot generalization
 
 Pairing modes:
   - train: random (scale_A, scale_B) pairs
@@ -17,6 +18,7 @@ Usage:
 """
 
 import argparse
+import csv
 import itertools
 import json
 import logging
@@ -43,7 +45,24 @@ from usa_adapter import UniversalScaleAdapter
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATASET = PROJECT_ROOT / "datasets" / "usa_static_v1"
 
-# Indenters held out EXCLUSIVELY for test (zero-shot)
+# Fixed indenter-level split for USA training/evaluation.
+TRAIN_INDENTERS = frozenset(
+    {
+        "cone",
+        "cylinder",
+        "cylinder_sh",
+        "cylinder_si",
+        "dotin",
+        "dots",
+        "hemisphere",
+        "line",
+        "moon",
+        "prism",
+        "random",
+        "sphere",
+    }
+)
+VAL_INDENTERS = frozenset({"sphere_s", "triangle"})
 TEST_INDENTERS = frozenset({"pacman", "wave", "torus", "hexagon"})
 
 # Anchor scale for val/test (stable metrics)
@@ -56,6 +75,27 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+for noisy_logger_name in ("httpx", "huggingface_hub", "urllib3"):
+    logging.getLogger(noisy_logger_name).setLevel(logging.ERROR)
+
+METRICS_CSV_COLUMNS = [
+    "epoch",
+    "global_step",
+    "lr",
+    "train_loss",
+    "train_mse",
+    "train_cos_loss",
+    "train_cos",
+    "val_loss",
+    "val_mse",
+    "val_cos_loss",
+    "val_cos",
+    "best_val_loss",
+    "best_val_cos",
+    "epoch_seconds",
+    "elapsed_seconds",
+    "eta_seconds",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +141,9 @@ class MultiscaleTactileDataset(Dataset):
         self._coord_cache: dict[Path, torch.Tensor] = {}
         self._warned_no_common: set[tuple[int, str, str]] = set()
         self._log_samples_done = 0
-        self._max_sample_logs = 8
+        self._max_sample_logs = 0
         self._coord_logs_done = 0
-        self._max_coord_logs = 8
+        self._max_coord_logs = 0
 
         img_size = 224
         if augment:
@@ -356,12 +396,13 @@ class MultiscaleTactileDataset(Dataset):
 def load_manifest_and_split(
     manifest_path: Path,
     dataset_root: Path,
+    train_indenters: frozenset[str],
+    val_indenters: frozenset[str],
     test_indenters: frozenset[str],
-    train_ratio: float = 0.85,
     seed: int = 42,
 ) -> tuple[list[int], list[int], list[int], dict[int, dict], dict]:
     """
-    Load manifest, split by indenter. Load full metadata (incl. scales) from each episode.
+    Load manifest, split by explicit indenter groups. Load full metadata (incl. scales) from each episode.
     Returns (train_ids, val_ids, test_ids, episode_meta, manifest_info).
     """
     with open(manifest_path) as f:
@@ -394,20 +435,37 @@ def load_manifest_and_split(
         ind = episode_meta[eid].get("indenter", ep.get("indenter", "unknown"))
         by_indenter.setdefault(ind, []).append(eid)
 
+    if train_indenters & val_indenters:
+        raise ValueError(f"Train/val indenter overlap: {sorted(train_indenters & val_indenters)}")
+    if train_indenters & test_indenters:
+        raise ValueError(f"Train/test indenter overlap: {sorted(train_indenters & test_indenters)}")
+    if val_indenters & test_indenters:
+        raise ValueError(f"Val/test indenter overlap: {sorted(val_indenters & test_indenters)}")
+
+    assigned_indenters = set(train_indenters) | set(val_indenters) | set(test_indenters)
+    actual_indenters = set(by_indenter.keys())
+    missing_indenters = sorted(assigned_indenters - actual_indenters)
+    unexpected_indenters = sorted(actual_indenters - assigned_indenters)
+    if missing_indenters:
+        raise RuntimeError(f"Manifest is missing expected indenters for split: {missing_indenters}")
+    if unexpected_indenters:
+        raise RuntimeError(f"Manifest contains indenters not assigned to a split: {unexpected_indenters}")
+
     train_ids = []
     val_ids = []
     test_ids = []
 
     rng = random.Random(seed)
-    for ind, ids in by_indenter.items():
+    for ind, ids in sorted(by_indenter.items()):
         rng.shuffle(ids)
-        if ind in test_indenters:
+        if ind in train_indenters:
+            train_ids.extend(ids)
+        elif ind in val_indenters:
+            val_ids.extend(ids)
+        elif ind in test_indenters:
             test_ids.extend(ids)
         else:
-            n = len(ids)
-            n_train = max(1, int(n * train_ratio))
-            train_ids.extend(ids[:n_train])
-            val_ids.extend(ids[n_train:])
+            raise RuntimeError(f"Indenter {ind!r} is not assigned to any split")
 
     return train_ids, val_ids, test_ids, episode_meta, manifest_info
 
@@ -483,6 +541,21 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:02d}m{secs:02d}s"
 
 
+def initialize_metrics_csv(path: Path, overwrite: bool) -> None:
+    mode = "w" if overwrite else "a"
+    need_header = overwrite or (not path.exists())
+    with open(path, mode, encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=METRICS_CSV_COLUMNS)
+        if need_header:
+            writer.writeheader()
+
+
+def append_metrics_row(path: Path, row: dict) -> None:
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=METRICS_CSV_COLUMNS)
+        writer.writerow({key: row.get(key, "") for key in METRICS_CSV_COLUMNS})
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -504,13 +577,21 @@ def train(args):
     train_ids, val_ids, test_ids, episode_meta, manifest_info = load_manifest_and_split(
         manifest_path,
         dataset_root=dataset_root,
+        train_indenters=TRAIN_INDENTERS,
+        val_indenters=VAL_INDENTERS,
         test_indenters=TEST_INDENTERS,
-        train_ratio=args.train_ratio,
         seed=args.seed,
     )
 
-    log.info("Split: train=%d val=%d test=%d (test indenters: %s)",
-             len(train_ids), len(val_ids), len(test_ids), sorted(TEST_INDENTERS))
+    log.info(
+        "Split: train=%d val=%d test=%d | train indenters=%s | val indenters=%s | test indenters=%s",
+        len(train_ids),
+        len(val_ids),
+        len(test_ids),
+        sorted(TRAIN_INDENTERS),
+        sorted(VAL_INDENTERS),
+        sorted(TEST_INDENTERS),
+    )
 
     vit = FrozenViTFeatureExtractor(device=device)
     backbone_tokens = vit.patch_token_count
@@ -599,7 +680,9 @@ def train(args):
     )
 
     if args.test_only:
-        ckpt_dir = PROJECT_ROOT / "checkpoints" / "usa_adapter"
+        ckpt_dir = Path(args.checkpoint_dir).expanduser()
+        if not ckpt_dir.is_absolute():
+            ckpt_dir = (PROJECT_ROOT / ckpt_dir).resolve()
         adapter = UniversalScaleAdapter(
             embed_dim=vit.embed_dim, num_heads=8, num_layers=2
         ).to(device)
@@ -774,8 +857,14 @@ def train(args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    ckpt_dir = PROJECT_ROOT / "checkpoints" / "usa_adapter"
+    ckpt_dir = Path(args.checkpoint_dir).expanduser()
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = (PROJECT_ROOT / ckpt_dir).resolve()
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Checkpoint dir: %s", ckpt_dir)
+    metrics_csv_path = ckpt_dir / "metrics.csv"
+    initialize_metrics_csv(metrics_csv_path, overwrite=(args.resume_from is None))
+    log.info("Metrics CSV: %s", metrics_csv_path)
 
     best_val_loss = float("inf")
     best_val_cos = -1.0
@@ -949,17 +1038,6 @@ def train(args):
                 cos=f"{cos:.4f}",
             )
 
-            if not args.sanity_check and n_batches % max(1, args.log_every * 10) == 0:
-                log.info(
-                    "  [%d/%d] loss=%.6f mse=%.6f cos_loss=%.6f cos=%.4f",
-                    n_batches,
-                    batches_per_epoch,
-                    loss.item(),
-                    mse_component.item(),
-                    cos_component.item(),
-                    cos,
-                )
-
             if not args.sanity_check:
                 scheduler.step()
 
@@ -973,6 +1051,7 @@ def train(args):
         remaining_epochs = max(args.epochs - epoch, 0)
         eta_seconds = remaining_epochs * avg_epoch_time
         total_elapsed = time.time() - train_start_time
+        lr_now = optimizer.param_groups[0]["lr"]
         time_suffix = (
             f"epoch_t={_format_duration(epoch_elapsed)} "
             f"elapsed={_format_duration(total_elapsed)} "
@@ -1040,38 +1119,55 @@ def train(args):
             if val_cos > best_val_cos:
                 best_val_cos = val_cos
 
-            if epoch % args.log_every == 0 or epoch == 1:
-                lr_now = optimizer.param_groups[0]["lr"]
-                log.info(
-                    "Epoch %3d/%d  train_loss=%.6f train_mse=%.6f train_cos_loss=%.6f train_cos=%.4f  "
-                    "val_loss=%.6f val_mse=%.6f val_cos_loss=%.6f val_cos=%.4f  lr=%.2e  %s",
-                    epoch,
-                    args.epochs,
-                    avg_loss,
-                    avg_mse_component,
-                    avg_cos_component,
-                    avg_train_cos,
-                    val_loss,
-                    val_mse_component,
-                    val_cos_component,
-                    val_cos,
-                    lr_now,
-                    time_suffix,
-                )
+            log.info(
+                "Epoch %3d/%d  train_loss=%.6f train_mse=%.6f train_cos_loss=%.6f train_cos=%.4f  "
+                "val_loss=%.6f val_mse=%.6f val_cos_loss=%.6f val_cos=%.4f  lr=%.2e  %s",
+                epoch,
+                args.epochs,
+                avg_loss,
+                avg_mse_component,
+                avg_cos_component,
+                avg_train_cos,
+                val_loss,
+                val_mse_component,
+                val_cos_component,
+                val_cos,
+                lr_now,
+                time_suffix,
+            )
+            append_metrics_row(
+                metrics_csv_path,
+                {
+                    "epoch": int(epoch),
+                    "global_step": int(step),
+                    "lr": float(lr_now),
+                    "train_loss": float(avg_loss),
+                    "train_mse": float(avg_mse_component),
+                    "train_cos_loss": float(avg_cos_component),
+                    "train_cos": float(avg_train_cos),
+                    "val_loss": float(val_loss),
+                    "val_mse": float(val_mse_component),
+                    "val_cos_loss": float(val_cos_component),
+                    "val_cos": float(val_cos),
+                    "best_val_loss": float(best_val_loss),
+                    "best_val_cos": float(best_val_cos),
+                    "epoch_seconds": float(epoch_elapsed),
+                    "elapsed_seconds": float(total_elapsed),
+                    "eta_seconds": float(eta_seconds),
+                },
+            )
         else:
-            if epoch % args.log_every == 0 or epoch == 1:
-                lr_now = optimizer.param_groups[0]["lr"]
-                log.info(
-                    "Epoch %3d/%d  loss=%.6f mse=%.6f cos_loss=%.6f cos=%.4f  lr=%.2e  %s",
-                    epoch,
-                    args.epochs,
-                    avg_loss,
-                    avg_mse_component,
-                    avg_cos_component,
-                    avg_train_cos,
-                    lr_now,
-                    time_suffix,
-                )
+            log.info(
+                "Epoch %3d/%d  loss=%.6f mse=%.6f cos_loss=%.6f cos=%.4f  lr=%.2e  %s",
+                epoch,
+                args.epochs,
+                avg_loss,
+                avg_mse_component,
+                avg_cos_component,
+                avg_train_cos,
+                lr_now,
+                time_suffix,
+            )
 
             if args.sanity_check and avg_loss < 0.001:
                 log.info("Sanity check PASSED: loss -> 0")
@@ -1084,6 +1180,23 @@ def train(args):
                     epoch=epoch,
                     loss=avg_loss,
                 )
+            append_metrics_row(
+                metrics_csv_path,
+                {
+                    "epoch": int(epoch),
+                    "global_step": int(step),
+                    "lr": float(lr_now),
+                    "train_loss": float(avg_loss),
+                    "train_mse": float(avg_mse_component),
+                    "train_cos_loss": float(avg_cos_component),
+                    "train_cos": float(avg_train_cos),
+                    "best_val_loss": float(best_val_loss),
+                    "best_val_cos": float(best_val_cos),
+                    "epoch_seconds": float(epoch_elapsed),
+                    "elapsed_seconds": float(total_elapsed),
+                    "eta_seconds": float(eta_seconds),
+                },
+            )
 
         if epoch % args.save_every == 0 and not args.sanity_check:
             save_checkpoint(
@@ -1169,6 +1282,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train USA adapter (datasets/usa_static_v1)")
     p.add_argument("--dataset", type=str, default=str(DEFAULT_DATASET),
                    help="Path to datasets/usa_static_v1")
+    p.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=str(PROJECT_ROOT / "checkpoints" / "usa_adapter"),
+        help="Directory for training checkpoints (best.pt and periodic epoch checkpoints).",
+    )
     p.add_argument("--scales", nargs="+", type=int, default=[15, 18, 20, 22, 25])
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)
@@ -1178,8 +1297,12 @@ def parse_args():
                    help="Weight for MSE feature-matching term.")
     p.add_argument("--lambda_cos", type=float, default=0.5,
                    help="Weight for cosine feature-alignment term (1-cosine_similarity).")
-    p.add_argument("--train_ratio", type=float, default=0.85,
-                   help="Train ratio for non-test indenters (val = 1 - train_ratio)")
+    p.add_argument(
+        "--train_ratio",
+        type=float,
+        default=0.85,
+        help="Deprecated and ignored. Train/val/test are now fixed by explicit indenter lists in the script.",
+    )
     p.add_argument("--pairs_per_epoch", type=int, default=2000)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--warmup_epochs", type=int, default=5)
