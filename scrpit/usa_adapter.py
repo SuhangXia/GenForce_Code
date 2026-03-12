@@ -249,7 +249,6 @@ class UniversalScaleAdapter(nn.Module):
         context_coord_map_mm: torch.Tensor | None = None,
         query_coord_map_mm: torch.Tensor | None = None,
         context_valid_mask: torch.Tensor | None = None,
-        query_valid_mask: torch.Tensor | None = None,
         **legacy_kwargs,
     ) -> torch.Tensor:
         """
@@ -258,7 +257,6 @@ class UniversalScaleAdapter(nn.Module):
             context_coord_map_mm: (B,Hc,Wc,2) or (B,Nc,2)
             query_coord_map_mm: (B,Hq,Wq,2) or (B,Nq,2)
             context_valid_mask: optional bool mask, True=valid, shape (B,Hc,Wc) or (B,Nc)
-            query_valid_mask: optional bool mask, True=valid, shape (B,Hq,Wq) or (B,Nq)
         Returns:
             (B,Hq,Wq,D) if query_coord_map_mm is 4D, else (B,Nq,D)
         """
@@ -311,7 +309,6 @@ class UniversalScaleAdapter(nn.Module):
         nq = query_coords_flat.shape[1]
 
         context_valid_flat = self._flatten_mask("context_valid_mask", context_valid_mask, b, nc)
-        query_valid_flat = self._flatten_mask("query_valid_mask", query_valid_mask, b, nq)
 
         device = context_feat_flat.device
         dtype = context_feat_flat.dtype
@@ -320,8 +317,34 @@ class UniversalScaleAdapter(nn.Module):
 
         if context_valid_flat is not None:
             context_valid_flat = context_valid_flat.to(device=device)
-        if query_valid_flat is not None:
-            query_valid_flat = query_valid_flat.to(device=device)
+
+        eps = 1e-4
+        if context_valid_flat is None:
+            min_bounds = context_coords_flat.min(dim=1, keepdim=True).values
+            max_bounds = context_coords_flat.max(dim=1, keepdim=True).values
+        else:
+            if not torch.all(context_valid_flat.any(dim=1)):
+                raise ValueError("context_valid_mask leaves at least one batch element with zero valid context tokens")
+
+            valid_context = context_valid_flat.unsqueeze(-1)
+            coord_max = torch.finfo(dtype).max
+            coord_min = torch.finfo(dtype).min
+            min_bounds = torch.where(
+                valid_context,
+                context_coords_flat,
+                torch.full_like(context_coords_flat, coord_max),
+            ).min(dim=1, keepdim=True).values
+            max_bounds = torch.where(
+                valid_context,
+                context_coords_flat,
+                torch.full_like(context_coords_flat, coord_min),
+            ).max(dim=1, keepdim=True).values
+
+        is_valid = (
+            (query_coords_flat >= (min_bounds - eps))
+            & (query_coords_flat <= (max_bounds + eps))
+        )
+        query_valid_flat = is_valid[..., 0] & is_valid[..., 1]
 
         context_pos_enc = self.coord_encoder(context_coords_flat)
         query_pos_enc = self.coord_encoder(query_coords_flat)
@@ -332,10 +355,8 @@ class UniversalScaleAdapter(nn.Module):
         context_v = context_feat_flat
 
         context_key_padding_mask = None if context_valid_flat is None else (~context_valid_flat)
-        query_key_padding_mask = None if query_valid_flat is None else (~query_valid_flat)
-
-        if query_valid_flat is not None:
-            query_state = query_state.masked_fill(~query_valid_flat.unsqueeze(-1), 0.0)
+        query_key_padding_mask = ~query_valid_flat
+        query_state = query_state.masked_fill(~query_valid_flat.unsqueeze(-1), 0.0)
 
         for layer in self.layers:
             query_state = layer(
@@ -349,8 +370,7 @@ class UniversalScaleAdapter(nn.Module):
 
         if self.final_norm is not None:
             query_state = self.final_norm(query_state)
-        if query_valid_flat is not None:
-            query_state = query_state.masked_fill(~query_valid_flat.unsqueeze(-1), 0.0)
+        query_state = query_state.masked_fill(~query_valid_flat.unsqueeze(-1), 0.0)
 
         if query_hw is not None:
             hq, wq = query_hw
