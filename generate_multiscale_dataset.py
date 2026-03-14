@@ -705,6 +705,9 @@ class EpisodeState:
     indenter: str
     x_mm: float
     y_mm: float
+    x_norm: float
+    y_norm: float
+    reference_scale_mm: float
     depth_mm: float
     episode_dir: Path
     scales: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -765,6 +768,8 @@ def make_scale_progress_entry(
     indenter: str,
     x_mm: float,
     y_mm: float,
+    x_norm: float,
+    y_norm: float,
     depth_mm: float,
     frame_sampling_mode: str,
     frame_depth_targets_mm: Sequence[float] | None,
@@ -778,6 +783,8 @@ def make_scale_progress_entry(
         "contact": {
             "x_mm": float(x_mm),
             "y_mm": float(y_mm),
+            "x_norm": float(x_norm),
+            "y_norm": float(y_norm),
             "depth_mm": float(depth_mm),
         },
         "frame_sampling_mode": str(frame_sampling_mode),
@@ -865,6 +872,20 @@ def format_coord_suffix(v: float) -> str:
         return str(int(round(v)))
     s = f"{float(v):.4f}".rstrip("0").rstrip(".")
     return "0" if s == "-0" else s
+
+
+def normalized_contact_from_reference_mm(x_mm: float, y_mm: float, reference_scale_mm: float) -> Tuple[float, float]:
+    if reference_scale_mm <= 0:
+        raise ValueError(f"reference_scale_mm must be > 0, got {reference_scale_mm}")
+    half_scale = float(reference_scale_mm) / 2.0
+    return float(x_mm) / half_scale, float(y_mm) / half_scale
+
+
+def contact_mm_from_normalized(x_norm: float, y_norm: float, scale_mm: float) -> Tuple[float, float]:
+    if scale_mm <= 0:
+        raise ValueError(f"scale_mm must be > 0, got {scale_mm}")
+    half_scale = float(scale_mm) / 2.0
+    return float(x_norm) * half_scale, float(y_norm) * half_scale
 
 
 def expected_npz_path(npz_root: Path, indenter: str, x_mm: float, y_mm: float, depth_mm: float) -> Path:
@@ -1058,8 +1079,8 @@ def build_image_index_csv(dataset_root: Path) -> Tuple[Path, int]:
                             "episode_dir": episode_dir_name,
                             "indenter_name": episode_meta.get("indenter", episode_entry.get("indenter", "")),
                             "particle": episode_meta.get("particle", manifest.get("particle", "")),
-                            "command_x_mm": contact.get("x_mm", ""),
-                            "command_y_mm": contact.get("y_mm", ""),
+                            "command_x_mm": scale_meta.get("contact_x_mm", contact.get("x_mm", "")),
+                            "command_y_mm": scale_meta.get("contact_y_mm", contact.get("y_mm", "")),
                             "command_depth_mm": contact.get("depth_mm", ""),
                             "scale_key": scale_key,
                             "scale_mm": scale_mm,
@@ -1282,6 +1303,8 @@ def validate_existing_scale_metadata(
     expected_marker_files: Sequence[str] | None = None,
     expected_frame_sampling_mode: str | None = None,
     expected_frame_depth_targets_mm: Sequence[float] | None = None,
+    expected_contact_x_mm: float | None = None,
+    expected_contact_y_mm: float | None = None,
 ) -> bool:
     if not isinstance(scale_meta, dict):
         return False
@@ -1307,6 +1330,15 @@ def validate_existing_scale_metadata(
         for a, b in zip(got_targets, expected_frame_depth_targets_mm):
             if abs(float(a) - float(b)) > 1e-3:
                 return False
+
+    if expected_contact_x_mm is not None:
+        got_x = scale_meta.get("contact_x_mm")
+        if got_x is None or abs(float(got_x) - float(expected_contact_x_mm)) > 1e-4:
+            return False
+    if expected_contact_y_mm is not None:
+        got_y = scale_meta.get("contact_y_mm")
+        if got_y is None or abs(float(got_y) - float(expected_contact_y_mm)) > 1e-4:
+            return False
 
     frames = scale_meta.get("frames")
     if not isinstance(frames, dict) or len(frames) == 0:
@@ -1946,12 +1978,18 @@ def main() -> None:
     physics_tasks: List[Dict[str, Any]] = []
     scale_progress: Dict[str, Dict[str, Any]] = {}
     resume_scales_from_metadata = 0
+    contact_reference_scale_mm = float(max(args.scales_mm))
 
     episode_id = 0
     for indenter in indenter_names:
         for _ in range(args.episodes_per_indenter):
             x_mm = round(rng.uniform(args.x_min, args.x_max), 4)
             y_mm = round(rng.uniform(args.y_min, args.y_max), 4)
+            x_norm, y_norm = normalized_contact_from_reference_mm(
+                x_mm=x_mm,
+                y_mm=y_mm,
+                reference_scale_mm=contact_reference_scale_mm,
+            )
             episode_frame_depth_targets_mm: List[float] | None = None
             if args.frame_sampling_mode == "depth_random":
                 episode_frame_depth_targets_mm = make_stratified_random_frame_depth_targets_mm(
@@ -1976,6 +2014,9 @@ def main() -> None:
                 indenter=indenter,
                 x_mm=x_mm,
                 y_mm=y_mm,
+                x_norm=x_norm,
+                y_norm=y_norm,
+                reference_scale_mm=contact_reference_scale_mm,
                 depth_mm=depth_mm,
                 episode_dir=episode_dir,
             )
@@ -1995,14 +2036,23 @@ def main() -> None:
             prepared_scales = 0
             skipped_scales = 0
             for scale_mm in args.scales_mm:
+                scale_contact_x_mm, scale_contact_y_mm = contact_mm_from_normalized(
+                    x_norm=x_norm,
+                    y_norm=y_norm,
+                    scale_mm=float(scale_mm),
+                )
+                scale_contact_x_mm = round(scale_contact_x_mm, 4)
+                scale_contact_y_mm = round(scale_contact_y_mm, 4)
                 scale_key = f"scale_{int(scale_mm)}mm"
                 progress_key = make_scale_progress_key(episode_id, int(scale_mm))
                 scale_progress[progress_key] = make_scale_progress_entry(
                     episode_id=episode_id,
                     scale_mm=int(scale_mm),
                     indenter=indenter,
-                    x_mm=x_mm,
-                    y_mm=y_mm,
+                    x_mm=scale_contact_x_mm,
+                    y_mm=scale_contact_y_mm,
+                    x_norm=x_norm,
+                    y_norm=y_norm,
                     depth_mm=depth_mm,
                     frame_sampling_mode=str(args.frame_sampling_mode),
                     frame_depth_targets_mm=episode_frame_depth_targets_mm,
@@ -2016,6 +2066,8 @@ def main() -> None:
                         expected_marker_files=expected_marker_files,
                         expected_frame_sampling_mode=str(args.frame_sampling_mode),
                         expected_frame_depth_targets_mm=episode_frame_depth_targets_mm,
+                        expected_contact_x_mm=scale_contact_x_mm,
+                        expected_contact_y_mm=scale_contact_y_mm,
                     ):
                         episode_states[episode_id].scales[scale_key] = scale_meta
                         resume_scales_from_metadata += 1
@@ -2058,8 +2110,8 @@ def main() -> None:
                         "episode_id": episode_id,
                         "scale_mm": int(scale_mm),
                         "indenter": indenter,
-                        "x_mm": x_mm,
-                        "y_mm": y_mm,
+                        "x_mm": scale_contact_x_mm,
+                        "y_mm": scale_contact_y_mm,
                         "depth_mm": depth_mm,
                         "repo_root": str(repo_root),
                         "particle": str(args.particle),
@@ -2092,12 +2144,14 @@ def main() -> None:
                 prepared_scales += 1
 
             logging.info(
-                "Prepared episode_%06d | indenter=%s | contact=(x=%.4f, y=%.4f, d=%.1f) | queued_scales=%d skipped_scales=%d%s",
+                "Prepared episode_%06d | indenter=%s | contact_ref=(x=%.4f, y=%.4f @ %.1fmm) | contact_norm=(x=%.4f, y=%.4f) | queued_scales=%d skipped_scales=%d%s",
                 episode_id,
                 indenter,
                 x_mm,
                 y_mm,
-                depth_mm,
+                contact_reference_scale_mm,
+                x_norm,
+                y_norm,
                 prepared_scales,
                 skipped_scales,
                 (
@@ -2272,6 +2326,9 @@ def main() -> None:
                 "x_mm": state.x_mm,
                 "y_mm": state.y_mm,
                 "depth_mm": state.depth_mm,
+                "reference_scale_mm": state.reference_scale_mm,
+                "x_norm": state.x_norm,
+                "y_norm": state.y_norm,
             },
             "image_resolution": {"width": DEFAULT_IMAGE_RES[0], "height": DEFAULT_IMAGE_RES[1]},
             "scales": state.scales,
@@ -2300,6 +2357,8 @@ def main() -> None:
             "scale_mm": int(scale_state.scale_mm),
             "contact_x_mm": float(scale_state.contact_x_mm),
             "contact_y_mm": float(scale_state.contact_y_mm),
+            "contact_x_norm": float(ep_state.x_norm),
+            "contact_y_norm": float(ep_state.y_norm),
             "contact_depth_mm": float(scale_state.contact_depth_mm),
             "deformation_stats_final": scale_state.deformation_stats_final,
             "trajectory_length": int(scale_state.trajectory_length),
@@ -2882,6 +2941,9 @@ def main() -> None:
                     "x_mm": state.x_mm,
                     "y_mm": state.y_mm,
                     "depth_mm": state.depth_mm,
+                    "reference_scale_mm": state.reference_scale_mm,
+                    "x_norm": state.x_norm,
+                    "y_norm": state.y_norm,
                 },
                 "image_resolution": {"width": DEFAULT_IMAGE_RES[0], "height": DEFAULT_IMAGE_RES[1]},
                 "scales": state.scales,
@@ -2901,6 +2963,9 @@ def main() -> None:
                         "x_mm": state.x_mm,
                         "y_mm": state.y_mm,
                         "depth_mm": state.depth_mm,
+                        "reference_scale_mm": state.reference_scale_mm,
+                        "x_norm": state.x_norm,
+                        "y_norm": state.y_norm,
                     },
                 }
             )

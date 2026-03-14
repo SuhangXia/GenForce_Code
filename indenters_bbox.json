@@ -1,0 +1,227 @@
+{
+  "meta": {
+    "indenter_dir": "/home/suhang/projects/test_code/GenForce_Code/sim/assets/indenters/input/npy_100000",
+    "config": "/home/suhang/projects/test_code/GenForce_Code/sim/parameters.yml",
+    "z_fraction": 0.08,
+    "square_bbox": true,
+    "margin_mm": 0.2
+  },
+  "indenters": {
+    "cone": {
+      "bbox_mm": [
+        -1.2176,
+        -1.2519,
+        1.2783,
+        1.244
+      ],
+      "width_mm": 2.4959,
+      "height_mm": 2.4959,
+      "contact_points_count": 608,
+      "square_side_mm": 2.4959
+    },
+    "cylinder": {
+      "bbox_mm": [
+        -3.1692,
+        -3.1999,
+        3.2307,
+        3.1999
+      ],
+      "width_mm": 6.3999,
+      "height_mm": 6.3999,
+      "contact_points_count": 3463,
+      "square_side_mm": 6.3999
+    },
+    "cylinder_sh": {
+      "bbox_mm": [
+        -3.6681,
+        -3.7001,
+        3.7314,
+        3.6995
+      ],
+      "width_mm": 7.3995,
+      "height_mm": 7.3995,
+      "contact_points_count": 4197,
+      "square_side_mm": 7.3995
+    },
+    "cylinder_si": {
+      "bbox_mm": [
+        -7.1739,
+        -7.2,
+        7.2261,
+        7.2
+      ],
+      "width_mm": 14.4,
+      "height_mm": 14.4,
+      "contact_points_count": 5667,
+      "square_side_mm": 14.4
+    },
+    "dotin": {
+      "bbox_mm": [
+        -4.1707,
+        -4.2013,
+        4.2318,
+        4.2013
+      ],
+      "width_mm": 8.4025,
+      "height_mm": 8.4025,
+      "contact_points_count": 6820,
+      "square_side_mm": 8.4025
+    },
+    "dots": {
+      "bbox_mm": [
+        -7.1707,
+        -7.2005,
+        7.2302,
+        7.2005
+      ],
+      "width_mm": 14.4009,
+      "height_mm": 14.4009,
+      "contact_points_count": 10443,
+      "square_side_mm": 14.4009
+    },
+    "hemisphere": {
+      "bbox_mm": [
+        -7.1707,
+        -7.2002,
+        7.2298,
+        7.2002
+      ],
+      "width_mm": 14.4005,
+      "height_mm": 14.4005,
+      "contact_points_count": 8430,
+      "square_side_mm": 14.4005
+    },
+    "hexagon": {
+      "bbox_mm": [
+        -3.6661,
+        -3.6966,
+        3.7271,
+        3.6966
+      ],
+      "width_mm": 7.3931,
+      "height_mm": 7.3931,
+      "contact_points_count": 3917,
+      "square_side_mm": 7.3931
+    },
+    "line": {
+      "bbox_mm": [
+        -8.1694,
+        -8.2,
+        8.2306,
+        8.2
+      ],
+      "width_mm": 16.4,
+      "height_mm": 16.4,
+      "contact_points_count": 4910,
+      "square_side_mm": 16.4
+    },
+    "moon": {
+      "bbox_mm": [
+        -3.0702,
+        -3.6961,
+        4.3224,
+        3.6965
+      ],
+      "width_mm": 7.3926,
+      "height_mm": 7.3926,
+      "contact_points_count": 3494,
+      "square_side_mm": 7.3926
+    },
+    "pacman": {
+      "bbox_mm": [
+        -2.92,
+        -3.19,
+        3.4643,
+        3.1943
+      ],
+      "width_mm": 6.3843,
+      "height_mm": 6.3843,
+      "contact_points_count": 3355,
+      "square_side_mm": 6.3843
+    },
+    "prism": {
+      "bbox_mm": [
+        -3.6694,
+        -3.7,
+        3.7306,
+        3.7
+      ],
+      "width_mm": 7.4,
+      "height_mm": 7.4,
+      "contact_points_count": 4239,
+      "square_side_mm": 7.4
+    },
+    "random": {
+      "bbox_mm": [
+        -3.7719,
+        -3.6562,
+        3.6027,
+        3.7185
+      ],
+      "width_mm": 7.3746,
+      "height_mm": 7.3746,
+      "contact_points_count": 3036,
+      "square_side_mm": 7.3746
+    },
+    "sphere": {
+      "bbox_mm": [
+        -3.8204,
+        -3.8637,
+        3.8632,
+        3.8199
+      ],
+      "width_mm": 7.6836,
+      "height_mm": 7.6836,
+      "contact_points_count": 2912,
+      "square_side_mm": 7.6836
+    },
+    "sphere_s": {
+      "bbox_mm": [
+        -2.7965,
+        -2.8459,
+        2.8574,
+        2.808
+      ],
+      "width_mm": 5.6539,
+      "height_mm": 5.6539,
+      "contact_points_count": 1788,
+      "square_side_mm": 5.6539
+    },
+    "torus": {
+      "bbox_mm": [
+        -4.6684,
+        -4.6972,
+        4.7224,
+        4.6936
+      ],
+      "width_mm": 9.3909,
+      "height_mm": 9.3909,
+      "contact_points_count": 4878,
+      "square_side_mm": 9.3909
+    },
+    "triangle": {
+      "bbox_mm": [
+        -3.6672,
+        -3.6968,
+        3.727,
+        3.6974
+      ],
+      "width_mm": 7.3942,
+      "height_mm": 7.3942,
+      "contact_points_count": 2464,
+      "square_side_mm": 7.3942
+    },
+    "wave": {
+      "bbox_mm": [
+        -8.2525,
+        -7.2,
+        6.1475,
+        7.2
+      ],
+      "width_mm": 14.4,
+      "height_mm": 14.4,
+      "contact_points_count": 9466,
+      "square_side_mm": 14.4
+    }
+  }
+}
