@@ -1,5 +1,6 @@
 import math
 import warnings
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -78,7 +79,7 @@ class RelativeCoordBias(nn.Module):
     def __init__(self, num_heads: int, hidden_dim: int = 64):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(2, hidden_dim),
+            nn.Linear(4, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_heads),
         )
@@ -88,7 +89,12 @@ class RelativeCoordBias(nn.Module):
         delta_coords: (B, Nq, Nc, 2)
         returns:      (B, H, Nq, Nc)
         """
-        bias = self.mlp(delta_coords)  # (B, Nq, Nc, H)
+        dx = delta_coords[..., 0:1]
+        dy = delta_coords[..., 1:2]
+        r2 = dx.square() + dy.square()
+        r = torch.sqrt(r2 + 1e-8)
+        geom = torch.cat([dx, dy, r, r2], dim=-1)
+        bias = self.mlp(geom)  # (B, Nq, Nc, H)
         return bias.permute(0, 3, 1, 2).contiguous()
 
 
@@ -138,7 +144,12 @@ class CrossAttentionWithBias(nn.Module):
                 raise ValueError(
                     f"key_padding_mask shape must be {(b, nc)}, got {tuple(key_padding_mask.shape)}"
                 )
-            logits = logits.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+            safe_key_padding_mask = key_padding_mask
+            all_masked = safe_key_padding_mask.all(dim=1)
+            if all_masked.any():
+                safe_key_padding_mask = safe_key_padding_mask.clone()
+                safe_key_padding_mask[all_masked, 0] = False
+            logits = logits.masked_fill(safe_key_padding_mask[:, None, None, :], float("-inf"))
 
         attn = F.softmax(logits, dim=-1)
         attn = self.dropout(attn)
@@ -205,11 +216,17 @@ class USAQueryDecoderBlock(nn.Module):
     ) -> torch.Tensor:
         # Self-attention on query tokens
         q_norm = self.self_norm(query_state)
+        safe_query_key_padding_mask = query_key_padding_mask
+        if safe_query_key_padding_mask is not None:
+            all_masked = safe_query_key_padding_mask.all(dim=1)
+            if all_masked.any():
+                safe_query_key_padding_mask = safe_query_key_padding_mask.clone()
+                safe_query_key_padding_mask[all_masked, 0] = False
         self_out, _ = self.self_attn(
             query=q_norm,
             key=q_norm,
             value=q_norm,
-            key_padding_mask=query_key_padding_mask,
+            key_padding_mask=safe_query_key_padding_mask,
             need_weights=False,
         )
         query_state = query_state + self.dropout(self_out)
@@ -317,12 +334,92 @@ class UniversalScaleAdapter(nn.Module):
         self.use_final_norm = bool(use_final_norm)
         self.final_norm = nn.LayerNorm(self.embed_dim) if self.use_final_norm else None
 
+        mix_init = torch.tensor([2.0, -2.0], dtype=torch.float32)
         if learnable_output_gate:
-            self.interp_gate = nn.Parameter(torch.tensor(1.0))
-            self.adapter_gate = nn.Parameter(torch.tensor(1.0))
+            self.mix_logits = nn.Parameter(mix_init.clone())
         else:
-            self.register_buffer("interp_gate", torch.tensor(1.0), persistent=False)
-            self.register_buffer("adapter_gate", torch.tensor(1.0), persistent=False)
+            self.register_buffer(
+                "mix_logits",
+                mix_init,
+                persistent=False,
+            )
+
+    @staticmethod
+    def _coerce_legacy_gate_value(value: torch.Tensor | float | int) -> torch.Tensor:
+        tensor = torch.as_tensor(value, dtype=torch.float32).detach().reshape(-1)
+        if tensor.numel() == 0:
+            raise ValueError("Legacy gate tensor is empty")
+        return tensor[0]
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        mix_key = prefix + "mix_logits"
+        legacy_logit_keys = {
+            "interp": prefix + "interp_gate_logit",
+            "adapter": prefix + "adapter_gate_logit",
+        }
+        legacy_scalar_keys = {
+            "interp": prefix + "interp_gate",
+            "adapter": prefix + "adapter_gate",
+        }
+
+        if mix_key not in state_dict:
+            default_mix = torch.softmax(self.mix_logits.detach().to(dtype=torch.float32), dim=0)
+            interp_weight = default_mix[0]
+            adapter_weight = default_mix[1]
+            used_legacy = False
+
+            if legacy_logit_keys["interp"] in state_dict:
+                interp_weight = torch.sigmoid(
+                    self._coerce_legacy_gate_value(state_dict[legacy_logit_keys["interp"]])
+                )
+                used_legacy = True
+            elif legacy_scalar_keys["interp"] in state_dict:
+                interp_weight = F.softplus(
+                    self._coerce_legacy_gate_value(state_dict[legacy_scalar_keys["interp"]])
+                )
+                used_legacy = True
+
+            if legacy_logit_keys["adapter"] in state_dict:
+                adapter_weight = torch.sigmoid(
+                    self._coerce_legacy_gate_value(state_dict[legacy_logit_keys["adapter"]])
+                )
+                used_legacy = True
+            elif legacy_scalar_keys["adapter"] in state_dict:
+                adapter_weight = F.softplus(
+                    self._coerce_legacy_gate_value(state_dict[legacy_scalar_keys["adapter"]])
+                )
+                used_legacy = True
+
+            if used_legacy:
+                legacy_weights = torch.stack([interp_weight, adapter_weight]).clamp_min(1e-8)
+                state_dict[mix_key] = legacy_weights.log()
+
+        for legacy_key in (
+            legacy_logit_keys["interp"],
+            legacy_logit_keys["adapter"],
+            legacy_scalar_keys["interp"],
+            legacy_scalar_keys["adapter"],
+        ):
+            state_dict.pop(legacy_key, None)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @staticmethod
     def _flatten_feat(name: str, feat: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int] | None]:
@@ -444,6 +541,23 @@ class UniversalScaleAdapter(nn.Module):
         out = torch.where(has_any, out, torch.zeros_like(out))
         return out
 
+    @staticmethod
+    def _masked_mean_token_norm(tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        if tokens.dim() != 3:
+            raise ValueError(f"tokens must be (B,N,D), got {tuple(tokens.shape)}")
+        if valid_mask.shape != tokens.shape[:2]:
+            raise ValueError(
+                f"valid_mask shape mismatch: expected {tuple(tokens.shape[:2])}, got {tuple(valid_mask.shape)}"
+            )
+
+        valid_mask = valid_mask.to(device=tokens.device, dtype=torch.bool)
+        if tokens.shape[1] == 0 or not valid_mask.any():
+            return tokens.new_zeros(())
+
+        token_norm = torch.linalg.vector_norm(tokens, dim=-1)
+        weights = valid_mask.to(dtype=token_norm.dtype)
+        return (token_norm * weights).sum() / weights.sum().clamp_min(1.0)
+
     def forward(
         self,
         context_feat: torch.Tensor | None = None,
@@ -452,8 +566,10 @@ class UniversalScaleAdapter(nn.Module):
         context_valid_mask: torch.Tensor | None = None,
         context_scale_mm: float | int | torch.Tensor | None = None,
         query_scale_mm: float | int | torch.Tensor | None = None,
+        return_valid_mask: bool = False,
+        return_debug: bool = False,
         **legacy_kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[Any, ...]:
         """
         Generic direction:
             context_feat/context_coord_map_mm  ->  query_coord_map_mm
@@ -631,12 +747,38 @@ class UniversalScaleAdapter(nn.Module):
         query_state = query_state.masked_fill(~query_valid_flat.unsqueeze(-1), 0.0)
 
         # Final output = interpolation prior + learned residual
-        out = self.interp_gate * interp_feat + self.adapter_gate * query_state
+        mix = torch.softmax(self.mix_logits.to(device=query_state.device, dtype=query_state.dtype), dim=0)
+        alpha_interp = mix[0]
+        alpha_adapter = mix[1]
+        out = alpha_interp * interp_feat + alpha_adapter * query_state
         out = out.masked_fill(~query_valid_flat.unsqueeze(-1), 0.0)
+
+        debug_dict = None
+        if return_debug:
+            valid_ratio = (
+                query_valid_flat.to(dtype=query_state.dtype).mean()
+                if query_valid_flat.numel() > 0
+                else query_state.new_zeros(())
+            )
+            debug_dict = {
+                "alpha_interp": alpha_interp,
+                "alpha_adapter": alpha_adapter,
+                "valid_ratio": valid_ratio,
+                "interp_norm": self._masked_mean_token_norm(interp_feat, query_valid_flat),
+                "adapter_norm": self._masked_mean_token_norm(query_state, query_valid_flat),
+                "output_norm": self._masked_mean_token_norm(out, query_valid_flat),
+            }
 
         if query_hw is not None:
             hq, wq = query_hw
-            return out.reshape(b, hq, wq, self.embed_dim)
+            out = out.reshape(b, hq, wq, self.embed_dim)
+
+        if return_valid_mask and return_debug:
+            return out, query_valid_flat, debug_dict
+        if return_valid_mask:
+            return out, query_valid_flat
+        if return_debug:
+            return out, debug_dict
         return out
 
 
