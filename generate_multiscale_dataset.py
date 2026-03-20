@@ -53,21 +53,35 @@ import numpy as np
 from PIL import Image
 import yaml
 
+try:
+    from pytransform3d import rotations as pytransform3d_rotations
+except ImportError:
+    pytransform3d_rotations = None
+
 
 DEFAULT_SCALES_MM = list(range(15, 26))
-DEFAULT_X_RANGE = (-3.0, 3.0)
-DEFAULT_Y_RANGE = (-3.0, 3.0)
+DEFAULT_REFERENCE_SCALE_MM = 25.0
+DEFAULT_X_RANGE = (-DEFAULT_REFERENCE_SCALE_MM / 2.0, DEFAULT_REFERENCE_SCALE_MM / 2.0)
+DEFAULT_Y_RANGE = (-DEFAULT_REFERENCE_SCALE_MM / 2.0, DEFAULT_REFERENCE_SCALE_MM / 2.0)
 DEFAULT_DEPTH_RANGE = (0.4, 2.2)
 DEFAULT_FOV_DEG = 40.0
-DEFAULT_REFERENCE_SCALE_MM = 25.0
 DEFAULT_DISTANCE_SAFETY = 0.98
 DEFAULT_PATCH_GRID = "14x14"
+DEFAULT_POSITION_SAMPLE_RATIOS = {
+    "clean": 0.65,
+    "near_boundary": 0.25,
+    "partial_crop": 0.10,
+}
+DEFAULT_INDENTER_BBOX_BOTTOM_HEIGHT_MM = 5.0
+DEFAULT_NEAR_BOUNDARY_MAX_MARGIN_MM = 0.75
+DEFAULT_PARTIAL_CROP_MIN_OVERHANG_MM = 0.10
+DEFAULT_PARTIAL_CROP_MAX_OVERHANG_MM = 1.00
 DEFAULT_FRAME_FRACTIONS = [0.4, 0.6, 0.8, 1.0]
 DEFAULT_FRAME_SAMPLING_MODE = "depth_random"
 DEFAULT_FRAME_COUNT = 4
 DEFAULT_FRAME_DEPTH_START_MM = 0.4
 DEFAULT_FRAME_DEPTH_END_MM = 2.2
-DEFAULT_IMAGE_RES = (640, 480)
+DEFAULT_IMAGE_RES = (568, 568)
 TEXTURE_EXTS = {".jpg", ".jpeg", ".png"}
 IMAGE_INDEX_COLUMNS = [
     "dataset_root",
@@ -79,6 +93,10 @@ IMAGE_INDEX_COLUMNS = [
     "command_x_mm",
     "command_y_mm",
     "command_depth_mm",
+    "position_sample_type_requested",
+    "position_sample_type_actual",
+    "contact_margin_min_scale_mm",
+    "contact_margin_reference_scale_mm",
     "scale_key",
     "scale_mm",
     "frame_name",
@@ -109,6 +127,18 @@ IMAGE_INDEX_COLUMNS = [
     "split",
     "is_unseen_indenter",
 ]
+
+
+def compute_full_sensor_fit_scale_m(scale_m: float, res_x: int, res_y: int) -> float:
+    if scale_m <= 0:
+        raise ValueError("scale_m must be > 0")
+    if res_x <= 0 or res_y <= 0:
+        raise ValueError("render resolution must be > 0")
+
+    # The gel is square, but the render is 4:3. Expand the fitted span by the
+    # limiting image dimension so the full square stays inside the frame.
+    aspect = float(res_x) / float(res_y)
+    return float(scale_m) * max(1.0, aspect)
 
 
 OPEN3D_TEMP_SCRIPT = r'''
@@ -273,6 +303,8 @@ import bpy
 import numpy as np
 from mathutils import Vector
 
+DEFAULT_IMAGE_RES = (568, 568)
+
 
 def parse_args():
     import sys
@@ -407,6 +439,19 @@ def apply_uv_math(obj, cx: float, cy: float, scale_m: float, uv_inset_ratio: flo
     bm.to_mesh(me)
     bm.free()
     me.update()
+
+
+def compute_full_sensor_fit_scale_m(scale_m: float, res_x: int, res_y: int) -> float:
+    if scale_m <= 0:
+        raise ValueError("scale_m must be > 0")
+    if res_x <= 0 or res_y <= 0:
+        raise ValueError("render resolution must be > 0")
+
+    # The gel is square, but the render is 4:3. With a horizontal-fit camera,
+    # matching the square width would crop the square vertically. Inflate the
+    # fitted span by the render aspect so the full square stays visible.
+    aspect = float(res_x) / float(res_y)
+    return float(scale_m) * max(1.0, aspect)
 
 
 def check_and_rotate_uvs_genforce(obj):
@@ -567,14 +612,20 @@ def setup_camera(
     if fixed_distance_m <= 0:
         raise ValueError("fixed_distance_m must be > 0")
 
+    fit_scale_m = compute_full_sensor_fit_scale_m(
+        scale_m,
+        DEFAULT_IMAGE_RES[0],
+        DEFAULT_IMAGE_RES[1],
+    )
+
     if camera_mode == "fixed_distance_variable_fov":
         distance = fixed_distance_m
-        fov = 2.0 * math.atan((scale_m / 2.0) / distance)
+        fov = 2.0 * math.atan((fit_scale_m / 2.0) / distance)
     else:
         fov = math.radians(base_fov_deg)
         if fov <= 1e-6 or fov >= math.pi - 1e-6:
             raise ValueError("base_fov_deg produces invalid camera angle")
-        distance = (scale_m / 2.0) / math.tan(fov / 2.0)
+        distance = (fit_scale_m / 2.0) / math.tan(fov / 2.0)
         distance *= distance_safety
 
     cam_data.angle = fov
@@ -587,6 +638,7 @@ def setup_camera(
     scene.camera = cam
     print(
         f"Camera setup | mode={camera_mode} scale_mm={scale_m*1000.0:.1f} "
+        f"fit_scale_mm={fit_scale_m*1000.0:.4f} "
         f"fov_deg={math.degrees(fov):.4f} distance_m={distance:.6f}"
     )
 
@@ -600,8 +652,8 @@ def configure_render(out_dir: Path, render_samples: int):
         scene.cycles.max_bounces = 4
         scene.cycles.device = "CPU"
 
-    scene.render.resolution_x = 640
-    scene.render.resolution_y = 480
+    scene.render.resolution_x = DEFAULT_IMAGE_RES[0]
+    scene.render.resolution_y = DEFAULT_IMAGE_RES[1]
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "JPEG"
     scene.render.image_settings.color_mode = "RGB"
@@ -707,6 +759,10 @@ class EpisodeState:
     y_mm: float
     x_norm: float
     y_norm: float
+    position_sample_type_requested: str
+    position_sample_type_actual: str
+    contact_margin_min_scale_mm: float
+    contact_margin_reference_scale_mm: float
     reference_scale_mm: float
     depth_mm: float
     episode_dir: Path
@@ -770,6 +826,8 @@ def make_scale_progress_entry(
     y_mm: float,
     x_norm: float,
     y_norm: float,
+    position_sample_type_requested: str,
+    position_sample_type_actual: str,
     depth_mm: float,
     frame_sampling_mode: str,
     frame_depth_targets_mm: Sequence[float] | None,
@@ -787,6 +845,8 @@ def make_scale_progress_entry(
             "y_norm": float(y_norm),
             "depth_mm": float(depth_mm),
         },
+        "position_sample_type_requested": str(position_sample_type_requested),
+        "position_sample_type_actual": str(position_sample_type_actual),
         "frame_sampling_mode": str(frame_sampling_mode),
         "frame_depth_targets_mm": [float(v) for v in frame_depth_targets_mm] if frame_depth_targets_mm else [],
         "physics": {
@@ -886,6 +946,319 @@ def contact_mm_from_normalized(x_norm: float, y_norm: float, scale_mm: float) ->
         raise ValueError(f"scale_mm must be > 0, got {scale_mm}")
     half_scale = float(scale_mm) / 2.0
     return float(x_norm) * half_scale, float(y_norm) * half_scale
+
+
+def assign_position_sample_types(
+    episodes_per_indenter: int,
+    clean_ratio: float,
+    near_boundary_ratio: float,
+    partial_crop_ratio: float,
+    rng: random.Random,
+) -> List[str]:
+    if episodes_per_indenter <= 0:
+        raise ValueError(f"episodes_per_indenter must be > 0, got {episodes_per_indenter}")
+
+    ratios = {
+        "clean": float(clean_ratio),
+        "near_boundary": float(near_boundary_ratio),
+        "partial_crop": float(partial_crop_ratio),
+    }
+    if any(v < 0 for v in ratios.values()):
+        raise ValueError(f"Position sample ratios must be >= 0, got {ratios}")
+
+    total_ratio = sum(ratios.values())
+    if total_ratio <= 0:
+        raise ValueError("At least one position sample ratio must be > 0")
+
+    scaled = {
+        key: float(episodes_per_indenter) * (value / total_ratio)
+        for key, value in ratios.items()
+    }
+    counts = {key: int(math.floor(value)) for key, value in scaled.items()}
+    remainder = int(episodes_per_indenter - sum(counts.values()))
+    if remainder > 0:
+        order = sorted(
+            scaled.keys(),
+            key=lambda key: (scaled[key] - counts[key], scaled[key]),
+            reverse=True,
+        )
+        for idx in range(remainder):
+            counts[order[idx % len(order)]] += 1
+
+    sample_types = (
+        ["clean"] * counts["clean"]
+        + ["near_boundary"] * counts["near_boundary"]
+        + ["partial_crop"] * counts["partial_crop"]
+    )
+    if len(sample_types) != episodes_per_indenter:
+        raise RuntimeError(
+            f"Position sample count mismatch: expected {episodes_per_indenter}, got {len(sample_types)}"
+        )
+    rng.shuffle(sample_types)
+    return sample_types
+
+
+def rotation_matrix_from_pose(pose: Dict[str, float], degrees: bool = False) -> np.ndarray:
+    if pytransform3d_rotations is None:
+        roll = float(pose.get("R", 0.0))
+        pitch = float(pose.get("P", -np.pi))
+        yaw = float(pose.get("Y", 0.0))
+        if degrees:
+            roll = np.radians(roll)
+            pitch = np.radians(pitch)
+            yaw = np.radians(yaw)
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
+        ry = np.array([[cp, 0.0, -sp], [0.0, 1.0, 0.0], [sp, 0.0, cp]], dtype=np.float64)
+        rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        return rz @ ry @ rx
+    return pytransform3d_rotations.matrix_from_euler(
+        (
+            float(pose.get("R", 0.0)),
+            float(pose.get("P", -np.pi)),
+            float(pose.get("Y", 0.0)),
+        ),
+        0,
+        1,
+        2,
+        degrees,
+    )
+
+
+def compute_indenter_contact_bbox_mm(
+    indenter_npy_path: Path,
+    rotation_matrix: np.ndarray,
+    bottom_height_mm: float = DEFAULT_INDENTER_BBOX_BOTTOM_HEIGHT_MM,
+) -> Dict[str, float]:
+    if bottom_height_mm <= 0:
+        raise ValueError(f"bottom_height_mm must be > 0, got {bottom_height_mm}")
+    points = np.load(indenter_npy_path).astype(np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected (N,3) array in {indenter_npy_path}, got {points.shape}")
+    valid = np.isfinite(points).all(axis=1)
+    if not np.any(valid):
+        raise ValueError(f"No finite points in {indenter_npy_path}")
+    points = points[valid]
+    points_rot = (rotation_matrix @ points.T).T
+    z = points_rot[:, 2]
+    z_min = float(np.min(z))
+    z_max_slice = z_min + float(bottom_height_mm)
+    footprint_xy = points_rot[(z >= z_min) & (z <= z_max_slice), :2]
+    if footprint_xy.shape[0] < 3:
+        raise ValueError(
+            f"Too few bottom-slice points in {indenter_npy_path}: {footprint_xy.shape[0]}"
+        )
+    x_min = float(np.min(footprint_xy[:, 0]))
+    x_max = float(np.max(footprint_xy[:, 0]))
+    y_min = float(np.min(footprint_xy[:, 1]))
+    y_max = float(np.max(footprint_xy[:, 1]))
+    return {
+        "x_min_mm": x_min,
+        "x_max_mm": x_max,
+        "y_min_mm": y_min,
+        "y_max_mm": y_max,
+        "width_mm": x_max - x_min,
+        "height_mm": y_max - y_min,
+        "bbox_mode": "bottom_slice",
+        "bottom_height_mm": float(bottom_height_mm),
+    }
+
+
+def compute_margin_constrained_normalized_sampling_bounds(
+    bbox_mm: Dict[str, float],
+    scale_mm: float,
+    reference_scale_mm: float,
+    requested_x_min_mm: float,
+    requested_x_max_mm: float,
+    requested_y_min_mm: float,
+    requested_y_max_mm: float,
+    min_margin_mm: float = 0.0,
+) -> Dict[str, float]:
+    if scale_mm <= 0 or reference_scale_mm <= 0:
+        raise ValueError("scale_mm and reference_scale_mm must be > 0")
+    if min_margin_mm < 0:
+        raise ValueError(f"min_margin_mm must be >= 0, got {min_margin_mm}")
+
+    half_scale = float(scale_mm) / 2.0
+    ref_half = float(reference_scale_mm) / 2.0
+
+    feasible_x_min_norm = (-half_scale - float(bbox_mm["x_min_mm"]) + float(min_margin_mm)) / half_scale
+    feasible_x_max_norm = (half_scale - float(bbox_mm["x_max_mm"]) - float(min_margin_mm)) / half_scale
+    feasible_y_min_norm = (-half_scale - float(bbox_mm["y_min_mm"]) + float(min_margin_mm)) / half_scale
+    feasible_y_max_norm = (half_scale - float(bbox_mm["y_max_mm"]) - float(min_margin_mm)) / half_scale
+
+    requested_x_min_norm = float(requested_x_min_mm) / ref_half
+    requested_x_max_norm = float(requested_x_max_mm) / ref_half
+    requested_y_min_norm = float(requested_y_min_mm) / ref_half
+    requested_y_max_norm = float(requested_y_max_mm) / ref_half
+
+    x_min_norm = max(feasible_x_min_norm, requested_x_min_norm)
+    x_max_norm = min(feasible_x_max_norm, requested_x_max_norm)
+    y_min_norm = max(feasible_y_min_norm, requested_y_min_norm)
+    y_max_norm = min(feasible_y_max_norm, requested_y_max_norm)
+
+    return {
+        "x_min_norm": x_min_norm,
+        "x_max_norm": x_max_norm,
+        "y_min_norm": y_min_norm,
+        "y_max_norm": y_max_norm,
+        "feasible_x_min_norm": feasible_x_min_norm,
+        "feasible_x_max_norm": feasible_x_max_norm,
+        "feasible_y_min_norm": feasible_y_min_norm,
+        "feasible_y_max_norm": feasible_y_max_norm,
+        "requested_x_min_norm": requested_x_min_norm,
+        "requested_x_max_norm": requested_x_max_norm,
+        "requested_y_min_norm": requested_y_min_norm,
+        "requested_y_max_norm": requested_y_max_norm,
+        "min_margin_mm": float(min_margin_mm),
+    }
+
+
+def compute_fully_inside_normalized_sampling_bounds(
+    bbox_mm: Dict[str, float],
+    min_scale_mm: float,
+    reference_scale_mm: float,
+    requested_x_min_mm: float,
+    requested_x_max_mm: float,
+    requested_y_min_mm: float,
+    requested_y_max_mm: float,
+) -> Dict[str, float]:
+    return compute_margin_constrained_normalized_sampling_bounds(
+        bbox_mm=bbox_mm,
+        scale_mm=min_scale_mm,
+        reference_scale_mm=reference_scale_mm,
+        requested_x_min_mm=requested_x_min_mm,
+        requested_x_max_mm=requested_x_max_mm,
+        requested_y_min_mm=requested_y_min_mm,
+        requested_y_max_mm=requested_y_max_mm,
+        min_margin_mm=0.0,
+    )
+
+
+def sample_normalized_contact_from_bounds(
+    rng: random.Random,
+    bounds: Dict[str, float],
+) -> Tuple[float, float]:
+    if bounds["x_min_norm"] > bounds["x_max_norm"] or bounds["y_min_norm"] > bounds["y_max_norm"]:
+        raise ValueError(f"Invalid sampling bounds: {bounds}")
+    return (
+        round(rng.uniform(bounds["x_min_norm"], bounds["x_max_norm"]), 6),
+        round(rng.uniform(bounds["y_min_norm"], bounds["y_max_norm"]), 6),
+    )
+
+
+def compute_contact_margins_mm(
+    bbox_mm: Dict[str, float],
+    x_norm: float,
+    y_norm: float,
+    scale_mm: float,
+) -> Dict[str, float]:
+    half_scale = float(scale_mm) / 2.0
+    x_mm, y_mm = contact_mm_from_normalized(x_norm=x_norm, y_norm=y_norm, scale_mm=scale_mm)
+    left = x_mm + float(bbox_mm["x_min_mm"]) + half_scale
+    right = half_scale - (x_mm + float(bbox_mm["x_max_mm"]))
+    bottom = y_mm + float(bbox_mm["y_min_mm"]) + half_scale
+    top = half_scale - (y_mm + float(bbox_mm["y_max_mm"]))
+    return {
+        "left_mm": float(left),
+        "right_mm": float(right),
+        "bottom_mm": float(bottom),
+        "top_mm": float(top),
+        "min_margin_mm": float(min(left, right, bottom, top)),
+    }
+
+
+def sample_stratified_contact_position(
+    rng: random.Random,
+    requested_sample_type: str,
+    bbox_mm: Dict[str, float],
+    clean_bounds: Dict[str, float],
+    inside_bounds_min_scale: Dict[str, float],
+    inside_bounds_reference_scale: Dict[str, float],
+    min_scale_mm: float,
+    reference_scale_mm: float,
+    near_boundary_max_margin_mm: float,
+    partial_crop_min_overhang_mm: float,
+    partial_crop_max_overhang_mm: float,
+    max_attempts: int = 512,
+) -> Dict[str, float | str]:
+    if max_attempts <= 0:
+        raise ValueError(f"max_attempts must be > 0, got {max_attempts}")
+
+    def _bounds_valid(bounds: Dict[str, float]) -> bool:
+        return bounds["x_min_norm"] <= bounds["x_max_norm"] and bounds["y_min_norm"] <= bounds["y_max_norm"]
+
+    def _sample_clean() -> Tuple[float, float] | None:
+        if not _bounds_valid(clean_bounds):
+            return None
+        return sample_normalized_contact_from_bounds(rng, clean_bounds)
+
+    def _sample_near_boundary() -> Tuple[float, float] | None:
+        if not _bounds_valid(inside_bounds_min_scale):
+            return None
+        for _ in range(max_attempts):
+            x_norm, y_norm = sample_normalized_contact_from_bounds(rng, inside_bounds_min_scale)
+            margin = compute_contact_margins_mm(bbox_mm, x_norm, y_norm, min_scale_mm)["min_margin_mm"]
+            if 0.0 <= margin <= float(near_boundary_max_margin_mm):
+                return x_norm, y_norm
+        return None
+
+    def _sample_partial_crop() -> Tuple[float, float] | None:
+        if not _bounds_valid(inside_bounds_reference_scale):
+            return None
+        for _ in range(max_attempts):
+            x_norm, y_norm = sample_normalized_contact_from_bounds(rng, inside_bounds_reference_scale)
+            min_scale_margin = compute_contact_margins_mm(bbox_mm, x_norm, y_norm, min_scale_mm)["min_margin_mm"]
+            if -float(partial_crop_max_overhang_mm) <= min_scale_margin <= -float(partial_crop_min_overhang_mm):
+                return x_norm, y_norm
+        return None
+
+    def _sample_reference_safe() -> Tuple[float, float] | None:
+        if not _bounds_valid(inside_bounds_reference_scale):
+            return None
+        return sample_normalized_contact_from_bounds(rng, inside_bounds_reference_scale)
+
+    strategy_order = {
+        "clean": ("clean", "near_boundary", "partial_crop", "reference_safe_fallback"),
+        "near_boundary": ("near_boundary", "clean", "partial_crop", "reference_safe_fallback"),
+        "partial_crop": ("partial_crop", "near_boundary", "clean", "reference_safe_fallback"),
+    }
+    if requested_sample_type not in strategy_order:
+        raise ValueError(f"Unknown requested_sample_type: {requested_sample_type}")
+
+    samplers = {
+        "clean": _sample_clean,
+        "near_boundary": _sample_near_boundary,
+        "partial_crop": _sample_partial_crop,
+        "reference_safe_fallback": _sample_reference_safe,
+    }
+
+    chosen: Tuple[float, float] | None = None
+    actual_sample_type = requested_sample_type
+    for actual_sample_type in strategy_order[requested_sample_type]:
+        chosen = samplers[actual_sample_type]()
+        if chosen is not None:
+            break
+    if chosen is None:
+        raise RuntimeError(
+            f"Failed to sample position for {requested_sample_type} after trying {strategy_order[requested_sample_type]}"
+        )
+
+    x_norm, y_norm = chosen
+    min_scale_margin = compute_contact_margins_mm(bbox_mm, x_norm, y_norm, min_scale_mm)["min_margin_mm"]
+    reference_scale_margin = compute_contact_margins_mm(
+        bbox_mm, x_norm, y_norm, reference_scale_mm
+    )["min_margin_mm"]
+    return {
+        "x_norm": float(x_norm),
+        "y_norm": float(y_norm),
+        "requested_sample_type": str(requested_sample_type),
+        "actual_sample_type": str(actual_sample_type),
+        "min_scale_margin_mm": float(min_scale_margin),
+        "reference_scale_margin_mm": float(reference_scale_margin),
+    }
 
 
 def expected_npz_path(npz_root: Path, indenter: str, x_mm: float, y_mm: float, depth_mm: float) -> Path:
@@ -1082,6 +1455,16 @@ def build_image_index_csv(dataset_root: Path) -> Tuple[Path, int]:
                             "command_x_mm": scale_meta.get("contact_x_mm", contact.get("x_mm", "")),
                             "command_y_mm": scale_meta.get("contact_y_mm", contact.get("y_mm", "")),
                             "command_depth_mm": contact.get("depth_mm", ""),
+                            "position_sample_type_requested": contact.get(
+                                "position_sample_type_requested",
+                                scale_meta.get("position_sample_type_requested", ""),
+                            ),
+                            "position_sample_type_actual": contact.get(
+                                "position_sample_type_actual",
+                                scale_meta.get("position_sample_type_actual", ""),
+                            ),
+                            "contact_margin_min_scale_mm": contact.get("min_scale_margin_mm", ""),
+                            "contact_margin_reference_scale_mm": contact.get("reference_scale_margin_mm", ""),
                             "scale_key": scale_key,
                             "scale_mm": scale_mm,
                             "frame_name": frame_name,
@@ -1749,6 +2132,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--x-max", type=float, default=DEFAULT_X_RANGE[1])
     p.add_argument("--y-min", type=float, default=DEFAULT_Y_RANGE[0])
     p.add_argument("--y-max", type=float, default=DEFAULT_Y_RANGE[1])
+    p.add_argument(
+        "--position-clean-ratio",
+        type=float,
+        default=DEFAULT_POSITION_SAMPLE_RATIOS["clean"],
+        help="Fraction of episodes sampled as clean fully in-bound samples.",
+    )
+    p.add_argument(
+        "--position-near-boundary-ratio",
+        type=float,
+        default=DEFAULT_POSITION_SAMPLE_RATIOS["near_boundary"],
+        help="Fraction of episodes sampled near the smallest-scale boundary but still mostly inside.",
+    )
+    p.add_argument(
+        "--position-partial-crop-ratio",
+        type=float,
+        default=DEFAULT_POSITION_SAMPLE_RATIOS["partial_crop"],
+        help="Fraction of episodes allowed to be partially cropped on the smallest scale.",
+    )
+    p.add_argument(
+        "--near-boundary-max-margin-mm",
+        type=float,
+        default=DEFAULT_NEAR_BOUNDARY_MAX_MARGIN_MM,
+        help="Maximum smallest-scale margin (mm) for near-boundary samples.",
+    )
+    p.add_argument(
+        "--partial-crop-min-overhang-mm",
+        type=float,
+        default=DEFAULT_PARTIAL_CROP_MIN_OVERHANG_MM,
+        help="Minimum smallest-scale out-of-bounds amount (mm) for partial-crop samples.",
+    )
+    p.add_argument(
+        "--partial-crop-max-overhang-mm",
+        type=float,
+        default=DEFAULT_PARTIAL_CROP_MAX_OVERHANG_MM,
+        help="Maximum smallest-scale out-of-bounds amount (mm) for partial-crop samples.",
+    )
     p.add_argument("--depth-min", type=float, default=DEFAULT_DEPTH_RANGE[0])
     p.add_argument("--depth-max", type=float, default=DEFAULT_DEPTH_RANGE[1])
     p.add_argument(
@@ -1892,6 +2311,20 @@ def main() -> None:
         raise ValueError("--max-render-workers must be > 0")
     if args.depth_min <= 0 or args.depth_max <= 0 or args.depth_min > args.depth_max:
         raise ValueError("Invalid depth range")
+    if args.position_clean_ratio < 0 or args.position_near_boundary_ratio < 0 or args.position_partial_crop_ratio < 0:
+        raise ValueError("Position sample ratios must be >= 0")
+    if (
+        args.position_clean_ratio
+        + args.position_near_boundary_ratio
+        + args.position_partial_crop_ratio
+    ) <= 0:
+        raise ValueError("At least one position sample ratio must be > 0")
+    if args.near_boundary_max_margin_mm < 0:
+        raise ValueError("--near-boundary-max-margin-mm must be >= 0")
+    if args.partial_crop_min_overhang_mm < 0:
+        raise ValueError("--partial-crop-min-overhang-mm must be >= 0")
+    if args.partial_crop_max_overhang_mm < args.partial_crop_min_overhang_mm:
+        raise ValueError("--partial-crop-max-overhang-mm must be >= --partial-crop-min-overhang-mm")
     if args.reference_scale_mm <= 0:
         raise ValueError("--reference-scale-mm must be > 0")
     if args.distance_safety <= 0:
@@ -1937,8 +2370,13 @@ def main() -> None:
         fixed_camera_distance_m = float(args.camera_distance_m)
     else:
         ref_scale_m = float(args.reference_scale_mm) / 1000.0
+        ref_fit_scale_m = compute_full_sensor_fit_scale_m(
+            ref_scale_m,
+            DEFAULT_IMAGE_RES[0],
+            DEFAULT_IMAGE_RES[1],
+        )
         ref_fov_rad = math.radians(float(args.fov_deg))
-        fixed_camera_distance_m = (ref_scale_m / 2.0) / math.tan(ref_fov_rad / 2.0)
+        fixed_camera_distance_m = (ref_fit_scale_m / 2.0) / math.tan(ref_fov_rad / 2.0)
         fixed_camera_distance_m *= float(args.distance_safety)
 
     parameters_path = repo_root / "sim" / "parameters.yml"
@@ -1955,6 +2393,90 @@ def main() -> None:
     indenter_names = discover_indenter_names(indenter_dir, args.objects)
     textures = discover_textures(texture_dir)
     expected_marker_files = sorted({f"marker_{p.stem}.jpg" for p in textures})
+    contact_reference_scale_mm = float(max(args.scales_mm))
+    contact_constraint_scale_mm = float(min(args.scales_mm))
+
+    with open(parameters_path, "r", encoding="utf-8") as f:
+        parameters_cfg = yaml.safe_load(f)
+    indenter_pose = (
+        parameters_cfg.get("indenter", {}).get("pose", {})
+        if isinstance(parameters_cfg, dict)
+        else {}
+    )
+    indenter_rotation = rotation_matrix_from_pose(indenter_pose, degrees=False)
+    indenter_position_sampling_specs: Dict[str, Dict[str, Any]] = {}
+    impossible_indenters: List[str] = []
+    degraded_indenters: List[str] = []
+    for indenter_name in indenter_names:
+        bbox_mm = compute_indenter_contact_bbox_mm(indenter_dir / f"{indenter_name}.npy", indenter_rotation)
+        inside_bounds_min_scale = compute_margin_constrained_normalized_sampling_bounds(
+            bbox_mm=bbox_mm,
+            scale_mm=contact_constraint_scale_mm,
+            reference_scale_mm=contact_reference_scale_mm,
+            requested_x_min_mm=float(args.x_min),
+            requested_x_max_mm=float(args.x_max),
+            requested_y_min_mm=float(args.y_min),
+            requested_y_max_mm=float(args.y_max),
+            min_margin_mm=0.0,
+        )
+        clean_bounds = compute_margin_constrained_normalized_sampling_bounds(
+            bbox_mm=bbox_mm,
+            scale_mm=contact_constraint_scale_mm,
+            reference_scale_mm=contact_reference_scale_mm,
+            requested_x_min_mm=float(args.x_min),
+            requested_x_max_mm=float(args.x_max),
+            requested_y_min_mm=float(args.y_min),
+            requested_y_max_mm=float(args.y_max),
+            min_margin_mm=float(args.near_boundary_max_margin_mm),
+        )
+        inside_bounds_reference_scale = compute_margin_constrained_normalized_sampling_bounds(
+            bbox_mm=bbox_mm,
+            scale_mm=contact_reference_scale_mm,
+            reference_scale_mm=contact_reference_scale_mm,
+            requested_x_min_mm=float(args.x_min),
+            requested_x_max_mm=float(args.x_max),
+            requested_y_min_mm=float(args.y_min),
+            requested_y_max_mm=float(args.y_max),
+            min_margin_mm=0.0,
+        )
+        indenter_position_sampling_specs[indenter_name] = {
+            "bbox_mm": bbox_mm,
+            "inside_bounds_min_scale": inside_bounds_min_scale,
+            "clean_bounds": clean_bounds,
+            "inside_bounds_reference_scale": inside_bounds_reference_scale,
+        }
+        if (
+            inside_bounds_reference_scale["x_min_norm"] > inside_bounds_reference_scale["x_max_norm"]
+            or inside_bounds_reference_scale["y_min_norm"] > inside_bounds_reference_scale["y_max_norm"]
+        ):
+            impossible_indenters.append(indenter_name)
+        if (
+            inside_bounds_min_scale["x_min_norm"] > inside_bounds_min_scale["x_max_norm"]
+            or inside_bounds_min_scale["y_min_norm"] > inside_bounds_min_scale["y_max_norm"]
+        ):
+            degraded_indenters.append(indenter_name)
+    if impossible_indenters:
+        problems = []
+        for indenter_name in impossible_indenters:
+            spec = indenter_position_sampling_specs[indenter_name]
+            bbox_mm = spec["bbox_mm"]
+            bounds = spec["inside_bounds_reference_scale"]
+            problems.append(
+                f"{indenter_name}: bbox=({bbox_mm['width_mm']:.3f}mm x {bbox_mm['height_mm']:.3f}mm) "
+                f"requested_norm_x=[{bounds['x_min_norm']:.4f},{bounds['x_max_norm']:.4f}] "
+                f"requested_norm_y=[{bounds['y_min_norm']:.4f},{bounds['y_max_norm']:.4f}]"
+            )
+        raise ValueError(
+            "Reference-scale contact sampling is impossible for the following indenters:\n"
+            + "\n".join(problems)
+        )
+    if degraded_indenters:
+        logging.warning(
+            "Smallest-scale fully in-bound region is empty for %d indenters; stratified sampling will fall back "
+            "to best-effort categories when needed: %s",
+            len(degraded_indenters),
+            degraded_indenters,
+        )
 
     if args.clean_output and dataset_root.exists():
         shutil.rmtree(dataset_root)
@@ -1978,18 +2500,39 @@ def main() -> None:
     physics_tasks: List[Dict[str, Any]] = []
     scale_progress: Dict[str, Dict[str, Any]] = {}
     resume_scales_from_metadata = 0
-    contact_reference_scale_mm = float(max(args.scales_mm))
-
     episode_id = 0
     for indenter in indenter_names:
-        for _ in range(args.episodes_per_indenter):
-            x_mm = round(rng.uniform(args.x_min, args.x_max), 4)
-            y_mm = round(rng.uniform(args.y_min, args.y_max), 4)
-            x_norm, y_norm = normalized_contact_from_reference_mm(
-                x_mm=x_mm,
-                y_mm=y_mm,
+        requested_sample_types = assign_position_sample_types(
+            episodes_per_indenter=int(args.episodes_per_indenter),
+            clean_ratio=float(args.position_clean_ratio),
+            near_boundary_ratio=float(args.position_near_boundary_ratio),
+            partial_crop_ratio=float(args.position_partial_crop_ratio),
+            rng=rng,
+        )
+        sampling_spec = indenter_position_sampling_specs[indenter]
+        for requested_sample_type in requested_sample_types:
+            sampled_contact = sample_stratified_contact_position(
+                rng=rng,
+                requested_sample_type=str(requested_sample_type),
+                bbox_mm=sampling_spec["bbox_mm"],
+                clean_bounds=sampling_spec["clean_bounds"],
+                inside_bounds_min_scale=sampling_spec["inside_bounds_min_scale"],
+                inside_bounds_reference_scale=sampling_spec["inside_bounds_reference_scale"],
+                min_scale_mm=contact_constraint_scale_mm,
                 reference_scale_mm=contact_reference_scale_mm,
+                near_boundary_max_margin_mm=float(args.near_boundary_max_margin_mm),
+                partial_crop_min_overhang_mm=float(args.partial_crop_min_overhang_mm),
+                partial_crop_max_overhang_mm=float(args.partial_crop_max_overhang_mm),
             )
+            x_norm = float(sampled_contact["x_norm"])
+            y_norm = float(sampled_contact["y_norm"])
+            x_mm, y_mm = contact_mm_from_normalized(
+                x_norm=x_norm,
+                y_norm=y_norm,
+                scale_mm=contact_reference_scale_mm,
+            )
+            x_mm = round(x_mm, 4)
+            y_mm = round(y_mm, 4)
             episode_frame_depth_targets_mm: List[float] | None = None
             if args.frame_sampling_mode == "depth_random":
                 episode_frame_depth_targets_mm = make_stratified_random_frame_depth_targets_mm(
@@ -2016,6 +2559,10 @@ def main() -> None:
                 y_mm=y_mm,
                 x_norm=x_norm,
                 y_norm=y_norm,
+                position_sample_type_requested=str(sampled_contact["requested_sample_type"]),
+                position_sample_type_actual=str(sampled_contact["actual_sample_type"]),
+                contact_margin_min_scale_mm=float(sampled_contact["min_scale_margin_mm"]),
+                contact_margin_reference_scale_mm=float(sampled_contact["reference_scale_margin_mm"]),
                 reference_scale_mm=contact_reference_scale_mm,
                 depth_mm=depth_mm,
                 episode_dir=episode_dir,
@@ -2053,6 +2600,8 @@ def main() -> None:
                     y_mm=scale_contact_y_mm,
                     x_norm=x_norm,
                     y_norm=y_norm,
+                    position_sample_type_requested=episode_states[episode_id].position_sample_type_requested,
+                    position_sample_type_actual=episode_states[episode_id].position_sample_type_actual,
                     depth_mm=depth_mm,
                     frame_sampling_mode=str(args.frame_sampling_mode),
                     frame_depth_targets_mm=episode_frame_depth_targets_mm,
@@ -2144,9 +2693,13 @@ def main() -> None:
                 prepared_scales += 1
 
             logging.info(
-                "Prepared episode_%06d | indenter=%s | contact_ref=(x=%.4f, y=%.4f @ %.1fmm) | contact_norm=(x=%.4f, y=%.4f) | queued_scales=%d skipped_scales=%d%s",
+                "Prepared episode_%06d | indenter=%s | sample=%s->%s | margin_min_scale=%.4fmm | "
+                "contact_ref=(x=%.4f, y=%.4f @ %.1fmm) | contact_norm=(x=%.4f, y=%.4f) | queued_scales=%d skipped_scales=%d%s",
                 episode_id,
                 indenter,
+                episode_states[episode_id].position_sample_type_requested,
+                episode_states[episode_id].position_sample_type_actual,
+                episode_states[episode_id].contact_margin_min_scale_mm,
                 x_mm,
                 y_mm,
                 contact_reference_scale_mm,
@@ -2172,6 +2725,29 @@ def main() -> None:
     logging.info("Episodes: %d", total_episodes)
     logging.info("Scales: %s", args.scales_mm)
     logging.info("Patch grid: %dx%d", patch_h, patch_w)
+    logging.info(
+        "Position sampling: clean=%.2f near_boundary=%.2f partial_crop=%.2f | near_margin<=%.3fmm | "
+        "partial_overhang=[%.3f, %.3f]mm",
+        float(args.position_clean_ratio),
+        float(args.position_near_boundary_ratio),
+        float(args.position_partial_crop_ratio),
+        float(args.near_boundary_max_margin_mm),
+        float(args.partial_crop_min_overhang_mm),
+        float(args.partial_crop_max_overhang_mm),
+    )
+    logging.info(
+        "Indenter bbox: mode=bottom_slice bottom_height=%.3fmm",
+        float(DEFAULT_INDENTER_BBOX_BOTTOM_HEIGHT_MM),
+    )
+    logging.info(
+        "Contact constraint: layered_sampling=True min_scale=%.1fmm reference_scale=%.1fmm requested_ref_bounds=x[%.3f,%.3f] y[%.3f,%.3f]",
+        contact_constraint_scale_mm,
+        contact_reference_scale_mm,
+        float(args.x_min),
+        float(args.x_max),
+        float(args.y_min),
+        float(args.y_max),
+    )
     logging.info("Resume mode: %s", args.resume)
     logging.info("Intermediates root: %s", work_tmp_root)
     if args.frame_sampling_mode == "depth_random":
@@ -2329,6 +2905,11 @@ def main() -> None:
                 "reference_scale_mm": state.reference_scale_mm,
                 "x_norm": state.x_norm,
                 "y_norm": state.y_norm,
+                "position_sample_type_requested": state.position_sample_type_requested,
+                "position_sample_type_actual": state.position_sample_type_actual,
+                "min_scale_margin_mm": state.contact_margin_min_scale_mm,
+                "reference_scale_margin_mm": state.contact_margin_reference_scale_mm,
+                "constraint_scale_mm": float(contact_constraint_scale_mm),
             },
             "image_resolution": {"width": DEFAULT_IMAGE_RES[0], "height": DEFAULT_IMAGE_RES[1]},
             "scales": state.scales,
@@ -2359,6 +2940,8 @@ def main() -> None:
             "contact_y_mm": float(scale_state.contact_y_mm),
             "contact_x_norm": float(ep_state.x_norm),
             "contact_y_norm": float(ep_state.y_norm),
+            "position_sample_type_requested": str(ep_state.position_sample_type_requested),
+            "position_sample_type_actual": str(ep_state.position_sample_type_actual),
             "contact_depth_mm": float(scale_state.contact_depth_mm),
             "deformation_stats_final": scale_state.deformation_stats_final,
             "trajectory_length": int(scale_state.trajectory_length),
@@ -2550,16 +3133,21 @@ def main() -> None:
                         adapter_coord_map_path = scale_dir / "adapter_coord_map.npy"
                         np.save(adapter_coord_map_path, coord_map)
                         adapter_coord_map_shape = [int(v) for v in coord_map.shape]
+                        fit_scale_m = compute_full_sensor_fit_scale_m(
+                            float(scale_mm) / 1000.0,
+                            DEFAULT_IMAGE_RES[0],
+                            DEFAULT_IMAGE_RES[1],
+                        )
 
                         if args.camera_mode == "fixed_distance_variable_fov":
                             camera_fov_deg = math.degrees(
-                                2.0 * math.atan((float(scale_mm) / 1000.0 / 2.0) / float(fixed_camera_distance_m))
+                                2.0 * math.atan((fit_scale_m / 2.0) / float(fixed_camera_distance_m))
                             )
                             camera_distance_m = float(fixed_camera_distance_m)
                         else:
                             camera_fov_deg = float(args.fov_deg)
                             camera_distance_m = (
-                                (float(scale_mm) / 1000.0 / 2.0) / math.tan(math.radians(float(args.fov_deg)) / 2.0)
+                                (fit_scale_m / 2.0) / math.tan(math.radians(float(args.fov_deg)) / 2.0)
                             )
                             camera_distance_m *= float(args.distance_safety)
 
@@ -2914,6 +3502,12 @@ def main() -> None:
         manifest_episodes: List[Dict[str, Any]] = []
         failed_episodes: List[Dict[str, Any]] = []
         successful_frame_counts: List[int] = []
+        position_sample_counts_requested = {
+            "clean": 0,
+            "near_boundary": 0,
+            "partial_crop": 0,
+        }
+        position_sample_counts_actual: Dict[str, int] = {}
 
         for episode_id in sorted(episode_states):
             state = episode_states[episode_id]
@@ -2944,6 +3538,11 @@ def main() -> None:
                     "reference_scale_mm": state.reference_scale_mm,
                     "x_norm": state.x_norm,
                     "y_norm": state.y_norm,
+                    "position_sample_type_requested": state.position_sample_type_requested,
+                    "position_sample_type_actual": state.position_sample_type_actual,
+                    "min_scale_margin_mm": state.contact_margin_min_scale_mm,
+                    "reference_scale_margin_mm": state.contact_margin_reference_scale_mm,
+                    "constraint_scale_mm": float(contact_constraint_scale_mm),
                 },
                 "image_resolution": {"width": DEFAULT_IMAGE_RES[0], "height": DEFAULT_IMAGE_RES[1]},
                 "scales": state.scales,
@@ -2953,6 +3552,12 @@ def main() -> None:
 
             for scale_meta in state.scales.values():
                 successful_frame_counts.append(len(scale_meta.get("frames", {})))
+            position_sample_counts_requested[state.position_sample_type_requested] = (
+                position_sample_counts_requested.get(state.position_sample_type_requested, 0) + 1
+            )
+            position_sample_counts_actual[state.position_sample_type_actual] = (
+                position_sample_counts_actual.get(state.position_sample_type_actual, 0) + 1
+            )
 
             manifest_episodes.append(
                 {
@@ -2966,6 +3571,11 @@ def main() -> None:
                         "reference_scale_mm": state.reference_scale_mm,
                         "x_norm": state.x_norm,
                         "y_norm": state.y_norm,
+                        "position_sample_type_requested": state.position_sample_type_requested,
+                        "position_sample_type_actual": state.position_sample_type_actual,
+                        "min_scale_margin_mm": state.contact_margin_min_scale_mm,
+                        "reference_scale_margin_mm": state.contact_margin_reference_scale_mm,
+                        "constraint_scale_mm": float(contact_constraint_scale_mm),
                     },
                 }
             )
@@ -3006,6 +3616,25 @@ def main() -> None:
                 if (args.frame_sampling_mode != "fraction" or args.frame_indices is None)
                 else [int(v) for v in args.frame_indices]
             ),
+            "contact_sampling_mode": "normalized_layered_min_scale",
+            "indenter_bbox_mode": "bottom_slice",
+            "indenter_bbox_bottom_height_mm": float(DEFAULT_INDENTER_BBOX_BOTTOM_HEIGHT_MM),
+            "position_sample_ratios": {
+                "clean": float(args.position_clean_ratio),
+                "near_boundary": float(args.position_near_boundary_ratio),
+                "partial_crop": float(args.position_partial_crop_ratio),
+            },
+            "near_boundary_max_margin_mm": float(args.near_boundary_max_margin_mm),
+            "partial_crop_min_overhang_mm": float(args.partial_crop_min_overhang_mm),
+            "partial_crop_max_overhang_mm": float(args.partial_crop_max_overhang_mm),
+            "contact_reference_scale_mm": float(contact_reference_scale_mm),
+            "contact_constraint_scale_mm": float(contact_constraint_scale_mm),
+            "position_sample_counts_requested": {
+                key: int(value) for key, value in position_sample_counts_requested.items()
+            },
+            "position_sample_counts_actual": {
+                str(key): int(value) for key, value in position_sample_counts_actual.items()
+            },
             "frames_per_scale": frames_per_scale,
             "episodes_per_indenter": int(args.episodes_per_indenter),
             "indenter_count": len(indenter_names),

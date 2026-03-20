@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-遍历所有压头，计算与硅胶接触面的实际物理尺寸，并为每个压头生成一个
-能完全包围接触面的 2D bbox（矩形 + 可选正方形）。
+遍历所有压头，为每个压头计算一个 2D bbox（矩形或正方形），用于完全包住压头。
+
+默认：从下往上只取 5mm 高度的点做 xy 投影再算 bbox（--bottom-height-mm 5），排除上方法兰。
+可选 --full-footprint 用全点云（会含法兰）；--contact-face 用 z 最低一层点（与深度相关）。
 
 坐标系说明:
   bbox 和图中坐标均为「压头局部坐标系（旋转后）」的 xy 平面，单位 mm。
   - 与 gel_press.py 中使用的旋转一致：parameters.yml 里 indenter.pose 的 R,P,Y
     （默认 P=-π 绕 Y 轴 180°），旋转后 z 轴朝下为接触方向。
-  - 原点：压头 .npy 的几何中心未平移，仅做了旋转，故原点在压头模型中心附近。
+  - 原点：压头 .npy 的几何中心未平移，仅做了旋转。
   - 用于仿真时，世界坐标 = (20+x_mm, 20+y_mm) + 本 bbox 的 (x,y)。
 
 用法:
   python tools/compute_indenter_contact_bbox.py --indenter-dir sim/assets/indenters/input/npy_100000
   python tools/compute_indenter_contact_bbox.py ... --square --output indenters_bbox.json
-  python tools/compute_indenter_contact_bbox.py ... --visualize --vis-dir indenter_bbox_vis   # 保存每压头一张图便于肉眼确认
+  python tools/compute_indenter_contact_bbox.py ... --visualize --vis-dir indenter_bbox_vis
 """
 
 from __future__ import annotations
@@ -73,6 +75,31 @@ def rotation_matrix_from_pose(pose: dict[str, float], degrees: bool = False) -> 
     return rotations.matrix_from_euler((R, P, Y), 0, 1, 2, degrees)
 
 
+def get_full_footprint_xy(points: np.ndarray, rot: np.ndarray) -> np.ndarray:
+    """压头全点云旋转后投影到 xy 平面，返回 (N, 2)。会包含上方法兰等，通常偏大。"""
+    points_rot = (rot @ points.T).T
+    return points_rot[:, :2]
+
+
+def get_bottom_slice_footprint_xy(
+    points: np.ndarray,
+    rot: np.ndarray,
+    bottom_height_mm: float,
+) -> np.ndarray:
+    """
+    从下往上只取压头底部一段（z_min 到 z_min + bottom_height_mm）的点，投影到 xy，返回 (N, 2)。
+    用于排除上方法兰，只算接触端头的投影。旋转后 z 轴朝下，故 z 最小处为尖端。
+    """
+    if bottom_height_mm <= 0:
+        raise ValueError("bottom_height_mm must be > 0")
+    points_rot = (rot @ points.T).T
+    z = points_rot[:, 2]
+    z_min = float(np.nanmin(z))
+    z_max_slice = z_min + bottom_height_mm
+    mask = (z >= z_min) & (z <= z_max_slice)
+    return points_rot[mask, :2]
+
+
 def get_contact_points_xy(
     points: np.ndarray,
     rot: np.ndarray,
@@ -80,7 +107,7 @@ def get_contact_points_xy(
 ) -> np.ndarray:
     """
     取压头点云中与硅胶接触的那一层的点，投影到 xy 平面，返回 (N, 2)。
-    接触面定义为旋转后 z 最小的那一部分点（占 z 范围的 z_fraction，默认 8%）。
+    接触面定义为旋转后 z 最小的那一部分点（占 z 范围的 z_fraction）。与下压深度相关（球等会随深度变化）。
     """
     points_rot = (rot @ points.T).T
     z = points_rot[:, 2]
@@ -127,18 +154,21 @@ def apply_bbox_margin(
 def compute_indenter_bbox(
     npy_path: Path,
     rot: np.ndarray,
+    bottom_height_mm: float | None = 5.0,
+    use_full_footprint: bool = False,
     z_fraction: float = 0.08,
     square: bool = False,
     margin_mm: float = 0.0,
 ) -> dict[str, Any]:
     """
-    对单个压头 .npy 计算接触面 2D bbox。
-    返回包含 bbox_mm, width_mm, height_mm, contact_points_count 等字段的字典。
+    对单个压头 .npy 计算 2D bbox。
+    bottom_height_mm>0（默认 5）：从下往上只取该高度(mm)的点做 xy 投影，排除上方法兰。
+    bottom_height_mm=None 且 use_full_footprint=True：用全点云（会含法兰）。
+    use_full_footprint=False 且 bottom_height_mm=None：用 z_fraction 接触面。
     """
     points = np.load(npy_path).astype(np.float64)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"Expected (N, 3) array in {npy_path}, got shape {points.shape}")
-    # 去除全 nan 行
     valid = np.isfinite(points).all(axis=1)
     if not np.any(valid):
         return {
@@ -146,20 +176,28 @@ def compute_indenter_bbox(
             "width_mm": 0.0,
             "height_mm": 0.0,
             "square_side_mm": 0.0,
+            "points_count": 0,
             "contact_points_count": 0,
             "error": "no finite points",
         }
     points = points[valid]
 
-    xy = get_contact_points_xy(points, rot, z_fraction=z_fraction)
+    if bottom_height_mm is not None and bottom_height_mm > 0:
+        xy = get_bottom_slice_footprint_xy(points, rot, bottom_height_mm)
+    elif use_full_footprint:
+        xy = get_full_footprint_xy(points, rot)
+    else:
+        xy = get_contact_points_xy(points, rot, z_fraction=z_fraction)
     if xy.shape[0] < 3:
+        n_pts = int(xy.shape[0])
         return {
             "bbox_mm": [0.0, 0.0, 0.0, 0.0],
             "width_mm": 0.0,
             "height_mm": 0.0,
             "square_side_mm": 0.0,
-            "contact_points_count": int(xy.shape[0]),
-            "error": "too few contact points",
+            "points_count": n_pts,
+            "contact_points_count": n_pts,
+            "error": "too few points",
         }
 
     x_min, y_min, x_max, y_max = bbox_from_points_xy(xy)
@@ -173,11 +211,13 @@ def compute_indenter_bbox(
         side = max(width, height)
         width = height = side
 
+    n_pts = int(xy.shape[0])
     result = {
         "bbox_mm": [round(x_min, 4), round(y_min, 4), round(x_max, 4), round(y_max, 4)],
         "width_mm": round(width, 4),
         "height_mm": round(height, 4),
-        "contact_points_count": int(xy.shape[0]),
+        "points_count": n_pts,
+        "contact_points_count": n_pts,  # 兼容旧 JSON
     }
     if square:
         result["square_side_mm"] = round(max(result["width_mm"], result["height_mm"]), 4)
@@ -190,10 +230,12 @@ def draw_bbox_vis(
     results: dict[str, Any],
     rot: np.ndarray,
     vis_dir: Path,
+    bottom_height_mm: float | None = 5.0,
+    use_full_footprint: bool = False,
     z_fraction: float = 0.08,
     show_full_footprint: bool = True,
 ) -> None:
-    """为每个压头画一张图：接触点 + bbox 矩形，可选画全点云 xy 投影，便于肉眼确认 bbox 包住压头。"""
+    """为每个压头画一张图：参与 bbox 的点 + 红色 bbox；可选灰色全点云。"""
     if not _HAS_MATPLOTLIB:
         print("Warning: matplotlib not found, skip --visualize")
         return
@@ -213,27 +255,43 @@ def draw_bbox_vis(
             continue
         points = points[valid]
         points_rot = (rot @ points.T).T
-        contact_xy = get_contact_points_xy(points, rot, z_fraction=z_fraction)
+        full_xy = points_rot[:, :2]
         x_min, y_min, x_max, y_max = r["bbox_mm"]
 
         fig, ax = plt.subplots(1, 1, figsize=(6, 6))
         if show_full_footprint:
             ax.scatter(
-                points_rot[:, 0], points_rot[:, 1],
-                s=0.3, c="lightgray", alpha=0.6, label="full indenter (xy)",
+                full_xy[:, 0], full_xy[:, 1],
+                s=0.3, c="lightgray", alpha=0.5, label="full indenter (xy)",
             )
-        ax.scatter(
-            contact_xy[:, 0], contact_xy[:, 1],
-            s=2, c="C0", alpha=0.8, label="contact face",
-        )
-        # bbox 矩形：闭合
+        # 画参与 bbox 的点
+        if bottom_height_mm is not None and bottom_height_mm > 0:
+            slice_xy = get_bottom_slice_footprint_xy(points, rot, bottom_height_mm)
+            ax.scatter(
+                slice_xy[:, 0], slice_xy[:, 1],
+                s=1.5, c="C0", alpha=0.9, label=f"bottom {bottom_height_mm}mm (used for bbox)",
+            )
+            title = f"{name}  bottom {bottom_height_mm}mm bbox (mm)"
+        elif use_full_footprint:
+            ax.scatter(
+                full_xy[:, 0], full_xy[:, 1],
+                s=0.5, c="C0", alpha=0.6, label="full (used for bbox)",
+            )
+            title = f"{name}  full footprint bbox (mm)"
+        else:
+            contact_xy = get_contact_points_xy(points, rot, z_fraction=z_fraction)
+            ax.scatter(
+                contact_xy[:, 0], contact_xy[:, 1],
+                s=2, c="C0", alpha=0.8, label="contact face (z_fraction)",
+            )
+            title = f"{name}  contact-face bbox (mm)"
         rect_x = [x_min, x_max, x_max, x_min, x_min]
         rect_y = [y_min, y_min, y_max, y_max, y_min]
         ax.plot(rect_x, rect_y, "r-", linewidth=2, label="bbox")
         ax.set_aspect("equal")
         ax.set_xlabel("x (mm)")
         ax.set_ylabel("y (mm)")
-        ax.set_title(f"{name}  contact bbox (mm)")
+        ax.set_title(title)
         ax.legend(loc="upper right", fontsize=8)
         ax.grid(True, alpha=0.3)
         ax.axhline(0, color="k", linewidth=0.5, alpha=0.5)
@@ -264,10 +322,27 @@ def main() -> None:
         help="仿真参数 yaml，用于读取 indenter pose",
     )
     parser.add_argument(
+        "--bottom-height-mm",
+        type=float,
+        default=5.0,
+        metavar="MM",
+        help="从下往上只取该高度(mm)的点做 xy 投影算 bbox，排除上方法兰（默认 5）",
+    )
+    parser.add_argument(
+        "--full-footprint",
+        action="store_true",
+        help="用压头全点云 xy 投影（会含法兰）；与 --bottom-height-mm 二选一",
+    )
+    parser.add_argument(
+        "--contact-face",
+        action="store_true",
+        help="用旋转后 z 最低的一层点（z_fraction）算 bbox；与 --bottom-height-mm / --full-footprint 二选一",
+    )
+    parser.add_argument(
         "--z-fraction",
         type=float,
         default=0.08,
-        help="接触面取 z 最低的该比例点（默认 0.08）",
+        help="仅 --contact-face 时有效：接触面取 z 最低的该比例点（默认 0.08）",
     )
     parser.add_argument(
         "--square",
@@ -330,6 +405,19 @@ def main() -> None:
     if not names:
         raise FileNotFoundError(f"在 {indenter_dir} 下未找到任何 .npy 压头文件")
 
+    # 三种模式：底部一段 / 全点云 / 接触面
+    if args.contact_face:
+        bottom_height_mm = None
+        use_full_footprint = False
+    elif args.full_footprint:
+        bottom_height_mm = None
+        use_full_footprint = True
+    else:
+        bottom_height_mm = float(args.bottom_height_mm)
+        use_full_footprint = False
+        if bottom_height_mm <= 0:
+            raise ValueError("--bottom-height-mm must be > 0 (e.g. 5)")
+
     results = {}
     for name in names:
         npy_path = indenter_dir / f"{name}.npy"
@@ -340,6 +428,8 @@ def main() -> None:
             results[name] = compute_indenter_bbox(
                 npy_path,
                 rot,
+                bottom_height_mm=bottom_height_mm,
+                use_full_footprint=use_full_footprint,
                 z_fraction=args.z_fraction,
                 square=args.square,
                 margin_mm=args.margin_mm,
@@ -348,7 +438,13 @@ def main() -> None:
             results[name] = {"error": str(e)}
 
     # 打印摘要
-    print("Indenter contact-face 2D bbox (mm):")
+    if args.contact_face:
+        mode = "contact-face"
+    elif args.full_footprint:
+        mode = "full footprint"
+    else:
+        mode = f"bottom slice {args.bottom_height_mm}mm"
+    print(f"Indenter 2D bbox (mm) [mode={mode}]:")
     print("-" * 60)
     for name in names:
         r = results[name]
@@ -357,7 +453,7 @@ def main() -> None:
         else:
             b = r["bbox_mm"]
             print(f"  {name}: bbox=[{b[0]:.3f}, {b[1]:.3f}, {b[2]:.3f}, {b[3]:.3f}] "
-                  f"W={r['width_mm']:.3f} H={r['height_mm']:.3f} mm  n_contact={r['contact_points_count']}")
+                  f"W={r['width_mm']:.3f} H={r['height_mm']:.3f} mm  n_points={r['points_count']}")
     print("-" * 60)
 
     if args.output:
@@ -366,6 +462,8 @@ def main() -> None:
         meta = {
             "indenter_dir": str(indenter_dir),
             "config": str(config_path),
+            "bottom_height_mm": args.bottom_height_mm if not (args.contact_face or args.full_footprint) else None,
+            "use_full_footprint": args.full_footprint,
             "z_fraction": args.z_fraction,
             "square_bbox": args.square,
             "margin_mm": args.margin_mm,
@@ -382,6 +480,8 @@ def main() -> None:
             results,
             rot,
             vis_dir,
+            bottom_height_mm=bottom_height_mm,
+            use_full_footprint=use_full_footprint,
             z_fraction=args.z_fraction,
             show_full_footprint=not args.no_full_footprint,
         )
