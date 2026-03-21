@@ -8,6 +8,7 @@ gif/
 *.npz
 *.jpg
 checkpoints/
+usa_train_runs/
 wandb/
 img_show.py
 dataset/
