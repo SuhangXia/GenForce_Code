@@ -11,6 +11,7 @@ import timm
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
 try:
     import wandb
 except ImportError:  # pragma: no cover - optional dependency in lightweight runtime environments.
@@ -39,9 +40,13 @@ except ImportError:  # pragma: no cover - optional dependency in lightweight run
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+SCRPIT_DIR = PROJECT_ROOT / 'scrpit'
+if str(SCRPIT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRPIT_DIR))
 
 from downstream_task.datasets import MultiscaleTactileDataset
 from downstream_task.models import StaticPoseRegressor
+from usa_adapter import UniversalScaleAdapter
 
 
 def _default_dataset_root() -> Path:
@@ -53,6 +58,7 @@ def _default_dataset_root() -> Path:
 
 
 DEFAULT_DATASET_ROOT = _default_dataset_root()
+REFERENCE_SCALE_MM = 20.0
 TRAIN_INDENTERS = [
     'cone',
     'cylinder',
@@ -108,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--save-path', type=str, default=str(DEFAULT_SAVE_PATH))
     parser.add_argument('--save-every', type=int, default=5, help='Save an epoch checkpoint every N epochs.')
     parser.add_argument('--resume-from', type=str, default=None, help='Resume training from a saved checkpoint.')
+    parser.add_argument('--usa-ckpt', type=str, default='', help='Optional frozen USA checkpoint for 20mm->20mm identity training.')
     parser.add_argument('--wandb-project', type=str, default='Tactile_Downstream')
     parser.add_argument('--wandb-name', type=str, default='Train_Baseline_20mm')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -137,12 +144,17 @@ def build_datasets(dataset_root: Path):
     return train_dataset, val_dataset
 
 
-def unpack_supervised_batch(batch: object, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def unpack_supervised_batch(
+    batch: object,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(batch, (tuple, list)) and len(batch) >= 4:
-        imgs, targets, _target_coords, _source_coords = batch[:4]
+        imgs, targets, target_coords, source_coords = batch[:4]
     elif isinstance(batch, dict):
         imgs = batch['image']
         targets = batch['target']
+        target_coords = batch['target_coords']
+        source_coords = batch['source_coords']
     else:
         raise TypeError(
             'Expected each batch to yield (imgs, targets, target_coords, source_coords) or a dict variant.'
@@ -150,11 +162,13 @@ def unpack_supervised_batch(batch: object, device: torch.device) -> tuple[torch.
 
     imgs = imgs.to(device=device, dtype=torch.float32)
     targets = targets.to(device=device, dtype=torch.float32)
+    target_coords = target_coords.to(device=device, dtype=torch.float32)
+    source_coords = source_coords.to(device=device, dtype=torch.float32)
     if imgs.ndim != 4:
         raise ValueError(f'Expected imgs to have shape (B, 3, 224, 224), got {tuple(imgs.shape)}')
     if targets.ndim != 2 or targets.shape[-1] != 3:
         raise ValueError(f'Expected targets to have shape (B, 3), got {tuple(targets.shape)}')
-    return imgs, targets
+    return imgs, targets, target_coords, source_coords
 
 
 def create_loaders(train_dataset, val_dataset, args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
@@ -176,8 +190,37 @@ def create_loaders(train_dataset, val_dataset, args: argparse.Namespace) -> tupl
     return train_loader, val_loader
 
 
+def infer_usa_kwargs(state_dict: dict[str, torch.Tensor], embed_dim: int = 768) -> dict[str, object]:
+    layer_ids = sorted({int(key.split('.')[1]) for key in state_dict if key.startswith('layers.')})
+    if not layer_ids:
+        raise ValueError('USA checkpoint does not contain any adapter layers.')
+
+    return {
+        'embed_dim': embed_dim,
+        'num_heads': 8,
+        'num_layers': max(layer_ids) + 1,
+        'dropout': 0.0,
+        'coord_num_frequencies': 4,
+        'coord_scale_mm': 10.0,
+        'interp_k': 4,
+        'use_scale_token': any(key.startswith('scale_mlp.') for key in state_dict),
+        'use_final_norm': any(key.startswith('final_norm.') for key in state_dict),
+    }
+
+
+def build_usa_plugin(state_dict: dict[str, torch.Tensor], embed_dim: int = 768) -> UniversalScaleAdapter:
+    return UniversalScaleAdapter(**infer_usa_kwargs(state_dict, embed_dim=embed_dim))
+
+
+def load_checkpoint(path: Path, device: torch.device) -> dict:
+    checkpoint = torch.load(path, map_location=device)
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    return {'model_state_dict': checkpoint}
+
+
 def run_epoch(
-    model: nn.Module,
+    model: StaticPoseRegressor,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
@@ -194,8 +237,29 @@ def run_epoch(
 
     iterator = tqdm(loader, desc=desc, leave=False, disable=not progress)
     for batch in iterator:
-        imgs, targets = unpack_supervised_batch(batch, device)
-        preds = model(src_imgs=imgs)
+        imgs, targets, target_coords, _source_coords = unpack_supervised_batch(batch, device)
+
+        if model.usa_plugin is not None:
+            # Identity training on the adapter manifold: 20mm -> 20mm.
+            # We intentionally feed the same 20mm reference grid on both sides so the
+            # downstream head learns USA-processed feature statistics without scale shift.
+            baseline_coords = target_coords
+            baseline_scale_ts = torch.full(
+                (imgs.shape[0],),
+                float(REFERENCE_SCALE_MM),
+                device=device,
+                dtype=torch.float32,
+            )
+            preds = model(
+                src_imgs=imgs,
+                target_coords=baseline_coords,
+                source_coords=baseline_coords,
+                target_scale=baseline_scale_ts,
+                source_scale=baseline_scale_ts,
+            )
+        else:
+            preds = model(src_imgs=imgs)
+
         loss = criterion(preds, targets)
 
         if optimizer is not None:
@@ -241,7 +305,7 @@ def save_checkpoint(
 
 
 def _resolve_checkpoint_path(raw_path: str | None) -> Path | None:
-    if raw_path is None:
+    if raw_path is None or raw_path == '':
         return None
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
@@ -257,6 +321,7 @@ def _format_duration(seconds: float) -> str:
         return f'{hours:d}h{minutes:02d}m{secs:02d}s'
     return f'{minutes:02d}m{secs:02d}s'
 
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -268,7 +333,19 @@ def main() -> None:
     train_loader, val_loader = create_loaders(train_dataset, val_dataset, args)
 
     vit_backbone = FrozenViTBackbone()
-    model = StaticPoseRegressor(vit_backbone=vit_backbone, usa_plugin=None, out_dim=3).to(device)
+    usa_plugin = None
+    resolved_usa_ckpt = _resolve_checkpoint_path(args.usa_ckpt)
+    if resolved_usa_ckpt is not None:
+        usa_payload = load_checkpoint(resolved_usa_ckpt, device)
+        if 'model_state_dict' not in usa_payload:
+            raise KeyError(f'USA checkpoint is missing model_state_dict: {resolved_usa_ckpt}')
+        usa_plugin = build_usa_plugin(usa_payload['model_state_dict'], embed_dim=768).to(device)
+        usa_plugin.load_state_dict(usa_payload['model_state_dict'])
+        usa_plugin.eval()
+        for param in usa_plugin.parameters():
+            param.requires_grad = False
+
+    model = StaticPoseRegressor(vit_backbone=vit_backbone, usa_plugin=usa_plugin, out_dim=3).to(device)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -300,7 +377,8 @@ def main() -> None:
 
     print(
         f'Training setup | device={device} | train_samples={len(train_dataset)} | '
-        f'val_samples={len(val_dataset)} | batch_size={args.batch_size}'
+        f'val_samples={len(val_dataset)} | batch_size={args.batch_size} | '
+        f'usa_plugin={resolved_usa_ckpt if resolved_usa_ckpt is not None else "disabled"}'
     )
 
     wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
@@ -336,6 +414,7 @@ def main() -> None:
                     'val_loss': val_loss,
                     'epoch_seconds': epoch_seconds,
                     'elapsed_seconds': elapsed_seconds,
+                    'using_usa': resolved_usa_ckpt is not None,
                 }
             )
             print(

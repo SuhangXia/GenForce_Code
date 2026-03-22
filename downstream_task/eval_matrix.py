@@ -146,6 +146,14 @@ def load_checkpoint(path: Path, device: torch.device) -> dict:
     return {'model_state_dict': checkpoint}
 
 
+def strip_prefix_from_state_dict(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith(prefix)
+    }
+
+
 def build_eval_dataset(dataset_root: Path, test_scale: int, indenter_split: str):
     indenters = SEEN_INDENTERS if indenter_split == 'seen' else UNSEEN_INDENTERS
     return MultiscaleTactileDataset(
@@ -250,12 +258,8 @@ def main() -> None:
     device = torch.device(args.device)
 
     vit_backbone = FrozenViTBackbone()
-    model = StaticPoseRegressor(vit_backbone=vit_backbone, usa_plugin=None, out_dim=3).to(device)
 
-    regressor_ckpt = Path(args.regressor_ckpt)
-    reg_payload = load_checkpoint(regressor_ckpt, device)
-    model.load_state_dict(reg_payload['model_state_dict'])
-
+    usa_plugin = None
     if args.use_usa:
         if not args.usa_ckpt:
             raise ValueError('--usa_ckpt is required when --use_usa is True')
@@ -267,7 +271,24 @@ def main() -> None:
         usa_plugin.eval()
         for param in usa_plugin.parameters():
             param.requires_grad = False
-        model.usa_plugin = usa_plugin
+
+    model = StaticPoseRegressor(vit_backbone=vit_backbone, usa_plugin=usa_plugin, out_dim=3).to(device)
+
+    regressor_ckpt = Path(args.regressor_ckpt)
+    reg_payload = load_checkpoint(regressor_ckpt, device)
+    reg_state_dict = reg_payload['model_state_dict']
+    # The downstream regressor checkpoint may have been trained with a frozen USA plugin.
+    # We always load the non-USA weights from the regressor checkpoint, while USA itself is
+    # controlled explicitly by --use_usa/--usa_ckpt for evaluation.
+    reg_state_dict = strip_prefix_from_state_dict(reg_state_dict, 'usa_plugin.')
+    load_result = model.load_state_dict(reg_state_dict, strict=False)
+    unexpected_non_usa = [key for key in load_result.unexpected_keys if not key.startswith('usa_plugin.')]
+    missing_non_usa = [key for key in load_result.missing_keys if not key.startswith('usa_plugin.')]
+    if unexpected_non_usa or missing_non_usa:
+        raise RuntimeError(
+            'Failed to load regressor checkpoint cleanly. '
+            f'missing={missing_non_usa} unexpected={unexpected_non_usa}'
+        )
 
     dataset = build_eval_dataset(Path(args.dataset_root), args.test_scale, args.indenter_split)
     loader = DataLoader(

@@ -19,3 +19,4 @@ ply/
 output/
 adapter_dataset_static_v1_pilot/
 
+logs/

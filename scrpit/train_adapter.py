@@ -1123,9 +1123,7 @@ def train(args):
         else:
             val_loader = None
 
-    adapter = UniversalScaleAdapter(
-        embed_dim=vit.embed_dim, num_heads=8, num_layers=2
-    ).to(device)
+    adapter = make_adapter(vit.embed_dim).to(device)
 
     log.info(
         "USA parameters: %d",
