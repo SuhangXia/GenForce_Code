@@ -1,53 +1,33 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import timm
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-try:
-    import wandb
-except ImportError:  # pragma: no cover - optional dependency in lightweight runtime environments.
-    class _WandbStub:
-        @staticmethod
-        def init(*args, **kwargs):
-            print('wandb is not installed; continuing with local logging only.')
-            return None
 
-        @staticmethod
-        def log(*args, **kwargs):
-            return None
-
-        @staticmethod
-        def finish(*args, **kwargs):
-            return None
-
-    wandb = _WandbStub()
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-SCRPIT_DIR = PROJECT_ROOT / 'scrpit'
-if str(SCRPIT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRPIT_DIR))
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+for candidate in (SCRIPT_DIR, PROJECT_ROOT):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
 from downstream_task.datasets import MultiscaleTactileDataset
 from downstream_task.models import StaticPoseRegressor
-from downstream_task.adapter_utils import build_frozen_adapter_plugin
+try:
+    from standalone_qformer.eval_wrapper import build_frozen_qformer_plugin
+except ModuleNotFoundError:  # pragma: no cover - script execution fallback
+    from eval_wrapper import build_frozen_qformer_plugin
 
 
-def _default_dataset_root() -> Path:
-    container_path = Path('/datasets/usa_static_v1_large_run/downstream_test_16_20_23')
-    host_path = Path('/home/suhang/datasets/usa_static_v1_large_run/downstream_test_16_20_23')
-    if container_path.exists():
-        return container_path
-    return host_path
-
-
-DEFAULT_DATASET_ROOT = _default_dataset_root()
+DEFAULT_DOCKER_DATASET = Path('/datasets/usa_static_v1_large_run/downstream_test_16_20_23')
+DEFAULT_HOST_DATASET = Path('/home/suhang/datasets/usa_static_v1_large_run/downstream_test_16_20_23')
 REFERENCE_SCALE_MM = 20.0
 SEEN_INDENTERS = [
     'cone',
@@ -66,7 +46,23 @@ SEEN_INDENTERS = [
     'triangle',
 ]
 UNSEEN_INDENTERS = ['pacman', 'wave', 'torus', 'hexagon']
-TARGET_NAMES = ['mse_x', 'mse_y', 'mse_depth']
+
+
+def default_dataset_root() -> Path:
+    if DEFAULT_DOCKER_DATASET.exists():
+        return DEFAULT_DOCKER_DATASET
+    return DEFAULT_HOST_DATASET
+
+
+def str2bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = value.strip().lower()
+    if value in {'1', 'true', 't', 'yes', 'y'}:
+        return True
+    if value in {'0', 'false', 'f', 'no', 'n'}:
+        return False
+    raise argparse.ArgumentTypeError(f'Invalid boolean value: {value}')
 
 
 class FrozenViTBackbone(nn.Module):
@@ -92,32 +88,33 @@ class FrozenViTBackbone(nn.Module):
         return x[:, 1:, :]
 
 
-def str2bool(value: str | bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    value = value.strip().lower()
-    if value in {'1', 'true', 't', 'yes', 'y'}:
-        return True
-    if value in {'0', 'false', 'f', 'no', 'n'}:
-        return False
-    raise argparse.ArgumentTypeError(f'Invalid boolean value: {value}')
+def resolve_path(path_str: str | Path) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = (PROJECT_ROOT / path).resolve()
+    return path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Evaluate the static downstream regressor across scales and indenter splits.')
-    parser.add_argument('--dataset-root', type=str, default=str(DEFAULT_DATASET_ROOT))
-    parser.add_argument('--test_scale', type=int, required=True)
-    parser.add_argument('--indenter_split', type=str, choices=['seen', 'unseen'], required=True)
-    parser.add_argument('--use-adapter', '--use_usa', dest='use_usa', type=str2bool, default=False)
-    parser.add_argument('--adapter-ckpt', '--usa_ckpt', dest='usa_ckpt', type=str, default='')
-    parser.add_argument('--regressor_ckpt', type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description='Evaluate the standalone Q-Former downstream regressor across scales and indenter splits.'
+    )
+    parser.add_argument('--dataset-root', type=str, default=str(default_dataset_root()))
+    parser.add_argument('--test-scale', type=int, required=True)
+    parser.add_argument('--indenter-split', type=str, choices=['seen', 'unseen'], required=True)
+    parser.add_argument('--use-qformer', type=str2bool, default=False)
+    parser.add_argument('--qformer-ckpt', type=str, default='')
+    parser.add_argument('--regressor-ckpt', type=str, required=True)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--model-name', type=str, default='vit_base_patch16_224')
+    parser.add_argument('--max-batches', type=int, default=None)
+    parser.add_argument('--output-json', type=str, default='')
     return parser.parse_args()
 
 
-def load_checkpoint(path: Path, device: torch.device) -> dict:
+def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict):
         return checkpoint
@@ -132,7 +129,19 @@ def strip_prefix_from_state_dict(state_dict: dict[str, torch.Tensor], prefix: st
     }
 
 
-def build_eval_dataset(dataset_root: Path, test_scale: int, indenter_split: str):
+def load_regressor_state(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    filtered = strip_prefix_from_state_dict(state_dict, 'usa_plugin.')
+    load_result = model.load_state_dict(filtered, strict=False)
+    unexpected_non_plugin = [key for key in load_result.unexpected_keys if not key.startswith('usa_plugin.')]
+    missing_non_plugin = [key for key in load_result.missing_keys if not key.startswith('usa_plugin.')]
+    if unexpected_non_plugin or missing_non_plugin:
+        raise RuntimeError(
+            'Failed to load regressor checkpoint cleanly. '
+            f'missing={missing_non_plugin} unexpected={unexpected_non_plugin}'
+        )
+
+
+def build_eval_dataset(dataset_root: Path, test_scale: int, indenter_split: str) -> MultiscaleTactileDataset:
     indenters = SEEN_INDENTERS if indenter_split == 'seen' else UNSEEN_INDENTERS
     return MultiscaleTactileDataset(
         root_dir=str(dataset_root),
@@ -142,7 +151,10 @@ def build_eval_dataset(dataset_root: Path, test_scale: int, indenter_split: str)
     )
 
 
-def unpack_eval_batch(batch: object, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def unpack_eval_batch(
+    batch: object,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(batch, (tuple, list)) and len(batch) >= 4:
         imgs, targets, target_coords, source_coords = batch[:4]
     elif isinstance(batch, dict):
@@ -169,10 +181,12 @@ def unpack_eval_batch(batch: object, device: torch.device) -> tuple[torch.Tensor
 
 def evaluate(
     model: StaticPoseRegressor,
-    loader: DataLoader,
+    loader: DataLoader[Any],
     device: torch.device,
     test_scale: int,
-    use_usa: bool,
+    use_qformer: bool,
+    *,
+    max_batches: int | None,
 ) -> dict[str, float]:
     model.eval()
     sum_sq_x = 0.0
@@ -181,16 +195,13 @@ def evaluate(
     total_samples = 0
 
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
             imgs, targets, target_coords, source_coords = unpack_eval_batch(batch, device)
 
-            if use_usa:
-                # Physical meaning:
-                # - the incoming image is observed at the current test scale (for example 16mm or 23mm)
-                # - the downstream regressor was trained strictly on 20mm features
-                # - USA must therefore map: current test scale -> 20mm baseline scale
-                baseline_target_coords = target_coords
-                current_test_source_coords = source_coords
+            if use_qformer:
                 baseline_target_scale_ts = torch.full(
                     (imgs.shape[0],),
                     float(REFERENCE_SCALE_MM),
@@ -205,8 +216,8 @@ def evaluate(
                 )
                 preds = model(
                     src_imgs=imgs,
-                    target_coords=baseline_target_coords,
-                    source_coords=current_test_source_coords,
+                    target_coords=target_coords,
+                    source_coords=source_coords,
                     target_scale=baseline_target_scale_ts,
                     source_scale=current_test_source_scale_ts,
                 )
@@ -235,35 +246,23 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
 
-    vit_backbone = FrozenViTBackbone()
+    vit_backbone = FrozenViTBackbone(model_name=args.model_name, pretrained=True)
 
-    usa_plugin = None
+    qformer_plugin = None
     adapter_kind = 'none'
-    if args.use_usa:
-        if not args.usa_ckpt:
-            raise ValueError('--usa_ckpt is required when --use_usa is True')
-        usa_payload = load_checkpoint(Path(args.usa_ckpt), device)
-        if 'model_state_dict' not in usa_payload:
-            raise KeyError('USA checkpoint must contain model_state_dict')
-        usa_plugin, adapter_kind = build_frozen_adapter_plugin(usa_payload['model_state_dict'], device, embed_dim=768)
+    if args.use_qformer:
+        if not args.qformer_ckpt:
+            raise ValueError('--qformer-ckpt is required when --use-qformer is True')
+        qformer_plugin, qformer_meta = build_frozen_qformer_plugin(resolve_path(args.qformer_ckpt), device)
+        adapter_kind = str(qformer_meta.get('adapter_kind', 'scale_conditioned_qformer'))
 
-    model = StaticPoseRegressor(vit_backbone=vit_backbone, usa_plugin=usa_plugin, out_dim=3).to(device)
+    model = StaticPoseRegressor(vit_backbone=vit_backbone, usa_plugin=qformer_plugin, out_dim=3).to(device)
 
-    regressor_ckpt = Path(args.regressor_ckpt)
+    regressor_ckpt = resolve_path(args.regressor_ckpt)
     reg_payload = load_checkpoint(regressor_ckpt, device)
-    reg_state_dict = reg_payload['model_state_dict']
-    # The downstream regressor checkpoint may have been trained with a frozen USA plugin.
-    # We always load the non-USA weights from the regressor checkpoint, while USA itself is
-    # controlled explicitly by --use_usa/--usa_ckpt for evaluation.
-    reg_state_dict = strip_prefix_from_state_dict(reg_state_dict, 'usa_plugin.')
-    load_result = model.load_state_dict(reg_state_dict, strict=False)
-    unexpected_non_usa = [key for key in load_result.unexpected_keys if not key.startswith('usa_plugin.')]
-    missing_non_usa = [key for key in load_result.missing_keys if not key.startswith('usa_plugin.')]
-    if unexpected_non_usa or missing_non_usa:
-        raise RuntimeError(
-            'Failed to load regressor checkpoint cleanly. '
-            f'missing={missing_non_usa} unexpected={unexpected_non_usa}'
-        )
+    if 'model_state_dict' not in reg_payload:
+        raise KeyError(f'Regressor checkpoint is missing model_state_dict: {regressor_ckpt}')
+    load_regressor_state(model, reg_payload['model_state_dict'])
 
     dataset = build_eval_dataset(Path(args.dataset_root), args.test_scale, args.indenter_split)
     loader = DataLoader(
@@ -274,19 +273,36 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    run_name = f'Eval_{args.test_scale}mm_{args.indenter_split}_USA_{args.use_usa}'
-    wandb.init(project='Tactile_Downstream_Eval', name=run_name, config=vars(args))
-    try:
-        metrics = evaluate(model, loader, device, args.test_scale, args.use_usa)
-        metrics['adapter_kind'] = adapter_kind
-        wandb.log(metrics)
-        print(
-            f"Eval scale={args.test_scale} split={args.indenter_split} use_adapter={args.use_usa} adapter_kind={adapter_kind} | "
-            f"mse_x={metrics['mse_x']:.6f} mse_y={metrics['mse_y']:.6f} "
-            f"mse_depth={metrics['mse_depth']:.6f} mse_total={metrics['mse_total']:.6f}"
-        )
-    finally:
-        wandb.finish()
+    metrics = evaluate(
+        model,
+        loader,
+        device,
+        args.test_scale,
+        args.use_qformer,
+        max_batches=args.max_batches,
+    )
+    metrics.update(
+        {
+            'test_scale': int(args.test_scale),
+            'indenter_split': args.indenter_split,
+            'use_qformer': bool(args.use_qformer),
+            'adapter_kind': adapter_kind,
+            'regressor_ckpt': str(regressor_ckpt),
+            'qformer_ckpt': str(resolve_path(args.qformer_ckpt)) if args.qformer_ckpt else '',
+        }
+    )
+
+    if args.output_json:
+        output_path = resolve_path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+
+    print(
+        f"Eval scale={args.test_scale} split={args.indenter_split} use_qformer={args.use_qformer} adapter_kind={adapter_kind} | "
+        f"mse_x={metrics['mse_x']:.6f} mse_y={metrics['mse_y']:.6f} "
+        f"mse_depth={metrics['mse_depth']:.6f} mse_total={metrics['mse_total']:.6f}"
+    )
 
 
 if __name__ == '__main__':

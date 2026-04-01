@@ -27,7 +27,13 @@ from dd_usa_adapter import DirectDriveUniversalScaleAdapter
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST_DATASET = Path('/home/suhang/datasets/usa_static_v1_large_run/downstream_test_16_20_23')
 DEFAULT_DOCKER_DATASET = Path('/datasets/usa_static_v1_large_run/downstream_test_16_20_23')
-DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / 'checkpoints' / 'dd_usa'
+DEFAULT_HOST_CHECKPOINT_ROOT = Path('/home/suhang/datasets/checkpoints')
+DEFAULT_DOCKER_CHECKPOINT_ROOT = Path('/datasets/checkpoints')
+DEFAULT_CHECKPOINT_DIR = (
+    DEFAULT_DOCKER_CHECKPOINT_ROOT / 'dd_usa'
+    if DEFAULT_DOCKER_CHECKPOINT_ROOT.parent.exists()
+    else DEFAULT_HOST_CHECKPOINT_ROOT / 'dd_usa'
+)
 DEFAULT_CANONICAL_SCALE_MM = 20.0
 NCEPS = 1e-6
 
@@ -153,13 +159,17 @@ def infer_square_hw(num_tokens: int) -> tuple[int, int]:
 
 
 
-def resolve_checkpoint_path(path_str: str | None) -> Path | None:
+def resolve_checkpoint_path(path_str: str | Path | None) -> Path | None:
     if not path_str:
         return None
     path = Path(path_str).expanduser()
-    if not path.is_absolute():
-        path = (PROJECT_ROOT / path).resolve()
-    return path
+    if path.is_absolute():
+        return path
+    root_candidate = (DEFAULT_CHECKPOINT_DIR.parent / path).resolve()
+    legacy_candidate = (PROJECT_ROOT / path).resolve()
+    if root_candidate.exists() or not legacy_candidate.exists():
+        return root_candidate
+    return legacy_candidate
 
 
 
@@ -1168,9 +1178,9 @@ def train(args: argparse.Namespace) -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    ckpt_dir = Path(args.checkpoint_dir).expanduser()
-    if not ckpt_dir.is_absolute():
-        ckpt_dir = (PROJECT_ROOT / ckpt_dir).resolve()
+    ckpt_dir = resolve_checkpoint_path(args.checkpoint_dir)
+    if ckpt_dir is None:
+        raise RuntimeError('Failed to resolve checkpoint directory.')
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     metrics_csv_path = ckpt_dir / 'metrics.csv'
     initialize_metrics_csv(metrics_csv_path, overwrite=(not args.resume_from))

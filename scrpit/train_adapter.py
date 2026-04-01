@@ -39,12 +39,30 @@ from tqdm import tqdm
 
 from usa_adapter import UniversalScaleAdapter
 
+
+def resolve_checkpoint_reference(path_str: str | Path) -> Path:
+    path = Path(path_str).expanduser()
+    if path.is_absolute():
+        return path
+    root_candidate = (DEFAULT_CHECKPOINT_DIR.parent / path).resolve()
+    legacy_candidate = (PROJECT_ROOT / path).resolve()
+    if root_candidate.exists() or not legacy_candidate.exists():
+        return root_candidate
+    return legacy_candidate
+
 # ---------------------------------------------------------------------------
 # Config & logging
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATASET = PROJECT_ROOT / "datasets" / "usa_static_v1"
+DEFAULT_HOST_CHECKPOINT_ROOT = Path('/home/suhang/datasets/checkpoints')
+DEFAULT_DOCKER_CHECKPOINT_ROOT = Path('/datasets/checkpoints')
+DEFAULT_CHECKPOINT_DIR = (
+    DEFAULT_DOCKER_CHECKPOINT_ROOT / 'usa_adapter'
+    if DEFAULT_DOCKER_CHECKPOINT_ROOT.parent.exists()
+    else DEFAULT_HOST_CHECKPOINT_ROOT / 'usa_adapter'
+)
 
 # Fixed indenter-level split for USA training/evaluation.
 TRAIN_INDENTERS = frozenset(
@@ -995,9 +1013,7 @@ def train(args):
     )
 
     if args.test_only:
-        ckpt_dir = Path(args.checkpoint_dir).expanduser()
-        if not ckpt_dir.is_absolute():
-            ckpt_dir = (PROJECT_ROOT / ckpt_dir).resolve()
+        ckpt_dir = resolve_checkpoint_reference(args.checkpoint_dir)
         adapter = make_adapter(vit.embed_dim).to(device)
 
         ckpt_path_raw = args.test_checkpoint or args.resume_from
@@ -1009,9 +1025,7 @@ def train(args):
                     f"Checkpoint not found for --test-only. Checked: {default_candidates[0]} and {default_candidates[1]}"
                 )
         else:
-            ckpt_path = Path(ckpt_path_raw).expanduser()
-            if not ckpt_path.is_absolute():
-                ckpt_path = (PROJECT_ROOT / ckpt_path).resolve()
+            ckpt_path = resolve_checkpoint_reference(ckpt_path_raw)
             if not ckpt_path.exists():
                 raise FileNotFoundError(f"Checkpoint not found for --test-only: {ckpt_path}")
 
@@ -1155,9 +1169,7 @@ def train(args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    ckpt_dir = Path(args.checkpoint_dir).expanduser()
-    if not ckpt_dir.is_absolute():
-        ckpt_dir = (PROJECT_ROOT / ckpt_dir).resolve()
+    ckpt_dir = resolve_checkpoint_reference(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log.info("Checkpoint dir: %s", ckpt_dir)
     metrics_csv_path = ckpt_dir / "metrics.csv"
@@ -1196,9 +1208,7 @@ def train(args):
         torch.save(payload, path)
 
     if args.resume_from is not None:
-        resume_path = Path(args.resume_from).expanduser()
-        if not resume_path.is_absolute():
-            resume_path = (PROJECT_ROOT / resume_path).resolve()
+        resume_path = resolve_checkpoint_reference(args.resume_from)
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
 
@@ -1700,7 +1710,7 @@ def parse_args():
     p.add_argument(
         "--checkpoint-dir",
         type=str,
-        default=str(PROJECT_ROOT / "checkpoints" / "usa_adapter"),
+        default=str(DEFAULT_CHECKPOINT_DIR),
         help="Directory for training checkpoints (best.pt and periodic epoch checkpoints).",
     )
     p.add_argument("--scales", nargs="+", type=int, default=[15, 18, 20, 22, 25])

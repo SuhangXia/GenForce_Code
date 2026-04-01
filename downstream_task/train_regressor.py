@@ -46,7 +46,7 @@ if str(SCRPIT_DIR) not in sys.path:
 
 from downstream_task.datasets import MultiscaleTactileDataset
 from downstream_task.models import StaticPoseRegressor
-from usa_adapter import UniversalScaleAdapter
+from downstream_task.adapter_utils import build_frozen_adapter_plugin
 
 
 def _default_dataset_root() -> Path:
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--save-path', type=str, default=str(DEFAULT_SAVE_PATH))
     parser.add_argument('--save-every', type=int, default=5, help='Save an epoch checkpoint every N epochs.')
     parser.add_argument('--resume-from', type=str, default=None, help='Resume training from a saved checkpoint.')
-    parser.add_argument('--usa-ckpt', type=str, default='', help='Optional frozen USA checkpoint for 20mm->20mm identity training.')
+    parser.add_argument('--adapter-ckpt', '--usa-ckpt', dest='usa_ckpt', type=str, default='', help='Optional frozen adapter checkpoint (USA or DD-USA) for frozen-plugin downstream training.')
     parser.add_argument('--wandb-project', type=str, default='Tactile_Downstream')
     parser.add_argument('--wandb-name', type=str, default='Train_Baseline_20mm')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -190,30 +190,8 @@ def create_loaders(train_dataset, val_dataset, args: argparse.Namespace) -> tupl
     return train_loader, val_loader
 
 
-def infer_usa_kwargs(state_dict: dict[str, torch.Tensor], embed_dim: int = 768) -> dict[str, object]:
-    layer_ids = sorted({int(key.split('.')[1]) for key in state_dict if key.startswith('layers.')})
-    if not layer_ids:
-        raise ValueError('USA checkpoint does not contain any adapter layers.')
-
-    return {
-        'embed_dim': embed_dim,
-        'num_heads': 8,
-        'num_layers': max(layer_ids) + 1,
-        'dropout': 0.0,
-        'coord_num_frequencies': 4,
-        'coord_scale_mm': 10.0,
-        'interp_k': 4,
-        'use_scale_token': any(key.startswith('scale_mlp.') for key in state_dict),
-        'use_final_norm': any(key.startswith('final_norm.') for key in state_dict),
-    }
-
-
-def build_usa_plugin(state_dict: dict[str, torch.Tensor], embed_dim: int = 768) -> UniversalScaleAdapter:
-    return UniversalScaleAdapter(**infer_usa_kwargs(state_dict, embed_dim=embed_dim))
-
-
 def load_checkpoint(path: Path, device: torch.device) -> dict:
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict):
         return checkpoint
     return {'model_state_dict': checkpoint}
@@ -334,16 +312,13 @@ def main() -> None:
 
     vit_backbone = FrozenViTBackbone()
     usa_plugin = None
+    adapter_kind = 'none'
     resolved_usa_ckpt = _resolve_checkpoint_path(args.usa_ckpt)
     if resolved_usa_ckpt is not None:
         usa_payload = load_checkpoint(resolved_usa_ckpt, device)
         if 'model_state_dict' not in usa_payload:
             raise KeyError(f'USA checkpoint is missing model_state_dict: {resolved_usa_ckpt}')
-        usa_plugin = build_usa_plugin(usa_payload['model_state_dict'], embed_dim=768).to(device)
-        usa_plugin.load_state_dict(usa_payload['model_state_dict'])
-        usa_plugin.eval()
-        for param in usa_plugin.parameters():
-            param.requires_grad = False
+        usa_plugin, adapter_kind = build_frozen_adapter_plugin(usa_payload['model_state_dict'], device, embed_dim=768)
 
     model = StaticPoseRegressor(vit_backbone=vit_backbone, usa_plugin=usa_plugin, out_dim=3).to(device)
 
@@ -362,7 +337,7 @@ def main() -> None:
         resume_path = _resolve_checkpoint_path(args.resume_from)
         if resume_path is None or not resume_path.exists():
             raise FileNotFoundError(f'Resume checkpoint not found: {args.resume_from}')
-        payload = torch.load(resume_path, map_location=device)
+        payload = torch.load(resume_path, map_location=device, weights_only=False)
         if 'model_state_dict' not in payload:
             raise KeyError(f'Checkpoint is missing model_state_dict: {resume_path}')
         model.load_state_dict(payload['model_state_dict'])
@@ -378,7 +353,8 @@ def main() -> None:
     print(
         f'Training setup | device={device} | train_samples={len(train_dataset)} | '
         f'val_samples={len(val_dataset)} | batch_size={args.batch_size} | '
-        f'usa_plugin={resolved_usa_ckpt if resolved_usa_ckpt is not None else "disabled"}'
+        f'adapter_ckpt={resolved_usa_ckpt if resolved_usa_ckpt is not None else "disabled"} | '
+        f'adapter_kind={adapter_kind}'
     )
 
     wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
@@ -414,7 +390,8 @@ def main() -> None:
                     'val_loss': val_loss,
                     'epoch_seconds': epoch_seconds,
                     'elapsed_seconds': elapsed_seconds,
-                    'using_usa': resolved_usa_ckpt is not None,
+                    'using_adapter': resolved_usa_ckpt is not None,
+                    'adapter_kind': adapter_kind,
                 }
             )
             print(

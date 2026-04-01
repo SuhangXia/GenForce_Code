@@ -27,7 +27,13 @@ from dd_usa_adapter import DirectDriveUniversalScaleAdapter
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST_DATASET = Path('/home/suhang/datasets/usa_static_v1_large_run/full_5scales_ep100_boundarymix')
 DEFAULT_DOCKER_DATASET = Path('/datasets/usa_static_v1_large_run/full_5scales_ep100_boundarymix')
-DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / 'checkpoints' / 'dd_usa_pretrain'
+DEFAULT_HOST_CHECKPOINT_ROOT = Path('/home/suhang/datasets/checkpoints')
+DEFAULT_DOCKER_CHECKPOINT_ROOT = Path('/datasets/checkpoints')
+DEFAULT_CHECKPOINT_DIR = (
+    DEFAULT_DOCKER_CHECKPOINT_ROOT / 'dd_usa_pretrain'
+    if DEFAULT_DOCKER_CHECKPOINT_ROOT.parent.exists()
+    else DEFAULT_HOST_CHECKPOINT_ROOT / 'dd_usa_pretrain'
+)
 
 TRAIN_INDENTERS = (
     'cone',
@@ -110,6 +116,17 @@ def resolve_path(path_str: str | Path) -> Path:
     if not path.is_absolute():
         path = (PROJECT_ROOT / path).resolve()
     return path
+
+
+def resolve_checkpoint_reference(path_str: str | Path) -> Path:
+    path = Path(path_str).expanduser()
+    if path.is_absolute():
+        return path
+    root_candidate = (DEFAULT_CHECKPOINT_DIR.parent / path).resolve()
+    legacy_candidate = (PROJECT_ROOT / path).resolve()
+    if root_candidate.exists() or not legacy_candidate.exists():
+        return root_candidate
+    return legacy_candidate
 
 
 def initialize_metrics_csv(path: Path, overwrite: bool) -> None:
@@ -903,7 +920,7 @@ def save_checkpoint(
 def resolve_resume_checkpoint(path_str: str | None) -> Path | None:
     if not path_str:
         return None
-    path = resolve_path(path_str)
+    path = resolve_checkpoint_reference(path_str)
     if path.is_dir():
         path = path / 'latest.pt'
     if not path.exists():
@@ -1115,7 +1132,7 @@ def main() -> None:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dataset_root = resolve_path(args.dataset)
-    checkpoint_dir = resolve_path(args.checkpoint_dir)
+    checkpoint_dir = resolve_checkpoint_reference(args.checkpoint_dir)
     resume_path = resolve_resume_checkpoint(args.resume_from)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     metrics_csv_path = checkpoint_dir / 'metrics.csv'
