@@ -18,17 +18,20 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import csv
 import datetime as dt
 import json
 import logging
 import math
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 import random
 import shlex
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -330,6 +333,108 @@ def _throughput_text(stage_start_ts: float, done: int) -> str:
     return f"throughput={rate:.3f}/s"
 
 
+def resolve_render_backlog_thresholds(args: argparse.Namespace) -> Tuple[int, int]:
+    high = int(args.render_backlog_high_watermark)
+    low = int(args.render_backlog_low_watermark)
+    if high <= 0:
+        high = max(8, int(args.max_render_workers) * 4)
+    if low <= 0:
+        low = max(int(args.max_render_workers), high // 2)
+    if low > high:
+        low = high
+    return high, low
+
+
+def inspect_binary_stl(path: Path) -> Tuple[bool, str]:
+    if not path.exists():
+        return False, "missing"
+    try:
+        size = int(path.stat().st_size)
+        if size < 84:
+            return False, f"too_small:{size}"
+        with open(path, "rb") as f:
+            header = f.read(84)
+        if len(header) < 84:
+            return False, f"short_header:{len(header)}"
+        tri_count = int(struct.unpack("<I", header[80:84])[0])
+        if tri_count <= 0:
+            return False, f"zero_triangles:{tri_count}"
+        expected_size = 84 + 50 * tri_count
+        if size != expected_size:
+            return False, f"size_mismatch:{size}!={expected_size}"
+        return True, "ok"
+    except Exception as exc:
+        return False, f"inspect_error:{exc}"
+
+
+def build_sequence_blender_script(*, render_device: str, render_gpu_backend: str) -> str:
+    script = str(legacy.BLENDER_TEMP_SCRIPT)
+    script = script.replace(
+        '    p.add_argument("--render-samples", type=int, default=32)\n',
+        '    p.add_argument("--render-samples", type=int, default=32)\n'
+        '    p.add_argument("--render-device", choices=["cpu", "gpu"], default="cpu")\n'
+        '    p.add_argument(\n'
+        '        "--render-gpu-backend",\n'
+        '        choices=["auto", "optix", "cuda", "hip", "oneapi", "metal"],\n'
+        '        default="auto",\n'
+        '    )\n',
+    )
+    script = script.replace(
+        "def configure_render(out_dir: Path, render_samples: int):\n",
+        "def configure_render(out_dir: Path, render_samples: int, render_device: str, render_gpu_backend: str):\n",
+    )
+    script = script.replace(
+        '    if hasattr(scene, "cycles"):\n'
+        '        scene.cycles.samples = max(1, int(render_samples))\n'
+        '        scene.cycles.use_adaptive_sampling = True\n'
+        '        scene.cycles.max_bounces = 4\n'
+        '        scene.cycles.device = "CPU"\n',
+        '    if hasattr(scene, "cycles"):\n'
+        '        scene.cycles.samples = max(1, int(render_samples))\n'
+        '        scene.cycles.use_adaptive_sampling = True\n'
+        '        scene.cycles.max_bounces = 4\n'
+        '        scene.cycles.device = "CPU"\n'
+        '        if str(render_device).lower() == "gpu":\n'
+        '            selected_backend = None\n'
+        '            backend_arg = str(render_gpu_backend).strip().upper()\n'
+        '            backend_candidates = ["OPTIX", "CUDA", "HIP", "ONEAPI", "METAL"] if backend_arg in {"", "AUTO"} else [backend_arg]\n'
+        '            cycles_addon = bpy.context.preferences.addons.get("cycles")\n'
+        '            if cycles_addon is None:\n'
+        '                print("Cycles addon not available; falling back to CPU render")\n'
+        '            else:\n'
+        '                prefs = cycles_addon.preferences\n'
+        '                for backend_name in backend_candidates:\n'
+        '                    try:\n'
+        '                        prefs.compute_device_type = backend_name\n'
+        '                        if hasattr(prefs, "refresh_devices"):\n'
+        '                            prefs.refresh_devices()\n'
+        '                        elif hasattr(prefs, "get_devices"):\n'
+        '                            prefs.get_devices()\n'
+        '                        devices = list(getattr(prefs, "devices", []))\n'
+        '                        gpu_devices = [dev for dev in devices if str(getattr(dev, "type", "")).upper() != "CPU"]\n'
+        '                        if not gpu_devices:\n'
+        '                            continue\n'
+        '                        for dev in devices:\n'
+        '                            dev.use = str(getattr(dev, "type", "")).upper() != "CPU"\n'
+        '                        scene.cycles.device = "GPU"\n'
+        '                        selected_backend = backend_name\n'
+        '                        break\n'
+        '                    except Exception as exc:\n'
+        '                        print(f"GPU backend unavailable: {backend_name} ({exc})")\n'
+        '                if selected_backend is None:\n'
+        '                    print("No usable GPU backend found; falling back to CPU render")\n'
+        '                else:\n'
+        '                    print(f"Cycles render device=GPU backend={selected_backend}")\n'
+        '        else:\n'
+        '            print("Cycles render device=CPU")\n',
+    )
+    script = script.replace(
+        "    configure_render(output_dir, int(args.render_samples))\n",
+        "    configure_render(output_dir, int(args.render_samples), str(args.render_device), str(args.render_gpu_backend))\n",
+    )
+    return script
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate multiscale tactile sequence datasets.")
     p.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parent)
@@ -457,6 +562,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--meshing-timeout-sec", type=int, default=600)
     p.add_argument("--render-timeout-sec", type=int, default=900)
     p.add_argument("--render-samples", type=int, default=32)
+    p.add_argument("--render-device", choices=["cpu", "gpu"], default="cpu")
+    p.add_argument(
+        "--render-gpu-backend",
+        choices=["auto", "optix", "cuda", "hip", "oneapi", "metal"],
+        default="auto",
+    )
+    p.add_argument("--auto-balance-pipeline", action="store_true")
+    p.add_argument("--render-backlog-high-watermark", type=int, default=0)
+    p.add_argument("--render-backlog-low-watermark", type=int, default=0)
     p.add_argument("--python-cmd", type=str, default=sys.executable)
     p.add_argument("--blender-cmd", type=str, default="blender")
     p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -492,8 +606,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--partial-crop-min-overhang-mm must be >= 0")
     if args.partial_crop_max_overhang_mm < args.partial_crop_min_overhang_mm:
         raise ValueError("--partial-crop-max-overhang-mm must be >= --partial-crop-min-overhang-mm")
-    if args.max_physics_workers <= 0 or args.max_meshing_workers <= 0 or args.max_render_workers <= 0:
-        raise ValueError("Worker counts must be > 0")
+    if args.max_physics_workers < 0 or args.max_meshing_workers <= 0 or args.max_render_workers <= 0:
+        raise ValueError("Worker counts must satisfy: physics >= 0, meshing > 0, render > 0")
+    if args.max_physics_workers == 0 and not args.resume:
+        raise ValueError("--max-physics-workers 0 is only supported together with --resume (backlog-drain mode)")
+    if args.render_backlog_high_watermark < 0 or args.render_backlog_low_watermark < 0:
+        raise ValueError("Render backlog watermarks must be >= 0")
+    if (
+        args.render_backlog_high_watermark > 0
+        and args.render_backlog_low_watermark > 0
+        and args.render_backlog_low_watermark > args.render_backlog_high_watermark
+    ):
+        raise ValueError("--render-backlog-low-watermark must be <= --render-backlog-high-watermark")
     if args.physics_timeout_sec <= 0 or args.meshing_timeout_sec <= 0 or args.render_timeout_sec <= 0:
         raise ValueError("Timeouts must be > 0")
     if args.render_samples <= 0:
@@ -1513,6 +1637,87 @@ def run_physics_sequence_task(task: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def build_scale_state_from_task_and_npz(
+    *,
+    episode_state: SequenceEpisodeState,
+    task: Dict[str, Any],
+    npz_path: Path,
+    patch_h: int,
+    patch_w: int,
+    physics_reused: bool,
+    physics_npz_cleanup_policy: str,
+) -> SequenceScaleState:
+    camera_distance_m, camera_fov_deg = task["camera_params"]
+    scale_dir = episode_state.episode_dir / str(task["scale_key"])
+    scale_dir.mkdir(parents=True, exist_ok=True)
+    coord_map = legacy.make_adapter_coord_map(float(task["scale_simulated_mm"]), patch_h, patch_w)
+    adapter_coord_map_path = scale_dir / "adapter_coord_map.npy"
+    np.save(adapter_coord_map_path, coord_map)
+    temporal_plan_payload = TemporalPlan(**task["temporal_plan"])
+    trajectory_length, deform_final, frames, _ = extract_or_construct_sequence_from_npz(
+        npz_path=npz_path,
+        temporal_plan=temporal_plan_payload,
+    )
+    return SequenceScaleState(
+        episode_id=int(task["episode_id"]),
+        scale_requested_mm=float(task["scale_requested_mm"]),
+        scale_simulated_mm=float(task["scale_simulated_mm"]),
+        scale_quantized=bool(task["scale_quantized"]),
+        scale_key=str(task["scale_key"]),
+        scale_dir=scale_dir,
+        temp_scale_dir=Path(task["temp_scale_dir"]),
+        contact_x_mm=float(task["x_mm"]),
+        contact_y_mm=float(task["y_mm"]),
+        contact_x_norm=float(task["contact_x_norm"]),
+        contact_y_norm=float(task["contact_y_norm"]),
+        indenter_split=episode_state.indenter_split,
+        scale_split=str(task["scale_split"]),
+        is_unseen_indenter=bool(episode_state.is_unseen_indenter),
+        is_unseen_scale=bool(task["is_unseen_scale"]),
+        trajectory_length=int(trajectory_length),
+        deformation_stats_final=deform_final,
+        camera_mode=str(task["camera_mode"]),
+        camera_distance_m=float(camera_distance_m),
+        camera_fov_deg=float(camera_fov_deg),
+        adapter_coord_map_path=adapter_coord_map_path,
+        adapter_coord_map_shape=[int(v) for v in coord_map.shape],
+        frames=frames,
+        physics_npz_path=npz_path,
+        physics_reused=bool(physics_reused),
+        physics_npz_cleanup_policy=str(physics_npz_cleanup_policy),
+    )
+
+
+def build_meshing_tasks_for_scale_state(
+    *,
+    scale_state: SequenceScaleState,
+    episode_id: int,
+    repo_root: Path,
+    args: argparse.Namespace,
+    open3d_script: Path,
+) -> List[Dict[str, Any]]:
+    tasks: List[Dict[str, Any]] = []
+    for frame in scale_state.frames:
+        stl_path = scale_state.temp_scale_dir / "stl" / f"{frame.frame_name}.stl"
+        tasks.append(
+            {
+                "episode_id": episode_id,
+                "scale_simulated_mm": scale_state.scale_simulated_mm,
+                "frame_name": frame.frame_name,
+                "source_physics_frame_index": frame.source_physics_frame_index,
+                "repo_root": repo_root,
+                "stl_path": stl_path,
+                "python_cmd": args.python_cmd,
+                "open3d_script": open3d_script,
+                "npz_path": scale_state.physics_npz_path,
+                "meshing_timeout_sec": args.meshing_timeout_sec,
+                "sample": {"frame_name": frame.frame_name},
+                "resume": bool(args.resume),
+            }
+        )
+    return tasks
+
+
 def run_meshing_sequence_task(task: Dict[str, Any]) -> Dict[str, Any]:
     episode_id = int(task["episode_id"])
     scale_simulated_mm = float(task["scale_simulated_mm"])
@@ -1525,16 +1730,27 @@ def run_meshing_sequence_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         if resume_mode and stl_path.exists():
-            return {
-                "status": "ok",
-                "episode_id": episode_id,
-                "scale_simulated_mm": scale_simulated_mm,
-                "frame_name": frame_name,
-                "frame_index": frame_index,
-                "stl_path": str(stl_path),
-                "sample": task["sample"],
-                "reused": True,
-            }
+            valid, reason = inspect_binary_stl(stl_path)
+            if valid:
+                return {
+                    "status": "ok",
+                    "episode_id": episode_id,
+                    "scale_simulated_mm": scale_simulated_mm,
+                    "frame_name": frame_name,
+                    "frame_index": frame_index,
+                    "stl_path": str(stl_path),
+                    "sample": task["sample"],
+                    "reused": True,
+                }
+            logging.warning(
+                "Invalid existing STL detected; regenerating | ep=%d scale=%.4f frame=%s stl=%s reason=%s",
+                episode_id,
+                scale_simulated_mm,
+                frame_name,
+                stl_path,
+                reason,
+            )
+            stl_path.unlink(missing_ok=True)
         mesh_cmd = [
             str(task["python_cmd"]),
             str(task["open3d_script"]),
@@ -1551,6 +1767,10 @@ def run_meshing_sequence_task(task: Dict[str, Any]) -> Dict[str, Any]:
             timeout_sec=int(task["meshing_timeout_sec"]),
             stage=f"npz_to_stl[{frame_name}]",
         )
+        valid, reason = inspect_binary_stl(stl_path)
+        if not valid:
+            stl_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Invalid STL generated at {stl_path}: {reason}")
         return {
             "status": "ok",
             "episode_id": episode_id,
@@ -1605,6 +1825,9 @@ def run_render_sequence_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
         if not stl_path.exists():
             raise FileNotFoundError(f"Missing STL for render: {stl_path}")
+        valid_stl, stl_reason = inspect_binary_stl(stl_path)
+        if not valid_stl:
+            raise RuntimeError(f"Invalid STL for render: {stl_path} ({stl_reason})")
 
         render_cmd = [
             str(task["blender_cmd"]),
@@ -1634,6 +1857,10 @@ def run_render_sequence_task(task: Dict[str, Any]) -> Dict[str, Any]:
             str(task["uv_inset_ratio"]),
             "--render-samples",
             str(task["render_samples"]),
+            "--render-device",
+            str(task.get("render_device", "cpu")),
+            "--render-gpu-backend",
+            str(task.get("render_gpu_backend", "auto")),
         ]
         legacy.run_cmd_checked(
             render_cmd,
@@ -1943,6 +2170,13 @@ def build_run_status_payload(
         "marker_texture_count": int(len(getattr(args, "marker_textures_selected", []))),
         "marker_texture_selection_mode": str(getattr(args, "marker_texture_selection_mode", "")),
         "marker_texture_seed": int(getattr(args, "marker_texture_seed", args.seed)),
+        "render_device": str(args.render_device),
+        "render_gpu_backend": str(args.render_gpu_backend),
+        "auto_balance_pipeline": bool(args.auto_balance_pipeline),
+        "render_backlog_thresholds": {
+            "high": int(resolve_render_backlog_thresholds(args)[0]),
+            "low": int(resolve_render_backlog_thresholds(args)[1]),
+        },
         "physics_npz_cleanup": str(args.physics_npz_cleanup),
         "keep_intermediates": bool(args.keep_intermediates),
         "cleanup_effective": bool(str(args.physics_npz_cleanup) == "delete_after_scale_complete"),
@@ -2074,6 +2308,13 @@ def build_manifest(
         "marker_texture_count": int(len(getattr(args, "marker_textures_selected", []))),
         "marker_texture_selection_mode": str(getattr(args, "marker_texture_selection_mode", "all")),
         "marker_texture_seed": int(getattr(args, "marker_texture_seed", args.seed)),
+        "render_device": str(args.render_device),
+        "render_gpu_backend": str(args.render_gpu_backend),
+        "auto_balance_pipeline": bool(args.auto_balance_pipeline),
+        "render_backlog_thresholds": {
+            "high": int(resolve_render_backlog_thresholds(args)[0]),
+            "low": int(resolve_render_backlog_thresholds(args)[1]),
+        },
         "physics_npz_cleanup": str(args.physics_npz_cleanup),
         "keep_intermediates": bool(args.keep_intermediates),
         "cleanup_effective": bool(str(args.physics_npz_cleanup) == "delete_after_scale_complete"),
@@ -3032,7 +3273,13 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
     open3d_script = script_tmp_dir / "tmp_npz2stl.py"
     blender_script = script_tmp_dir / "tmp_blender_multirender.py"
     open3d_script.write_text(legacy.OPEN3D_TEMP_SCRIPT, encoding="utf-8")
-    blender_script.write_text(legacy.BLENDER_TEMP_SCRIPT, encoding="utf-8")
+    blender_script.write_text(
+        build_sequence_blender_script(
+            render_device=str(args.render_device),
+            render_gpu_backend=str(args.render_gpu_backend),
+        ),
+        encoding="utf-8",
+    )
     selected_texture_dir = prepare_selected_texture_dir(
         selected_textures=selected_textures,
         selection_mode=marker_selection_mode,
@@ -3048,6 +3295,10 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
     expected_images_planned = int(args.planning_summary["totals"]["expected_images_planned"])
 
     try:
+        backlog_drain_mode = bool(args.resume and int(args.max_physics_workers) == 0)
+        if backlog_drain_mode:
+            logging.info("Backlog drain mode enabled | resume=True max_physics_workers=0")
+            total_physics_tasks = 0
         physics_stage_start = time.time()
         meshing_stage_start: float | None = None
         render_stage_start: float | None = None
@@ -3065,23 +3316,152 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
         physics_status_written = False
         meshing_status_written = False
 
-        with (
-            cf.ProcessPoolExecutor(max_workers=int(args.max_physics_workers)) as physics_pool,
-            cf.ProcessPoolExecutor(max_workers=int(args.max_meshing_workers)) as meshing_pool,
-            cf.ProcessPoolExecutor(max_workers=int(args.max_render_workers)) as render_pool,
-        ):
+        with contextlib.ExitStack() as stack:
+            physics_pool = (
+                stack.enter_context(cf.ProcessPoolExecutor(max_workers=int(args.max_physics_workers)))
+                if int(args.max_physics_workers) > 0
+                else None
+            )
+            meshing_pool = stack.enter_context(cf.ProcessPoolExecutor(max_workers=int(args.max_meshing_workers)))
+            render_pool = stack.enter_context(cf.ProcessPoolExecutor(max_workers=int(args.max_render_workers)))
             physics_futures: Dict[cf.Future, Dict[str, Any]] = {}
             meshing_futures: Dict[cf.Future, Dict[str, Any]] = {}
             render_futures: Dict[cf.Future, Dict[str, Any]] = {}
+            physics_pending_tasks: deque[Dict[str, Any]] = deque()
+            meshing_pending_tasks: deque[Dict[str, Any]] = deque()
+            render_pending_tasks: deque[Dict[str, Any]] = deque()
+            render_backlog_high, render_backlog_low = resolve_render_backlog_thresholds(args)
+            pipeline_paused = False
 
-            for task in physics_tasks:
-                physics_futures[physics_pool.submit(run_physics_sequence_task, task)] = task
+            def render_backlog_size() -> int:
+                return int(len(render_futures) + len(render_pending_tasks))
 
-            while physics_futures or meshing_futures or render_futures:
+            def maybe_update_balance_state(force_log: bool = False) -> None:
+                nonlocal pipeline_paused
+                if not bool(args.auto_balance_pipeline):
+                    return
+                backlog = render_backlog_size()
+                if (not pipeline_paused) and backlog >= render_backlog_high:
+                    pipeline_paused = True
+                    logging.info(
+                        "Pipeline auto-balance | pausing meshing/physics submissions render_backlog=%d high=%d low=%d",
+                        backlog,
+                        render_backlog_high,
+                        render_backlog_low,
+                    )
+                elif pipeline_paused and backlog <= render_backlog_low:
+                    pipeline_paused = False
+                    logging.info(
+                        "Pipeline auto-balance | resuming meshing/physics submissions render_backlog=%d high=%d low=%d",
+                        backlog,
+                        render_backlog_high,
+                        render_backlog_low,
+                    )
+                elif force_log and bool(args.auto_balance_pipeline):
+                    logging.info(
+                        "Pipeline auto-balance | state=%s render_backlog=%d high=%d low=%d",
+                        "paused" if pipeline_paused else "active",
+                        backlog,
+                        render_backlog_high,
+                        render_backlog_low,
+                    )
+
+            def submit_ready_work() -> None:
+                maybe_update_balance_state()
+                while render_pending_tasks and len(render_futures) < int(args.max_render_workers):
+                    render_task = render_pending_tasks.popleft()
+                    render_futures[render_pool.submit(run_render_sequence_task, render_task)] = render_task
+                if pipeline_paused:
+                    return
+                while meshing_pending_tasks and len(meshing_futures) < int(args.max_meshing_workers):
+                    mesh_task = meshing_pending_tasks.popleft()
+                    meshing_futures[meshing_pool.submit(run_meshing_sequence_task, mesh_task)] = mesh_task
+                if physics_pool is not None:
+                    while physics_pending_tasks and len(physics_futures) < int(args.max_physics_workers):
+                        physics_task = physics_pending_tasks.popleft()
+                        physics_futures[physics_pool.submit(run_physics_sequence_task, physics_task)] = physics_task
+
+            if physics_pool is not None:
+                physics_pending_tasks.extend(physics_tasks)
+            else:
+                backlog_seeded = 0
+                backlog_missing_npz = 0
+                backlog_invalid_npz = 0
+                for task in physics_tasks:
+                    npz_root = Path(task["temp_scale_dir"]) / "npz"
+                    npz_path = legacy.expected_npz_path(
+                        npz_root,
+                        str(task["indenter"]),
+                        float(task["x_mm"]),
+                        float(task["y_mm"]),
+                        float(task["depth_mm"]),
+                    )
+                    if not npz_path.exists():
+                        x_tag = legacy.format_coord_suffix(float(task["x_mm"]))
+                        y_tag = legacy.format_coord_suffix(float(task["y_mm"]))
+                        candidates = sorted((npz_root / str(task["indenter"])).glob(f"{x_tag}_{y_tag}_*.npz"))
+                        if not candidates:
+                            backlog_missing_npz += 1
+                            continue
+                        npz_path = candidates[-1]
+                    try:
+                        episode_id = int(task["episode_id"])
+                        scale_state = build_scale_state_from_task_and_npz(
+                            episode_state=episode_states[episode_id],
+                            task=task,
+                            npz_path=npz_path,
+                            patch_h=patch_h,
+                            patch_w=patch_w,
+                            physics_reused=True,
+                            physics_npz_cleanup_policy=str(args.physics_npz_cleanup),
+                        )
+                    except Exception as exc:
+                        backlog_invalid_npz += 1
+                        logging.warning(
+                            "Backlog drain skipped invalid NPZ | ep=%d scale=%s npz=%s err=%s",
+                            int(task["episode_id"]),
+                            str(task["scale_key"]),
+                            npz_path,
+                            exc,
+                        )
+                        continue
+                    scale_states[(episode_id, scale_state.scale_key)] = scale_state
+                    for mesh_task in build_meshing_tasks_for_scale_state(
+                        scale_state=scale_state,
+                        episode_id=episode_id,
+                        repo_root=repo_root,
+                        args=args,
+                        open3d_script=open3d_script,
+                    ):
+                        meshing_pending_tasks.append(mesh_task)
+                        meshing_submitted += 1
+                    if meshing_stage_start is None and meshing_pending_tasks:
+                        meshing_stage_start = time.time()
+                    backlog_seeded += 1
+                logging.info(
+                    "Backlog drain seeded scales | seeded=%d missing_npz=%d invalid_npz=%d",
+                    backlog_seeded,
+                    backlog_missing_npz,
+                    backlog_invalid_npz,
+                )
+            maybe_update_balance_state(force_log=True)
+            while (
+                physics_pending_tasks
+                or meshing_pending_tasks
+                or render_pending_tasks
+                or physics_futures
+                or meshing_futures
+                or render_futures
+            ):
+                submit_ready_work()
                 pending_futures: List[cf.Future] = []
                 pending_futures.extend(list(physics_futures.keys()))
                 pending_futures.extend(list(meshing_futures.keys()))
                 pending_futures.extend(list(render_futures.keys()))
+                if not pending_futures:
+                    maybe_update_balance_state(force_log=True)
+                    time.sleep(0.1)
+                    continue
                 done_set, _ = cf.wait(pending_futures, return_when=cf.FIRST_COMPLETED)
 
                 for future in done_set:
@@ -3102,37 +3482,12 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
                                 result.get("error", ""),
                             )
                         else:
-                            camera_distance_m, camera_fov_deg = task["camera_params"]
-                            scale_dir = episode_state.episode_dir / str(task["scale_key"])
-                            coord_map = legacy.make_adapter_coord_map(float(task["scale_simulated_mm"]), patch_h, patch_w)
-                            adapter_coord_map_path = scale_dir / "adapter_coord_map.npy"
-                            np.save(adapter_coord_map_path, coord_map)
-                            frames = [SequenceFrameRecord(**frame) for frame in result["frames"]]
-                            scale_state = SequenceScaleState(
-                                episode_id=episode_id,
-                                scale_requested_mm=float(result["scale_requested_mm"]),
-                                scale_simulated_mm=float(result["scale_simulated_mm"]),
-                                scale_quantized=bool(result["scale_quantized"]),
-                                scale_key=str(result["scale_key"]),
-                                scale_dir=scale_dir,
-                                temp_scale_dir=Path(result["temp_scale_dir"]),
-                                contact_x_mm=float(result["x_mm"]),
-                                contact_y_mm=float(result["y_mm"]),
-                                contact_x_norm=float(task["contact_x_norm"]),
-                                contact_y_norm=float(task["contact_y_norm"]),
-                                indenter_split=episode_state.indenter_split,
-                                scale_split=str(task["scale_split"]),
-                                is_unseen_indenter=bool(episode_state.is_unseen_indenter),
-                                is_unseen_scale=bool(task["is_unseen_scale"]),
-                                trajectory_length=int(result["trajectory_length"]),
-                                deformation_stats_final=result["deformation_stats_final"],
-                                camera_mode=str(task["camera_mode"]),
-                                camera_distance_m=float(camera_distance_m),
-                                camera_fov_deg=float(camera_fov_deg),
-                                adapter_coord_map_path=adapter_coord_map_path,
-                                adapter_coord_map_shape=[int(v) for v in coord_map.shape],
-                                frames=frames,
-                                physics_npz_path=Path(result["npz_path"]),
+                            scale_state = build_scale_state_from_task_and_npz(
+                                episode_state=episode_state,
+                                task=task,
+                                npz_path=Path(result["npz_path"]),
+                                patch_h=patch_h,
+                                patch_w=patch_w,
                                 physics_reused=bool(result["physics_reused"]),
                                 physics_npz_cleanup_policy=str(args.physics_npz_cleanup),
                             )
@@ -3140,26 +3495,17 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
                                 physics_reused += 1
                             scale_states[(episode_id, scale_state.scale_key)] = scale_state
 
-                            for frame in frames:
-                                stl_path = scale_state.temp_scale_dir / "stl" / f"{frame.frame_name}.stl"
-                                mesh_task = {
-                                    "episode_id": episode_id,
-                                    "scale_simulated_mm": scale_state.scale_simulated_mm,
-                                    "frame_name": frame.frame_name,
-                                    "source_physics_frame_index": frame.source_physics_frame_index,
-                                    "repo_root": repo_root,
-                                    "stl_path": stl_path,
-                                    "python_cmd": args.python_cmd,
-                                    "open3d_script": open3d_script,
-                                    "npz_path": scale_state.physics_npz_path,
-                                    "meshing_timeout_sec": args.meshing_timeout_sec,
-                                    "sample": {"frame_name": frame.frame_name},
-                                    "resume": bool(args.resume),
-                                }
-                                meshing_futures[meshing_pool.submit(run_meshing_sequence_task, mesh_task)] = mesh_task
+                            for mesh_task in build_meshing_tasks_for_scale_state(
+                                scale_state=scale_state,
+                                episode_id=episode_id,
+                                repo_root=repo_root,
+                                args=args,
+                                open3d_script=open3d_script,
+                            ):
+                                meshing_pending_tasks.append(mesh_task)
                                 meshing_submitted += 1
-                                if meshing_stage_start is None:
-                                    meshing_stage_start = time.time()
+                            if meshing_stage_start is None and meshing_pending_tasks:
+                                meshing_stage_start = time.time()
 
                         maybe_log_stage_progress(
                             stage_name="Physics",
@@ -3223,12 +3569,14 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
                                     "uv_mode": args.uv_mode,
                                     "uv_inset_ratio": args.uv_inset_ratio,
                                     "render_samples": args.render_samples,
+                                    "render_device": args.render_device,
+                                    "render_gpu_backend": args.render_gpu_backend,
                                     "render_timeout_sec": args.render_timeout_sec,
                                     "force_black_side_border_px": args.force_black_side_border_px,
                                 }
-                                render_futures[render_pool.submit(run_render_sequence_task, render_task)] = render_task
+                                render_pending_tasks.append(render_task)
                                 render_submitted += 1
-                                if render_stage_start is None:
+                                if render_stage_start is None and render_pending_tasks:
                                     render_stage_start = time.time()
 
                         maybe_log_stage_progress(
@@ -3307,7 +3655,9 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
                             expected_images=expected_images_planned,
                         )
 
-                if (not physics_status_written) and (not physics_futures):
+                submit_ready_work()
+
+                if (not physics_status_written) and (not physics_futures) and (not physics_pending_tasks):
                     maybe_log_stage_progress(
                         stage_name="Physics",
                         stage_start_ts=physics_stage_start,
@@ -3327,7 +3677,13 @@ def generate_from_scratch(args: argparse.Namespace) -> None:
                     )
                     physics_status_written = True
 
-                if (not meshing_status_written) and (not physics_futures) and (not meshing_futures):
+                if (
+                    (not meshing_status_written)
+                    and (not physics_futures)
+                    and (not physics_pending_tasks)
+                    and (not meshing_futures)
+                    and (not meshing_pending_tasks)
+                ):
                     maybe_log_stage_progress(
                         stage_name="Meshing",
                         stage_start_ts=meshing_stage_start if meshing_stage_start is not None else run_start_ts,

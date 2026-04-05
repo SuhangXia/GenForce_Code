@@ -1,0 +1,31 @@
+experiment:
+  name: sccwm_legacy_regressor
+  seed: 42
+
+dataset:
+  dataset_b_root: /home/suhang/datasets/usa_static_v1_large_run/sequence_profile_b_clips
+  clip_train_split: train
+  clip_val_split: val
+
+legacy_regressor:
+  type: temporal
+  observation_channels: 3
+  feature_dim: 128
+  hidden_dim: 128
+  output_dim: 3
+
+train:
+  epochs: 30
+  batch_size: 16
+  val_batch_size: 16
+  workers: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  save_every: 5
+  output_dir: /home/suhang/datasets/checkpoints/sccwm_legacy_regressor
+  no_progress: false
+
+system:
+  device: cuda
+  wandb_project: SCCWM_Legacy
+  wandb_name: sccwm_legacy_regressor

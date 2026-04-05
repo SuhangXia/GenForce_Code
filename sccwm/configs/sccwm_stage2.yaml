@@ -1,0 +1,23 @@
+base_config: sccwm_base.yaml
+
+experiment:
+  name: sccwm_stage2_state
+
+train:
+  output_dir: /home/suhang/datasets/checkpoints/sccwm_stage2_state
+  best_metric: state_mae_mean
+  best_mode: min
+
+loss:
+  feature_recon: 1.0
+  aux_observation_recon: 0.2
+  temporal_consistency: 0.1
+  rest_state_lock: 0.1
+  state_supervision: 1.0
+  state_consistency: 0.5
+  geometry_consistency: 0.2
+  counterfactual_ranking: 0.0
+  plugin_distillation: 0.0
+
+system:
+  wandb_name: sccwm_stage2_state

@@ -1,0 +1,71 @@
+experiment:
+  name: sccwm_base
+  seed: 42
+
+dataset:
+  dataset_a_root: /home/suhang/datasets/usa_static_v1_large_run/sequence_profile_a_any2any
+  dataset_b_root: /home/suhang/datasets/usa_static_v1_large_run/sequence_profile_b_clips
+  train_split: train
+  val_split: val
+  clip_train_split: train
+  clip_val_split: val
+  sequence_length: 3
+
+model:
+  input_channels: 3
+  feature_dim: 128
+  sensor_dim: 64
+  world_hidden_dim: 128
+  geometry_dim: 64
+  visibility_dim: 32
+  lattice_size: 32
+  reconstruct_observation: true
+  enable_contact_mask: false
+
+legacy_regressor:
+  type: temporal
+  observation_channels: 3
+  feature_dim: 128
+  hidden_dim: 128
+  output_dim: 3
+
+loss:
+  feature_recon: 1.0
+  aux_observation_recon: 0.2
+  state_supervision: 1.0
+  state_consistency: 0.5
+  geometry_consistency: 0.2
+  temporal_consistency: 0.1
+  rest_state_lock: 0.1
+  counterfactual_ranking: 0.2
+  counterfactual_margin: 0.25
+  plugin_distillation: 0.5
+  grad_clip_norm: 1.0
+
+train:
+  epochs: 30
+  batch_size: 8
+  val_batch_size: 8
+  workers: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  save_every: 5
+  output_dir: /home/suhang/datasets/checkpoints/sccwm_base
+  resume_from: ""
+  best_metric: loss
+  best_mode: min
+  no_progress: false
+
+eval:
+  batch_size: 8
+  workers: 4
+  exact_scales_mm: []
+  band_ranges_mm: []
+
+plugin:
+  legacy_ckpt: ""
+
+system:
+  device: cuda
+  wandb_project: SCCWM
+  wandb_name: sccwm_base
