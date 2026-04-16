@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from .utils import (
     build_temporal_observation,
@@ -31,13 +32,15 @@ class LegacyClipDataset(Dataset[dict[str, Any]]):
         *,
         split: str | None = None,
         clip_index_file: str | Path | None = None,
+        gray_cache_max_items: int = 256,
     ) -> None:
         super().__init__()
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.split = None if split is None else str(split)
+        self.gray_cache_max_items = max(int(gray_cache_max_items), 0)
         self.index_path = resolve_existing_path(self.dataset_root, clip_index_file or "clip_index.jsonl")
         self._coord_cache: dict[Path, torch.Tensor] = {}
-        self._gray_cache: dict[Path, torch.Tensor] = {}
+        self._gray_cache: OrderedDict[Path, torch.Tensor] = OrderedDict()
         self._episode_meta_cache: dict[Path, dict[str, Any]] = {}
         self._rows = self._build_rows()
         if not self._rows:
@@ -134,9 +137,21 @@ class LegacyClipDataset(Dataset[dict[str, Any]]):
         return self._coord_cache[path]
 
     def _load_gray(self, path: Path) -> torch.Tensor:
-        if path not in self._gray_cache:
-            self._gray_cache[path] = torch.from_numpy(rgb_to_gray(load_rgb(path)))
-        return self._gray_cache[path]
+        cached = self._gray_cache.get(path)
+        if cached is not None:
+            self._gray_cache.move_to_end(path)
+            return cached
+        gray = torch.from_numpy(rgb_to_gray(load_rgb(path)))
+        worker_info = get_worker_info()
+        cache_limit = self.gray_cache_max_items
+        if worker_info is not None and cache_limit > 0:
+            cache_limit = min(cache_limit, 64)
+        if cache_limit > 0:
+            self._gray_cache[path] = gray
+            self._gray_cache.move_to_end(path)
+            while len(self._gray_cache) > cache_limit:
+                self._gray_cache.popitem(last=False)
+        return gray
 
     def _load_episode_meta(self, path: Path) -> dict[str, Any]:
         if path not in self._episode_meta_cache:

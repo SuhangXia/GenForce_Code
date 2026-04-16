@@ -8,6 +8,10 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 from PIL import Image
+from PIL import ImageFile
+
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -30,6 +34,18 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
                 raise TypeError(f"Expected JSON object in {path}:{line_no}, got {type(payload)}")
             rows.append(payload)
     return rows
+
+
+def iter_jsonl(path: str | Path) -> Iterable[dict[str, Any]]:
+    with open(Path(path), "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                raise TypeError(f"Expected JSON object in {path}:{line_no}, got {type(payload)}")
+            yield payload
 
 
 def load_coord_map(path: str | Path) -> torch.Tensor:
@@ -131,6 +147,7 @@ def safe_int(value: Any, name: str) -> int:
 @dataclass(frozen=True)
 class FrameMetadata:
     global_seq_index: int
+    frame_name: str
     phase_name: str
     phase_index: int
     phase_progress: float

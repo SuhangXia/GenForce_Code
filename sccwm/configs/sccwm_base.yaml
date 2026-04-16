@@ -10,6 +10,7 @@ dataset:
   clip_train_split: train
   clip_val_split: val
   sequence_length: 3
+  gray_cache_max_items: 256
 
 model:
   input_channels: 3

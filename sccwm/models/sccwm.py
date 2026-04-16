@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .common import MLP, repeat_time, sequence_last_valid, spatial_softargmax2d
 from .counterfactual_decoder import CounterfactualDecoder
@@ -71,6 +72,18 @@ class SCCWM(nn.Module):
         half_scale = (scale_mm.reshape(view_shape) / 2.0).clamp_min(1e-6)
         return x_mm / half_scale, y_mm / half_scale
 
+    def _align_patch_features_to_coord_map(self, patch_features: torch.Tensor, coord_map: torch.Tensor) -> torch.Tensor:
+        if patch_features.dim() != 5:
+            raise ValueError(f"Expected patch_features shape (B,T,D,H,W), got {tuple(patch_features.shape)}")
+        if coord_map.dim() != 4 or coord_map.shape[-1] != 2:
+            raise ValueError(f"Expected coord_map shape (B,H,W,2), got {tuple(coord_map.shape)}")
+        target_hw = (int(coord_map.shape[1]), int(coord_map.shape[2]))
+        if patch_features.shape[-2:] == target_hw:
+            return patch_features
+        b, t, d, _, _ = patch_features.shape
+        pooled = F.adaptive_avg_pool2d(patch_features.reshape(b * t, d, patch_features.shape[-2], patch_features.shape[-1]), target_hw)
+        return pooled.reshape(b, t, d, target_hw[0], target_hw[1])
+
     def _predict_state(
         self,
         hidden_seq: torch.Tensor,
@@ -125,11 +138,12 @@ class SCCWM(nn.Module):
         device = obs_seq.device
         dtype = obs_seq.dtype
         scale = self._prepare_scale(scale_mm, b, device, dtype)
-        patch_features = self.patch_encoder(obs_seq)
-        sensor_embedding = self.sensor_encoder(coord_map.to(device=device, dtype=dtype), scale)
+        coord_map_t = coord_map.to(device=device, dtype=dtype)
+        patch_features = self._align_patch_features_to_coord_map(self.patch_encoder(obs_seq), coord_map_t)
+        sensor_embedding = self.sensor_encoder(coord_map_t, scale)
         world_features, occupancy = self.projector.splat_to_world_lattice(
             patch_features,
-            coord_map.to(device=device, dtype=dtype),
+            coord_map_t,
             absolute_contact_xy_mm=absolute_contact_xy_mm,
             world_origin_xy_mm=world_origin_xy_mm,
         )

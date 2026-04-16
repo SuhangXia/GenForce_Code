@@ -23,9 +23,25 @@ def feature_reconstruction_loss(decoded: torch.Tensor, target: torch.Tensor) -> 
     return F.smooth_l1_loss(decoded, target)
 
 
+def _resize_decoded_observation_to_target(decoded: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if decoded.shape[-2:] == target.shape[-2:]:
+        return decoded
+    if decoded.dim() != 5 or target.dim() != 5:
+        raise ValueError(f"Expected decoded/target observation tensors with shape (B,T,C,H,W), got {tuple(decoded.shape)} and {tuple(target.shape)}")
+    b, t, c, _, _ = decoded.shape
+    resized = F.interpolate(
+        decoded.reshape(b * t, c, decoded.shape[-2], decoded.shape[-1]),
+        size=target.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.reshape(b, t, c, target.shape[-2], target.shape[-1])
+
+
 def auxiliary_observation_loss(decoded: torch.Tensor | None, target: torch.Tensor) -> torch.Tensor:
     if decoded is None:
         return target.new_zeros(())
+    decoded = _resize_decoded_observation_to_target(decoded, target)
     return charbonnier_loss(decoded, target)
 
 
@@ -115,6 +131,7 @@ def rest_state_lock_loss(
     feat_lock = F.smooth_l1_loss(decoded_features[batch_idx, time_idx], target_features[batch_idx, time_idx])
     obs_lock = target_obs.new_zeros(())
     if decoded_obs is not None:
+        decoded_obs = _resize_decoded_observation_to_target(decoded_obs, target_obs)
         obs_lock = charbonnier_loss(decoded_obs[batch_idx, time_idx], target_obs[batch_idx, time_idx])
     return depth_lock + feat_lock + obs_lock, {
         "rest_depth": depth_lock.detach(),

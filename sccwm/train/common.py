@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
+import math
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -15,25 +18,27 @@ except ImportError:  # pragma: no cover
     def tqdm(iterable, *args, **kwargs):  # type: ignore
         return iterable
 
+class _WandbStub:
+    @staticmethod
+    def init(*args: Any, **kwargs: Any) -> None:
+        print("wandb SDK is unavailable; continuing with local logging only.")
+        return None
+
+    @staticmethod
+    def log(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    @staticmethod
+    def finish(*args: Any, **kwargs: Any) -> None:
+        return None
+
+
 try:
     import wandb as _wandb  # type: ignore
 except ImportError:  # pragma: no cover
-    class _WandbStub:
-        @staticmethod
-        def init(*args: Any, **kwargs: Any) -> None:
-            print("wandb is not installed; continuing with local logging only.")
-            return None
-
-        @staticmethod
-        def log(*args: Any, **kwargs: Any) -> None:
-            return None
-
-        @staticmethod
-        def finish(*args: Any, **kwargs: Any) -> None:
-            return None
     wandb = _WandbStub()
 else:
-    wandb = _wandb
+    wandb = _wandb if hasattr(_wandb, "init") and callable(getattr(_wandb, "init", None)) else _WandbStub()
 
 from sccwm.datasets import LegacyClipDataset, PairedSequenceDataset
 from sccwm.losses import build_negative_labels, build_state_embedding, compute_sccwm_losses
@@ -41,6 +46,58 @@ from sccwm.metrics.regression_metrics import compute_regression_metrics
 from sccwm.metrics.ccauc_metric import compute_ccauc
 from sccwm.models import LegacyStaticRegressor, LegacyTemporalRegressor, SCCWM
 from sccwm.utils.config import dump_json, format_seconds, resolve_path, seed_everything
+
+
+def _tqdm_metric_postfix(rows: list[dict[str, float]]) -> dict[str, str]:
+    if not rows:
+        return {}
+    latest = aggregate_metric_rows(rows[-20:])
+    keys = [
+        "loss",
+        "feature_recon",
+        "state_supervision_source",
+        "state_consistency",
+        "counterfactual_ranking",
+        "plugin_gt",
+        "pred_mae_mean",
+    ]
+    postfix: dict[str, str] = {}
+    for key in keys:
+        if key in latest:
+            postfix[key] = f"{latest[key]:.4f}"
+    return postfix
+
+
+def _safe_loader_workers(
+    requested_workers: int,
+    dataset: Any,
+    *,
+    label: str,
+    allow_large_index_workers: bool = False,
+) -> int:
+    workers = int(requested_workers)
+    index_path = getattr(dataset, "index_path", None)
+    if workers <= 0 or index_path is None:
+        return max(workers, 0)
+    try:
+        index_size_mb = Path(index_path).stat().st_size / (1024.0 * 1024.0)
+    except OSError:
+        return max(workers, 0)
+    if index_size_mb >= 512.0:
+        subset_filtered = getattr(dataset, "episode_id_subset", None) is not None
+        streaming_safe = bool(getattr(dataset, "uses_streaming_index", False))
+        if allow_large_index_workers or (streaming_safe and subset_filtered):
+            print(
+                f"{label} index is large ({index_size_mb:.1f} MB); honoring DataLoader workers={workers} "
+                "because this dataset is using the streaming/subset path."
+            )
+            return max(workers, 0)
+        print(
+            f"{label} index is large ({index_size_mb:.1f} MB); forcing DataLoader workers=0 "
+            "to avoid duplicating the dataset index across worker processes."
+        )
+        return 0
+    return max(workers, 0)
 
 
 def aggregate_metric_rows(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -112,13 +169,105 @@ def normalize_phase_batch(batch_phase_names: Any) -> list[list[str]]:
 
 def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    non_blocking = device.type == "cuda"
     for key, value in batch.items():
         if torch.is_tensor(value):
-            out[key] = value.to(device=device, dtype=torch.float32 if value.is_floating_point() else value.dtype)
+            out[key] = value.to(
+                device=device,
+                dtype=torch.float32 if value.is_floating_point() else value.dtype,
+                non_blocking=non_blocking,
+            )
         else:
             out[key] = value
     out["phase_names"] = normalize_phase_batch(batch.get("phase_names", []))
     return out
+
+
+def _select_split_root(ds_cfg: dict[str, Any], *, split: str, dataset_key: str) -> Path:
+    split = str(split)
+    if dataset_key == "a":
+        per_split_key = {
+            "train": "train_dataset_a_root",
+            "val": "val_dataset_a_root",
+            "test": "test_dataset_a_root",
+        }.get(split, "")
+        fallback_key = "dataset_a_root"
+    elif dataset_key == "b":
+        per_split_key = {
+            "train": "train_dataset_b_root",
+            "val": "val_dataset_b_root",
+            "test": "test_dataset_b_root",
+        }.get(split, "")
+        fallback_key = "dataset_b_root"
+    else:
+        raise ValueError(f"Unsupported dataset_key={dataset_key!r}")
+
+    root_value = ds_cfg.get(per_split_key) if per_split_key else None
+    if root_value is None:
+        root_value = ds_cfg[fallback_key]
+    return resolve_path(root_value)
+
+
+def _select_split_index_file(ds_cfg: dict[str, Any], *, split: str, dataset_key: str) -> str | Path | None:
+    split = str(split)
+    if dataset_key == "a":
+        return {
+            "train": ds_cfg.get("train_index_file"),
+            "val": ds_cfg.get("val_index_file"),
+            "test": ds_cfg.get("test_index_file"),
+        }.get(split)
+    if dataset_key == "b":
+        return {
+            "train": ds_cfg.get("clip_train_index_file"),
+            "val": ds_cfg.get("clip_val_index_file"),
+            "test": ds_cfg.get("clip_test_index_file"),
+        }.get(split)
+    raise ValueError(f"Unsupported dataset_key={dataset_key!r}")
+
+
+def _build_paired_loader(
+    cfg: dict[str, Any],
+    *,
+    split: str,
+    batch_size: int,
+    workers: int,
+    sequence_length: int,
+    shuffle: bool,
+    episode_id_subset: set[int] | None = None,
+) -> DataLoader[Any]:
+    ds_cfg = cfg.get("dataset", {})
+    train_cfg = cfg.get("train", {})
+    root = _select_split_root(ds_cfg, split=split, dataset_key="a")
+    index_file = _select_split_index_file(ds_cfg, split=split, dataset_key="a")
+    gray_cache_max_items = int(ds_cfg.get("gray_cache_max_items", 256))
+    allow_large_index_workers = bool(train_cfg.get("allow_large_index_workers", False))
+    is_dynamic_train_subset = shuffle and episode_id_subset is not None
+    dataset = PairedSequenceDataset(
+        root,
+        split=split,
+        sequence_length=sequence_length,
+        index_file=index_file,
+        episode_id_subset=episode_id_subset,
+        gray_cache_max_items=gray_cache_max_items,
+    )
+    dataset_workers = _safe_loader_workers(
+        workers,
+        dataset,
+        label=f"{split}",
+        allow_large_index_workers=allow_large_index_workers and is_dynamic_train_subset,
+    )
+    pin_memory = default_device(cfg).type == "cuda"
+    loader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": dataset_workers,
+        "pin_memory": pin_memory,
+    }
+    if dataset_workers > 0:
+        loader_kwargs["persistent_workers"] = not is_dynamic_train_subset
+        loader_kwargs["prefetch_factor"] = 2
+    return DataLoader(**loader_kwargs)
 
 
 def build_paired_loaders(cfg: dict[str, Any]) -> tuple[DataLoader[Any], DataLoader[Any]]:
@@ -126,15 +275,52 @@ def build_paired_loaders(cfg: dict[str, Any]) -> tuple[DataLoader[Any], DataLoad
     batch_size = int(cfg.get("train", {}).get("batch_size", 8))
     val_batch_size = int(cfg.get("train", {}).get("val_batch_size", batch_size))
     workers = int(cfg.get("train", {}).get("workers", 4))
-    root = resolve_path(ds_cfg["dataset_a_root"])
     seq_len = int(ds_cfg.get("sequence_length", 3))
-    train_ds = PairedSequenceDataset(root, split=str(ds_cfg.get("train_split", "train")), sequence_length=seq_len)
-    val_ds = PairedSequenceDataset(root, split=str(ds_cfg.get("val_split", "val")), sequence_length=seq_len)
-    pin_memory = default_device(cfg).type == "cuda"
+    train_split = str(ds_cfg.get("train_split", "train"))
+    val_split = str(ds_cfg.get("val_split", "val"))
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=pin_memory),
-        DataLoader(val_ds, batch_size=val_batch_size, shuffle=False, num_workers=workers, pin_memory=pin_memory),
+        _build_paired_loader(cfg, split=train_split, batch_size=batch_size, workers=workers, sequence_length=seq_len, shuffle=True),
+        _build_paired_loader(cfg, split=val_split, batch_size=val_batch_size, workers=workers, sequence_length=seq_len, shuffle=False),
     )
+
+
+def _discover_train_episode_buckets(train_root: Path) -> dict[str, list[int]]:
+    buckets: dict[str, list[int]] = {}
+    for meta_path in sorted(train_root.glob("episode_*/metadata.json")):
+        episode_id = int(meta_path.parent.name.split("_")[-1])
+        payload = json.loads(meta_path.read_text())
+        indenter = str(payload.get("indenter", "unknown"))
+        buckets.setdefault(indenter, []).append(episode_id)
+    for values in buckets.values():
+        values.sort()
+    return buckets
+
+
+def _sample_train_episode_subset(cfg: dict[str, Any], *, epoch: int) -> set[int] | None:
+    train_cfg = cfg.get("train", {})
+    ds_cfg = cfg.get("dataset", {})
+    per_indenter = int(train_cfg.get("sample_episodes_per_indenter_per_epoch", 0))
+    total = int(train_cfg.get("sample_episodes_per_epoch", 0))
+    if per_indenter <= 0 and total <= 0:
+        return None
+    train_split = str(ds_cfg.get("train_split", "train"))
+    train_root = _select_split_root(ds_cfg, split=train_split, dataset_key="a")
+    buckets = _discover_train_episode_buckets(train_root)
+    rng = random.Random(int(cfg.get("experiment", {}).get("seed", 42)) + int(epoch))
+    if per_indenter > 0:
+        selected: set[int] = set()
+        for episode_ids in buckets.values():
+            if not episode_ids:
+                continue
+            if per_indenter >= len(episode_ids):
+                selected.update(episode_ids)
+            else:
+                selected.update(rng.sample(episode_ids, per_indenter))
+        return selected
+    all_episode_ids = sorted({episode_id for values in buckets.values() for episode_id in values})
+    if total >= len(all_episode_ids):
+        return set(all_episode_ids)
+    return set(rng.sample(all_episode_ids, total))
 
 
 def build_clip_loaders(cfg: dict[str, Any]) -> tuple[DataLoader[Any], DataLoader[Any]]:
@@ -142,13 +328,21 @@ def build_clip_loaders(cfg: dict[str, Any]) -> tuple[DataLoader[Any], DataLoader
     batch_size = int(cfg.get("train", {}).get("batch_size", 8))
     val_batch_size = int(cfg.get("train", {}).get("val_batch_size", batch_size))
     workers = int(cfg.get("train", {}).get("workers", 4))
-    root = resolve_path(ds_cfg["dataset_b_root"])
-    train_ds = LegacyClipDataset(root, split=str(ds_cfg.get("clip_train_split", "train")))
-    val_ds = LegacyClipDataset(root, split=str(ds_cfg.get("clip_val_split", "val")))
+    train_split = str(ds_cfg.get("clip_train_split", "train"))
+    val_split = str(ds_cfg.get("clip_val_split", "val"))
+    train_root = _select_split_root(ds_cfg, split=train_split, dataset_key="b")
+    val_root = _select_split_root(ds_cfg, split=val_split, dataset_key="b")
+    train_index_file = _select_split_index_file(ds_cfg, split=train_split, dataset_key="b")
+    val_index_file = _select_split_index_file(ds_cfg, split=val_split, dataset_key="b")
+    gray_cache_max_items = int(ds_cfg.get("gray_cache_max_items", 256))
+    train_ds = LegacyClipDataset(train_root, split=train_split, clip_index_file=train_index_file, gray_cache_max_items=gray_cache_max_items)
+    val_ds = LegacyClipDataset(val_root, split=val_split, clip_index_file=val_index_file, gray_cache_max_items=gray_cache_max_items)
+    train_workers = _safe_loader_workers(workers, train_ds, label="clip-train")
+    val_workers = _safe_loader_workers(workers, val_ds, label="clip-val")
     pin_memory = default_device(cfg).type == "cuda"
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=pin_memory),
-        DataLoader(val_ds, batch_size=val_batch_size, shuffle=False, num_workers=workers, pin_memory=pin_memory),
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=train_workers, pin_memory=pin_memory),
+        DataLoader(val_ds, batch_size=val_batch_size, shuffle=False, num_workers=val_workers, pin_memory=pin_memory),
     )
 
 
@@ -187,12 +381,16 @@ def run_legacy_epoch(
     *,
     desc: str,
     progress: bool,
+    max_batches: int | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
     rows: list[dict[str, float]] = []
-    iterator = tqdm(loader, desc=desc, leave=False, disable=not progress)
-    for batch in iterator:
+    total = len(loader) if max_batches is None else min(len(loader), max_batches)
+    iterator = tqdm(loader, desc=desc, leave=False, disable=not progress, total=total)
+    for batch_idx, batch in enumerate(iterator):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         batch = move_batch_to_device(batch, device)
         outputs = model(clip_obs=batch["clip_obs"])
         pred = outputs["pred"]
@@ -205,6 +403,10 @@ def run_legacy_epoch(
         metrics = compute_regression_metrics(pred.detach(), target.detach())
         metrics["loss"] = float(loss.item())
         rows.append(metrics)
+        if progress:
+            postfix = _tqdm_metric_postfix(rows)
+            if postfix:
+                iterator.set_postfix(postfix)
     return aggregate_metric_rows(rows)
 
 
@@ -232,14 +434,18 @@ def run_sccwm_epoch(
     plugin_model: torch.nn.Module | None,
     desc: str,
     progress: bool,
+    max_batches: int | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
     if plugin_model is not None:
         plugin_model.eval()
     rows: list[dict[str, float]] = []
-    iterator = tqdm(loader, desc=desc, leave=False, disable=not progress)
-    for batch in iterator:
+    total = len(loader) if max_batches is None else min(len(loader), max_batches)
+    iterator = tqdm(loader, desc=desc, leave=False, disable=not progress, total=total)
+    for batch_idx, batch in enumerate(iterator):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         batch = move_batch_to_device(batch, device)
         abs_contact = batch["absolute_contact_xy_mm"] if bool(batch["has_absolute_contact_xy_mm"].any()) else None
         outputs = model.forward_pair(
@@ -289,13 +495,34 @@ def run_sccwm_epoch(
             neg = torch.nn.functional.cosine_similarity(source_state, target_state[neg_idx], dim=1)
             metrics.update(compute_ccauc(pos.detach().cpu().numpy(), neg.detach().cpu().numpy()))
         rows.append(metrics)
+        if progress:
+            postfix = _tqdm_metric_postfix(rows)
+            if postfix:
+                iterator.set_postfix(postfix)
     return aggregate_metric_rows(rows)
 
 
 def train_sccwm_stage(cfg: dict[str, Any], *, stage: str) -> None:
     device = default_device(cfg)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     seed_everything(int(cfg.get("experiment", {}).get("seed", 42)))
-    train_loader, val_loader = build_paired_loaders(cfg)
+    ds_cfg = cfg.get("dataset", {})
+    train_cfg = cfg.get("train", {})
+    batch_size = int(train_cfg.get("batch_size", 8))
+    val_batch_size = int(train_cfg.get("val_batch_size", batch_size))
+    workers = int(train_cfg.get("workers", 4))
+    seq_len = int(ds_cfg.get("sequence_length", 3))
+    train_split = str(ds_cfg.get("train_split", "train"))
+    val_split = str(ds_cfg.get("val_split", "val"))
+    val_loader = _build_paired_loader(
+        cfg,
+        split=val_split,
+        batch_size=val_batch_size,
+        workers=workers,
+        sequence_length=seq_len,
+        shuffle=False,
+    )
     model = build_sccwm_model(cfg, device)
     plugin_model = None
     if stage == "stage4":
@@ -307,10 +534,13 @@ def train_sccwm_stage(cfg: dict[str, Any], *, stage: str) -> None:
         load_model_state(plugin_model, ckpt, device)
         for param in plugin_model.parameters():
             param.requires_grad = False
-
-    train_cfg = cfg.get("train", {})
     loss_cfg = cfg.get("loss", {})
     output_dir = resolve_path(train_cfg["output_dir"])
+    metrics_history_path = output_dir / "metrics_history.jsonl"
+    max_train_samples = int(train_cfg.get("max_train_samples_per_epoch", 0))
+    max_val_samples = int(train_cfg.get("max_val_samples", 0))
+    max_train_batches = math.ceil(max_train_samples / max(batch_size, 1)) if max_train_samples > 0 else None
+    max_val_batches = math.ceil(max_val_samples / max(val_batch_size, 1)) if max_val_samples > 0 else None
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(train_cfg.get("lr", 1e-4)),
@@ -338,8 +568,24 @@ def train_sccwm_stage(cfg: dict[str, Any], *, stage: str) -> None:
     wandb.init(project=wandb_project, name=wandb_name, config=copy.deepcopy(cfg))
     start_time = time.time()
     try:
-        for epoch in range(start_epoch, int(train_cfg.get("epochs", 1)) + 1):
+        total_epochs = int(train_cfg.get("epochs", 1))
+        for epoch in range(start_epoch, total_epochs + 1):
             epoch_start = time.time()
+            epoch_episode_subset = _sample_train_episode_subset(cfg, epoch=epoch)
+            if epoch_episode_subset is not None:
+                print(
+                    f"[{stage}] epoch={epoch} sampled {len(epoch_episode_subset)} train episodes for this epoch "
+                    f"(dynamic episode subset enabled)"
+                )
+            train_loader = _build_paired_loader(
+                cfg,
+                split=train_split,
+                batch_size=batch_size,
+                workers=workers,
+                sequence_length=seq_len,
+                shuffle=True,
+                episode_id_subset=epoch_episode_subset,
+            )
             train_metrics = run_sccwm_epoch(
                 model,
                 train_loader,
@@ -350,6 +596,7 @@ def train_sccwm_stage(cfg: dict[str, Any], *, stage: str) -> None:
                 plugin_model=plugin_model,
                 desc=f"Train {stage} {epoch}",
                 progress=not bool(train_cfg.get("no_progress", False)),
+                max_batches=max_train_batches,
             )
             with torch.no_grad():
                 val_metrics = run_sccwm_epoch(
@@ -362,6 +609,7 @@ def train_sccwm_stage(cfg: dict[str, Any], *, stage: str) -> None:
                     plugin_model=plugin_model,
                     desc=f"Val {stage} {epoch}",
                     progress=not bool(train_cfg.get("no_progress", False)),
+                    max_batches=max_val_batches,
                 )
             scheduler.step()
             log_row = {f"train/{k}": v for k, v in train_metrics.items()}
@@ -369,6 +617,9 @@ def train_sccwm_stage(cfg: dict[str, Any], *, stage: str) -> None:
             log_row["epoch"] = epoch
             log_row["epoch_seconds"] = time.time() - epoch_start
             wandb.log(log_row)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with metrics_history_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_row, ensure_ascii=False) + "\n")
             current = float(val_metrics.get(best_metric_name, val_metrics.get("loss", 0.0)))
             improved = current < best_value if best_mode == "min" else current > best_value
             payload = {
@@ -383,18 +634,28 @@ def train_sccwm_stage(cfg: dict[str, Any], *, stage: str) -> None:
                 "best_value": best_value,
             }
             save_checkpoint(output_dir / "last.pt", payload)
+            print(f"[{stage}] saved last checkpoint -> {output_dir / 'last.pt'}")
             if improved:
                 best_value = current
                 payload["best_value"] = best_value
                 save_checkpoint(output_dir / "best.pt", payload)
+                print(f"[{stage}] updated best checkpoint -> {output_dir / 'best.pt'} ({best_metric_name}={best_value:.4f})")
             if int(train_cfg.get("save_every", 0)) > 0 and epoch % int(train_cfg.get("save_every", 1)) == 0:
                 save_checkpoint(output_dir / f"epoch_{epoch:04d}.pt", payload)
+                print(f"[{stage}] saved periodic checkpoint -> {output_dir / f'epoch_{epoch:04d}.pt'}")
+            elapsed = time.time() - start_time
+            epochs_done = epoch - start_epoch + 1
+            avg_epoch_seconds = elapsed / max(epochs_done, 1)
+            remaining_epochs = max(total_epochs - epoch, 0)
+            eta_seconds = avg_epoch_seconds * remaining_epochs
             print(
                 f"[{stage}] epoch={epoch} train_loss={train_metrics.get('loss', 0.0):.4f} "
                 f"val_loss={val_metrics.get('loss', 0.0):.4f} "
                 f"best_{best_metric_name}={best_value:.4f} "
                 f"epoch_time={format_seconds(time.time() - epoch_start)} "
-                f"elapsed={format_seconds(time.time() - start_time)}"
+                f"elapsed={format_seconds(elapsed)} "
+                f"remaining={format_seconds(eta_seconds)} "
+                f"eta={format_seconds(elapsed + eta_seconds)}"
             )
     finally:
         wandb.finish()
@@ -408,6 +669,13 @@ def train_legacy_regressor(cfg: dict[str, Any]) -> None:
     model = build_legacy_regressor(cfg, device)
     train_cfg = cfg.get("train", {})
     output_dir = resolve_path(train_cfg["output_dir"])
+    metrics_history_path = output_dir / "metrics_history.jsonl"
+    batch_size = int(train_cfg.get("batch_size", 8))
+    val_batch_size = int(train_cfg.get("val_batch_size", batch_size))
+    max_train_samples = int(train_cfg.get("max_train_samples_per_epoch", 0))
+    max_val_samples = int(train_cfg.get("max_val_samples", 0))
+    max_train_batches = math.ceil(max_train_samples / max(batch_size, 1)) if max_train_samples > 0 else None
+    max_val_batches = math.ceil(max_val_samples / max(val_batch_size, 1)) if max_val_samples > 0 else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(train_cfg.get("lr", 1e-4)), weight_decay=float(train_cfg.get("weight_decay", 1e-2)))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(train_cfg.get("epochs", 1)), 1))
     best_value = float("inf")
@@ -416,13 +684,36 @@ def train_legacy_regressor(cfg: dict[str, Any]) -> None:
         name=str(cfg.get("system", {}).get("wandb_name", cfg.get("experiment", {}).get("name", "legacy_regressor"))),
         config=copy.deepcopy(cfg),
     )
+    start_time = time.time()
     try:
-        for epoch in range(1, int(train_cfg.get("epochs", 1)) + 1):
-            train_metrics = run_legacy_epoch(model, train_loader, optimizer, device, desc=f"Legacy train {epoch}", progress=not bool(train_cfg.get("no_progress", False)))
+        total_epochs = int(train_cfg.get("epochs", 1))
+        for epoch in range(1, total_epochs + 1):
+            epoch_start = time.time()
+            train_metrics = run_legacy_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                desc=f"Legacy train {epoch}",
+                progress=not bool(train_cfg.get("no_progress", False)),
+                max_batches=max_train_batches,
+            )
             with torch.no_grad():
-                val_metrics = run_legacy_epoch(model, val_loader, None, device, desc=f"Legacy val {epoch}", progress=not bool(train_cfg.get("no_progress", False)))
+                val_metrics = run_legacy_epoch(
+                    model,
+                    val_loader,
+                    None,
+                    device,
+                    desc=f"Legacy val {epoch}",
+                    progress=not bool(train_cfg.get("no_progress", False)),
+                    max_batches=max_val_batches,
+                )
             scheduler.step()
-            wandb.log({f"train/{k}": v for k, v in train_metrics.items()} | {f"val/{k}": v for k, v in val_metrics.items()} | {"epoch": epoch})
+            log_row = {f"train/{k}": v for k, v in train_metrics.items()} | {f"val/{k}": v for k, v in val_metrics.items()} | {"epoch": epoch}
+            wandb.log(log_row)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with metrics_history_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_row, ensure_ascii=False) + "\n")
             payload = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -433,13 +724,27 @@ def train_legacy_regressor(cfg: dict[str, Any]) -> None:
                 "best_value": best_value,
             }
             save_checkpoint(output_dir / "last.pt", payload)
+            print(f"[legacy] saved last checkpoint -> {output_dir / 'last.pt'}")
             if val_metrics.get("mae_mean", float("inf")) < best_value:
                 best_value = float(val_metrics["mae_mean"])
                 payload["best_value"] = best_value
                 save_checkpoint(output_dir / "best.pt", payload)
+                print(f"[legacy] updated best checkpoint -> {output_dir / 'best.pt'} (mae_mean={best_value:.4f})")
             if int(train_cfg.get("save_every", 0)) > 0 and epoch % int(train_cfg.get("save_every", 1)) == 0:
                 save_checkpoint(output_dir / f"epoch_{epoch:04d}.pt", payload)
-            print(f"[legacy] epoch={epoch} train_loss={train_metrics.get('loss', 0.0):.4f} val_mae={val_metrics.get('mae_mean', 0.0):.4f}")
+                print(f"[legacy] saved periodic checkpoint -> {output_dir / f'epoch_{epoch:04d}.pt'}")
+            elapsed = time.time() - start_time
+            avg_epoch_seconds = elapsed / max(epoch, 1)
+            remaining_epochs = max(total_epochs - epoch, 0)
+            eta_seconds = avg_epoch_seconds * remaining_epochs
+            print(
+                f"[legacy] epoch={epoch} train_loss={train_metrics.get('loss', 0.0):.4f} "
+                f"val_mae={val_metrics.get('mae_mean', 0.0):.4f} "
+                f"epoch_time={format_seconds(time.time() - epoch_start)} "
+                f"elapsed={format_seconds(elapsed)} "
+                f"remaining={format_seconds(eta_seconds)} "
+                f"eta={format_seconds(elapsed + eta_seconds)}"
+            )
     finally:
         wandb.finish()
         dump_json({"best_value": best_value, "config": cfg}, output_dir / "train_summary.json")

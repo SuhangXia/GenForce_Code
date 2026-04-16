@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,12 +11,38 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable, *args, **kwargs):  # type: ignore
+        return iterable
+
 from sccwm.datasets import PairedSequenceDataset
 from sccwm.losses import build_negative_labels, build_state_embedding
 from sccwm.metrics import compute_ccauc, compute_plugin_metrics, compute_regression_metrics, compute_sass
 from sccwm.models import DeterministicTransportTemporalPredictor, FeatureSpaceSCTABaseline, LegacyStaticRegressor, LegacyTemporalRegressor, SCCWM
 from sccwm.train.common import default_device, load_checkpoint
 from sccwm.utils.config import dump_json, load_config_with_overrides, resolve_path
+
+
+def _timestamp_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(int(seconds), 0)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _progress_write(progress: Any, message: str) -> None:
+    line = f"[eval-ts {_timestamp_str()}] {message}"
+    writer = getattr(progress, "write", None)
+    if callable(writer):
+        writer(line)
+    else:
+        print(line)
 
 
 def build_eval_argparser(description: str, default_config: str) -> argparse.ArgumentParser:
@@ -29,9 +57,22 @@ def build_eval_argparser(description: str, default_config: str) -> argparse.Argu
     return parser
 
 
+def _select_eval_root(ds_cfg: dict[str, Any], *, split: str) -> Path:
+    split = str(split)
+    per_split_key = {
+        "train": "train_dataset_a_root",
+        "val": "val_dataset_a_root",
+        "test": "test_dataset_a_root",
+    }.get(split, "")
+    root_value = ds_cfg.get(per_split_key) if per_split_key else None
+    if root_value is None:
+        root_value = ds_cfg["dataset_a_root"]
+    return resolve_path(root_value)
+
+
 def build_eval_loader(cfg: dict[str, Any], *, split: str, sequence_length: int | None) -> DataLoader[Any]:
     ds_cfg = cfg.get("dataset", {})
-    root = resolve_path(ds_cfg["dataset_a_root"])
+    root = _select_eval_root(ds_cfg, split=split)
     seq_len = int(sequence_length or ds_cfg.get("sequence_length", 3))
     dataset = PairedSequenceDataset(root, split=split, sequence_length=seq_len)
     batch_size = int(cfg.get("eval", {}).get("batch_size", cfg.get("train", {}).get("val_batch_size", 8)))
@@ -162,35 +203,52 @@ def _scale_stats(values: list[float]) -> dict[str, float]:
     }
 
 
-def _finalize_direct_records(records: list[dict[str, Any]], *, protocol: str, cfg: dict[str, Any]) -> dict[str, Any]:
-    filtered = [record for record in records if _protocol_filter(record, protocol, cfg)]
+def _evenly_spaced_subset(records: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or len(records) <= limit:
+        return records
+    indices = np.linspace(0, len(records) - 1, num=limit, dtype=np.int64)
+    unique_indices: list[int] = []
+    last = -1
+    for idx in indices.tolist():
+        idx = int(idx)
+        if idx != last:
+            unique_indices.append(idx)
+            last = idx
+    return [records[idx] for idx in unique_indices]
+
+
+def _summarize_direct_records(filtered: list[dict[str, Any]], *, protocol: str, cfg: dict[str, Any]) -> dict[str, Any]:
     if not filtered:
-        raise RuntimeError(f"No evaluation samples remained after protocol filter: {protocol}")
+        raise RuntimeError(f"No evaluation samples remained for protocol: {protocol}")
     pred = torch.tensor([record["pred_source"] for record in filtered], dtype=torch.float32)
     target = torch.tensor([record["target"] for record in filtered], dtype=torch.float32)
     metrics = compute_regression_metrics(pred, target)
     sass_rows: list[dict[str, object]] = []
+    ccauc_max_samples = int(cfg.get("eval", {}).get("ccauc_max_samples", 4096))
+    ccauc_records = _evenly_spaced_subset(filtered, ccauc_max_samples)
     pos_scores: list[float] = []
-    occupancy = np.asarray([record["occupancy"] for record in filtered], dtype=np.float32)
-    depth = torch.tensor([record["target"][2] for record in filtered], dtype=torch.float32)
+    occupancy = np.asarray([record["occupancy"] for record in ccauc_records], dtype=np.float32)
+    depth = torch.tensor([record["target"][2] for record in ccauc_records], dtype=torch.float32)
     neg_idx = build_negative_labels(torch.tensor(occupancy, dtype=torch.float32), depth)
-    state_source = np.asarray([record["state_source"] for record in filtered], dtype=np.float32)
-    state_target = np.asarray([record["state_target"] for record in filtered], dtype=np.float32)
+    state_source = np.asarray([record["state_source"] for record in ccauc_records], dtype=np.float32)
+    state_target = np.asarray([record["state_target"] for record in ccauc_records], dtype=np.float32)
     neg_scores = [
         float(
             np.dot(state_source[idx], state_target[int(neg_idx[idx].item())])
             / (np.linalg.norm(state_source[idx]) * np.linalg.norm(state_target[int(neg_idx[idx].item())]) + 1e-6)
         )
-        for idx in range(len(filtered))
+        for idx in range(len(ccauc_records))
     ]
     for idx, record in enumerate(filtered):
         event_key = str(record["event_key"])
         sass_rows.append({"event_key": event_key, "pred": record["pred_source"]})
         sass_rows.append({"event_key": event_key, "pred": record["pred_target"]})
+    for record in ccauc_records:
         pos_scores.append(record["positive_score"])
     metrics.update(compute_sass(sass_rows))
     metrics.update(compute_ccauc(np.asarray(pos_scores, dtype=np.float32), np.asarray(neg_scores, dtype=np.float32)))
     metrics["sample_count"] = len(filtered)
+    metrics["ccauc_sample_count"] = len(ccauc_records)
     return {
         "protocol_name": protocol,
         "filtered_sample_count": len(filtered),
@@ -201,13 +259,28 @@ def _finalize_direct_records(records: list[dict[str, Any]], *, protocol: str, cf
     }
 
 
+def _finalize_direct_records(records: list[dict[str, Any]], *, protocol: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    filtered = [record for record in records if _protocol_filter(record, protocol, cfg)]
+    return _summarize_direct_records(filtered, protocol=protocol, cfg=cfg)
+
+
 def run_direct_eval(cfg: dict[str, Any], *, checkpoint_path: str | Path, split: str, sequence_length: int | None, protocol: str, limit: int = 0) -> dict[str, Any]:
     device = default_device(cfg)
     model = load_sccwm_for_eval(cfg, checkpoint_path, device)
     loader = build_eval_loader(cfg, split=split, sequence_length=sequence_length)
     records: list[dict[str, Any]] = []
+    eval_cfg = cfg.get("eval", {})
+    log_interval_seconds = max(float(eval_cfg.get("timestamp_log_interval_seconds", 600.0)), 1.0)
+    started_at = time.time()
     with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
+        iterator = tqdm(loader, desc=f"Direct eval {protocol} {split}", total=len(loader), leave=False)
+        _progress_write(
+            iterator,
+            f"direct_eval started protocol={protocol} split={split} checkpoint={checkpoint_path} "
+            f"total_batches={len(loader)} limit={limit if limit > 0 else 'none'}",
+        )
+        next_log_time = started_at + log_interval_seconds
+        for batch_idx, batch in enumerate(iterator, start=1):
             if limit > 0 and len(records) >= limit:
                 break
             batch = _move_eval_batch(batch, device)
@@ -254,7 +327,23 @@ def run_direct_eval(cfg: dict[str, Any], *, checkpoint_path: str | Path, split: 
                         "is_unseen_scale_target": bool(batch["is_unseen_scale_target"][sample_idx].item()),
                     }
                 )
-    return _finalize_direct_records(records, protocol=protocol, cfg=cfg)
+            iterator.set_postfix({"records": len(records)})
+            now = time.time()
+            if now >= next_log_time:
+                _progress_write(
+                    iterator,
+                    f"direct_eval heartbeat protocol={protocol} split={split} batch={batch_idx}/{len(loader)} "
+                    f"records={len(records)} elapsed={_format_elapsed(now - started_at)}",
+                )
+                while next_log_time <= now:
+                    next_log_time += log_interval_seconds
+    result = _finalize_direct_records(records, protocol=protocol, cfg=cfg)
+    _progress_write(
+        iterator,
+        f"direct_eval finished protocol={protocol} split={split} records={len(records)} "
+        f"filtered={result['filtered_sample_count']} elapsed={_format_elapsed(time.time() - started_at)}",
+    )
+    return result
 
 
 def run_plugin_eval(
@@ -271,6 +360,9 @@ def run_plugin_eval(
     device = default_device(cfg)
     legacy = load_legacy_for_eval(cfg, legacy_checkpoint_path, device)
     loader = build_eval_loader(cfg, split=split, sequence_length=sequence_length)
+    eval_cfg = cfg.get("eval", {})
+    log_interval_seconds = max(float(eval_cfg.get("timestamp_log_interval_seconds", 600.0)), 1.0)
+    started_at = time.time()
     sccwm_model = None
     if method in {"deterministic_transport", "sccwm_plugin"}:
         if not sccwm_checkpoint_path:
@@ -288,7 +380,14 @@ def run_plugin_eval(
 
     rows: list[dict[str, Any]] = []
     with torch.no_grad():
-        for batch in loader:
+        iterator = tqdm(loader, desc=f"Plugin eval {method} {split}", total=len(loader), leave=False)
+        _progress_write(
+            iterator,
+            f"plugin_eval started method={method} split={split} checkpoint={legacy_checkpoint_path} "
+            f"total_batches={len(loader)} limit={limit if limit > 0 else 'none'}",
+        )
+        next_log_time = started_at + log_interval_seconds
+        for batch_idx, batch in enumerate(iterator, start=1):
             if limit > 0 and len(rows) >= limit:
                 break
             batch = _move_eval_batch(batch, device)
@@ -331,8 +430,24 @@ def run_plugin_eval(
                 raise ValueError(f"Unsupported plugin method: {method}")
             batch_metrics = compute_plugin_metrics(pred.detach(), target.detach(), baseline_pred.detach())
             rows.append(batch_metrics)
+            iterator.set_postfix({"batches": len(rows)})
+            now = time.time()
+            if now >= next_log_time:
+                _progress_write(
+                    iterator,
+                    f"plugin_eval heartbeat method={method} split={split} batch={batch_idx}/{len(loader)} "
+                    f"rows={len(rows)} elapsed={_format_elapsed(now - started_at)}",
+                )
+                while next_log_time <= now:
+                    next_log_time += log_interval_seconds
     metrics = aggregate_rows(rows)
-    return {"metrics": metrics, "method": method}
+    result = {"metrics": metrics, "method": method}
+    _progress_write(
+        iterator,
+        f"plugin_eval finished method={method} split={split} rows={len(rows)} "
+        f"elapsed={_format_elapsed(time.time() - started_at)}",
+    )
+    return result
 
 
 def aggregate_rows(rows: list[dict[str, float]]) -> dict[str, float]:

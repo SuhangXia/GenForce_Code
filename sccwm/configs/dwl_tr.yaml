@@ -1,0 +1,23 @@
+base_config: sccwm_base.yaml
+
+experiment:
+  name: dwl_tr
+
+train:
+  output_dir: /home/suhang/datasets/checkpoints/dwl_tr
+  best_metric: state_mae_mean
+  best_mode: min
+
+loss:
+  feature_recon: 0.0
+  aux_observation_recon: 0.0
+  temporal_consistency: 0.1
+  rest_state_lock: 0.0
+  state_supervision: 1.0
+  state_consistency: 0.0
+  geometry_consistency: 0.0
+  counterfactual_ranking: 0.0
+  plugin_distillation: 0.0
+
+system:
+  wandb_name: dwl_tr

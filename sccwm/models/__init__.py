@@ -1,3 +1,4 @@
+from .dwl_tr import DWLTR
 from .legacy_regressors import (
     DeterministicTransportTemporalPredictor,
     FeatureSpaceSCTABaseline,
@@ -5,13 +6,16 @@ from .legacy_regressors import (
     LegacyTemporalRegressor,
     MultiScalePooledRegressor,
 )
+from .no_projector_tr import NoProjectorTR
 from .sccwm import SCCWM
 
 __all__ = [
+    "DWLTR",
     "DeterministicTransportTemporalPredictor",
     "FeatureSpaceSCTABaseline",
     "LegacyStaticRegressor",
     "LegacyTemporalRegressor",
     "MultiScalePooledRegressor",
+    "NoProjectorTR",
     "SCCWM",
 ]

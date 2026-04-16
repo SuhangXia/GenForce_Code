@@ -5,6 +5,7 @@ import torch
 from sccwm.losses.sccwm_losses import build_negative_labels, compute_counterfactual_ranking_loss
 from sccwm.metrics.ccauc_metric import compute_ccauc
 from sccwm.metrics.sass_metric import compute_sass
+from sccwm.models.dwl_tr import DWLTR
 from sccwm.models.sccwm import SCCWM
 from sccwm.models.world_lattice import WorldLatticeProjector
 
@@ -37,6 +38,20 @@ def test_sccwm_forward_pair() -> None:
     assert out["source"]["pred_x_norm"].shape == (2,)
     assert out["source"]["pred_depth_mm_seq"].shape == (2, 3)
     assert out["source_to_target"]["decoded_target_features"].shape[:3] == (2, 3, 32)
+
+
+def test_dwl_tr_forward_single() -> None:
+    model = DWLTR(feature_dim=32, world_hidden_dim=32, lattice_size=16)
+    obs = torch.randn(2, 3, 3, 256, 256)
+    coord_map = torch.randn(2, 16, 16, 2)
+    out = model.forward_single(
+        obs,
+        coord_map,
+        torch.tensor([20.0, 22.0]),
+    )
+    assert out["pred_x_norm"].shape == (2,)
+    assert out["pred_x_mm_seq"].shape == (2, 3)
+    assert out["state_embedding"].shape[0] == 2
 
 
 def test_counterfactual_helpers() -> None:
