@@ -1,0 +1,47 @@
+base_config: ../../sccwm_force_grounded_v21a/configs/sccwm_stage2_force_grounded_v21a.yaml
+
+experiment:
+  name: stage2_force_grounded_v24fgof
+
+model:
+  variant: v24fgof
+  geometry_hidden_dim: 64
+  state_refine_hidden_dim: 64
+  geometry_adv_grl_lambda: 0.25
+  operator_dim: 32
+  canonical_force_align_dim: 6
+  enable_swap_decode: true
+  marker_vocab:
+    - marker_Array1.jpg
+    - marker_Array2.jpg
+    - marker_Array_Gelsight.jpg
+    - marker_Diamond2.jpg
+
+train:
+  output_dir: /datasets/checkpoints/sccwm_force_grounded_v24/stage2_force_grounded_v24fgof
+  init_from: /datasets/checkpoints/sccwm_force_grounded_v21a/stage2_force_grounded/best.pt
+  resume_from: ""
+  best_metric: state_mae_depth
+  best_mode: min
+
+loss:
+  marker_vocab:
+    - marker_Array1.jpg
+    - marker_Array2.jpg
+    - marker_Array_Gelsight.jpg
+    - marker_Diamond2.jpg
+  canonical_scale_confusion: 0.10
+  canonical_branch_confusion: 0.05
+  canonical_marker_confusion: 0.05
+  operator_scale_supervision: 0.10
+  operator_branch_supervision: 0.05
+  operator_marker_supervision: 0.05
+  canonical_consistency: 0.05
+  canonical_operator_independence: 0.02
+  force_guidance_weight: 0.25
+  canonical_force_alignment: 1.0
+  canonical_force_similarity_distill: 0.25
+  force_weighted_pair_consistency: 0.50
+
+system:
+  wandb_name: stage2_force_grounded_v24fgof

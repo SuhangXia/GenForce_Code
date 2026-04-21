@@ -1,0 +1,74 @@
+base_config: ../../sccwm/configs/sccwm_stage2.yaml
+
+experiment:
+  name: sccwm_stage2_force_grounded_v21a
+
+dataset:
+  train_dataset_a_root: /datasets/usa_static_v1_large_run_blackborder_3px/scheme_s_lite_adapter_train_seq
+  val_dataset_a_root: /datasets/usa_static_v1_large_run_blackborder_3px/scheme_s_lite_adapter_val_seq_small
+  test_dataset_a_root: /datasets/usa_static_v1_large_run_blackborder_3px/scheme_s_lite_adapter_final_unseen_test_seq_small
+  train_dataset_a_assets_root: /datasets/usa_static_v1_large_run/scheme_s_lite_adapter_train_seq
+  val_dataset_a_assets_root: /datasets/usa_static_v1_large_run/scheme_s_lite_adapter_val_seq_small
+  test_dataset_a_assets_root: /datasets/usa_static_v1_large_run/scheme_s_lite_adapter_final_unseen_test_seq_small
+  train_index_file: /datasets/usa_static_v1_large_run/scheme_s_lite_adapter_train_seq/pair_index_train.jsonl
+  val_index_file: /datasets/usa_static_v1_large_run/scheme_s_lite_adapter_val_seq_small/pair_index_val.jsonl
+  test_index_file: /datasets/usa_static_v1_large_run/scheme_s_lite_adapter_final_unseen_test_seq_small/pair_index_test.jsonl
+  gray_cache_max_items: 1024
+
+model:
+  reconstruct_observation: false
+  z_force_dim: 6
+  adv_grl_lambda: 0.25
+  scale_bucket_edges_mm: [14.0, 18.0, 22.0]
+
+train:
+  output_dir: /datasets/checkpoints/sccwm_force_grounded_v21a/stage2_force_grounded
+  epochs: 6
+  batch_size: 8
+  val_batch_size: 4
+  workers: 4
+  allow_large_index_workers: true
+  sample_episodes_per_indenter_per_epoch: 20
+  init_from: /datasets/checkpoints/sccwm_120h_full/stage1_world/best.pt
+  resume_from: ""
+  best_metric: state_mae_depth
+  best_mode: min
+
+eval:
+  exact_scales_mm: [16.0, 23.0]
+  band_ranges_mm:
+    - [15.8, 16.2]
+    - [22.8, 23.2]
+
+loss:
+  feature_recon: 0.20
+  aux_observation_recon: 0.0
+  temporal_consistency: 0.05
+  rest_state_lock: 0.05
+  state_supervision: 1.0
+  state_consistency: 0.10
+  geometry_consistency: 0.10
+  force_penetration_proxy: 0.75
+  force_contact_intensity: 0.50
+  force_load_progress: 0.35
+  force_penetration_ranking: 0.20
+  force_latent_consistency: 0.25
+  force_map_consistency_weight: 0.5
+  force_variance: 0.05
+  force_variance_floor: 0.5
+  force_orth_sensor: 0.05
+  force_orth_visibility: 0.05
+  force_scale_confusion: 0.10
+  force_branch_confusion: 0.05
+  state_weight_x: 0.5
+  state_weight_y: 0.5
+  state_weight_depth: 2.0
+  penetration_proxy_scale: 20.0
+  contact_intensity_threshold: 0.03
+  penetration_ranking_margin: 0.02
+  penetration_ranking_min_target_gap: 0.02
+  scale_bucket_edges_mm: [14.0, 18.0, 22.0]
+  grad_clip_norm: 1.0
+
+system:
+  wandb_name: sccwm_stage2_force_grounded_v21a

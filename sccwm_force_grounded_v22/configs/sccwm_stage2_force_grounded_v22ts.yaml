@@ -1,0 +1,29 @@
+base_config: ../../sccwm_force_grounded_v21a/configs/sccwm_stage2_force_grounded_v21a.yaml
+
+experiment:
+  name: stage2_force_grounded_v22ts
+
+model:
+  variant: v22ts
+  temporal_load_hidden_dim: 64
+  contact_support_hidden_dim: 32
+
+train:
+  output_dir: /datasets/checkpoints/sccwm_force_grounded_v22/stage2_force_grounded_v22ts
+  init_from: /datasets/checkpoints/sccwm_force_grounded_v21a/stage2_force_grounded/best.pt
+  resume_from: ""
+
+loss:
+  trajectory_window_shape: 0.30
+  trajectory_window_order: 0.15
+  trajectory_dwell_flat: 0.05
+  trajectory_anchor_ranking: 0.10
+  trajectory_order_margin: 0.02
+  trajectory_order_target_gap: 0.05
+  trajectory_dwell_target_gap: 0.02
+  trajectory_anchor_ranking_margin: 0.02
+  trajectory_anchor_ranking_min_gap: 0.02
+  contact_support_entropy: 0.01
+
+system:
+  wandb_name: stage2_force_grounded_v22ts

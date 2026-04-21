@@ -168,6 +168,10 @@ class CrossBandPairDataset(Dataset[dict[str, Any]]):
             "target_episode_id": torch.tensor(pair.target.episode_id, dtype=torch.long),
             "source_global_seq_index": torch.tensor(pair.source.global_seq_index, dtype=torch.long),
             "target_global_seq_index": torch.tensor(pair.target.global_seq_index, dtype=torch.long),
+            "source_marker_name": pair.source.marker_name,
+            "target_marker_name": pair.target.marker_name,
+            "source_indenter": pair.source.indenter,
+            "target_indenter": pair.target.indenter,
         }
 
     def _select_vector(self, pair: CrossBandPairSpec, *, key: str, default: list[float] | None = None) -> list[float] | None:
