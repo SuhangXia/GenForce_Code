@@ -7,6 +7,10 @@ gif/
 *.ply
 *.npz
 *.jpg
+!sim/marker/**/
+!sim/marker/**/*.jpg
+!sim/marker/**/*.jpeg
+!sim/marker/**/*.png
 checkpoints/
 usa_train_runs/
 wandb/

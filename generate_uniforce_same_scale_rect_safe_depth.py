@@ -19,9 +19,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import logging
 import math
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -646,6 +648,88 @@ def build_manifest(
     }
 
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(int(round(float(seconds))), 0)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def maybe_log_uniforce_overall_progress(
+    *,
+    run_start_ts: float,
+    indenter: str,
+    indenter_index: int,
+    indenter_count: int,
+    physics_done: int,
+    physics_total: int,
+    meshing_done: int,
+    meshing_total: int,
+    render_done: int,
+    render_total: int,
+    marker_count: int,
+    force: bool = False,
+) -> None:
+    total_units_per_indenter = int(physics_total) + int(meshing_total) + int(render_total)
+    done_units_current = int(physics_done) + int(meshing_done) + int(render_done)
+    if total_units_per_indenter <= 0 or indenter_count <= 0:
+        return
+
+    now_ts = time.time()
+    last_log_ts = float(getattr(maybe_log_uniforce_overall_progress, "_last_log_ts", 0.0))
+    if (
+        not force
+        and done_units_current > 1
+        and done_units_current < total_units_per_indenter
+        and (now_ts - last_log_ts) < 60.0
+    ):
+        return
+
+    global_done_units = int(indenter_index) * total_units_per_indenter + done_units_current
+    global_total_units = int(indenter_count) * total_units_per_indenter
+    global_render_done = int(indenter_index) * int(render_total) + int(render_done)
+    global_render_total = int(indenter_count) * int(render_total)
+    rendered_images_done = global_render_done * int(marker_count)
+    rendered_images_total = global_render_total * int(marker_count)
+    completed_indenters = int(indenter_index) + (1 if done_units_current >= total_units_per_indenter else 0)
+
+    elapsed = max(0.0, now_ts - float(run_start_ts))
+    if rendered_images_done > 0:
+        avg_sec = elapsed / float(rendered_images_done)
+        remaining_images = max(rendered_images_total - rendered_images_done, 0)
+        eta_sec = avg_sec * float(remaining_images)
+        eta_at = (dt.datetime.now() + dt.timedelta(seconds=eta_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        eta_text = f"eta={_format_duration(eta_sec)} eta_at={eta_at}"
+    elif global_done_units > 0:
+        avg_sec = elapsed / float(global_done_units)
+        remaining_units = max(global_total_units - global_done_units, 0)
+        eta_sec = avg_sec * float(remaining_units)
+        eta_at = (dt.datetime.now() + dt.timedelta(seconds=eta_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        eta_text = f"eta={_format_duration(eta_sec)} eta_at={eta_at}"
+    else:
+        eta_text = "eta=-- eta_at=--"
+
+    logging.info(
+        "UniForce overall progress | indenters=%d/%d current=%s (%d/%d) tasks=%d/%d render=%d/%d "
+        "rendered_images=%d/%d elapsed=%s %s",
+        int(completed_indenters),
+        int(indenter_count),
+        str(indenter),
+        int(indenter_index) + 1,
+        int(indenter_count),
+        int(global_done_units),
+        int(global_total_units),
+        int(global_render_done),
+        int(global_render_total),
+        int(rendered_images_done),
+        int(rendered_images_total),
+        _format_duration(elapsed),
+        eta_text,
+    )
+    maybe_log_uniforce_overall_progress._last_log_ts = now_ts
+
+
 def main() -> None:
     args = parse_args()
     output_root = resolve_output_root(args)
@@ -676,6 +760,8 @@ def main() -> None:
 
     runs: list[GeneratorRun] = []
     requested_depth_mm = float(args.requested_depth_max_mm)
+    overall_run_start_ts = time.time()
+    total_indenters = len(args.objects)
     for indenter_index, indenter in enumerate(args.objects):
         safe_depth = compute_safe_depth(
             indenter=str(indenter),
@@ -697,10 +783,34 @@ def main() -> None:
             passthrough=args.genforce_args,
         )
         print(
-            f"Generating {indenter}: requested_depth={safe_depth.requested_depth_mm:.4f}mm "
+            f"Generating {indenter} ({indenter_index + 1}/{total_indenters}): "
+            f"requested_depth={safe_depth.requested_depth_mm:.4f}mm "
             f"safe_cap={safe_depth.safe_cap_mm:.4f}mm effective={safe_depth.effective_depth_mm:.4f}mm"
         )
-        run_rectgel_generation(argv, staged_texture_dir=staged_texture_dir)
+        original_overall = rectseq.maybe_log_overall_progress
+
+        def patched_overall_progress(**kwargs: Any) -> None:
+            original_overall(**kwargs)
+            maybe_log_uniforce_overall_progress(
+                run_start_ts=overall_run_start_ts,
+                indenter=str(indenter),
+                indenter_index=int(indenter_index),
+                indenter_count=int(total_indenters),
+                physics_done=int(kwargs["physics_done"]),
+                physics_total=int(kwargs["physics_total"]),
+                meshing_done=int(kwargs["meshing_done"]),
+                meshing_total=int(kwargs["meshing_total"]),
+                render_done=int(kwargs["render_done"]),
+                render_total=int(kwargs["render_total"]),
+                marker_count=int(kwargs["marker_count"]),
+                force=bool(kwargs.get("force", False)),
+            )
+
+        try:
+            rectseq.maybe_log_overall_progress = patched_overall_progress
+            run_rectgel_generation(argv, staged_texture_dir=staged_texture_dir)
+        finally:
+            rectseq.maybe_log_overall_progress = original_overall
         runs.append(GeneratorRun(indenter=str(indenter), run_root=run_root, safe_depth=safe_depth))
 
     next_episode_id = 0
