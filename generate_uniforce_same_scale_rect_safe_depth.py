@@ -6,9 +6,7 @@ uniforce_corl code. It builds a same-scale rectangular-gel dataset with:
 
 - short edge fixed by `--short-edge-mm` and width inferred as 4:3
 - per-indenter safe-depth caps with an extra safety margin
-- 20 marker textures total
-  - 12 top-level 1:1 marker textures, excluding Array_Gelsight
-  - 8 pre-existing 4:3 textures under sim/marker/marker_pattern/4_3
+- marker textures sourced only from sim/marker/marker_pattern/4_3
 - event-centric storage:
     episode_xxxxxx/scale_xxxxxmm/frame_xxxxxx/marker_*.jpg
 - compact event_index.jsonl for runtime marker-pair sampling
@@ -28,9 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from PIL import Image, ImageOps
-
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -42,7 +37,6 @@ import rectgel_common as rectgel
 
 MARKER_PATTERN_DIR = SCRIPT_DIR / "sim" / "marker" / "marker_pattern"
 MARKER_PATTERN_4_3_DIR = MARKER_PATTERN_DIR / "4_3"
-PIL_RESAMPLING = getattr(Image, "Resampling", Image)
 
 DEFAULT_BAD_DEPTH_MM = {
     "dots": 1.510032,
@@ -77,7 +71,6 @@ DEFAULT_SHORT_EDGE_MM = 16.0
 DEFAULT_KEEP_WORK = True
 TARGET_WIDTH = 640
 TARGET_HEIGHT = 480
-TOP_LEVEL_MARKER_EXCLUDES = {"Array_Gelsight"}
 FOUR_THREE_MARKER_EXCLUDES: set[str] = set()
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 DEFAULT_WORK_DIRNAME = "_work"
@@ -149,19 +142,6 @@ def validate_output_and_work_roots(output_root: Path, work_root: Path) -> None:
         raise ValueError("--work-root must not be a parent of --output-root")
 
 
-def discover_square_markers() -> list[Path]:
-    if not MARKER_PATTERN_DIR.exists():
-        raise FileNotFoundError(f"Missing marker directory: {MARKER_PATTERN_DIR}")
-    paths = sorted(
-        path
-        for path in MARKER_PATTERN_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTS and path.stem not in TOP_LEVEL_MARKER_EXCLUDES
-    )
-    if len(paths) != 12:
-        raise RuntimeError(f"Expected 12 top-level square marker textures, found {len(paths)} in {MARKER_PATTERN_DIR}")
-    return paths
-
-
 def discover_four_three_markers() -> list[Path]:
     if not MARKER_PATTERN_4_3_DIR.exists():
         raise FileNotFoundError(f"Missing 4:3 marker directory: {MARKER_PATTERN_4_3_DIR}")
@@ -170,37 +150,16 @@ def discover_four_three_markers() -> list[Path]:
         for path in MARKER_PATTERN_4_3_DIR.iterdir()
         if path.is_file() and path.suffix.lower() in IMAGE_EXTS and path.stem not in FOUR_THREE_MARKER_EXCLUDES
     )
-    if len(paths) != 8:
-        raise RuntimeError(f"Expected 8 4:3 marker textures, found {len(paths)} in {MARKER_PATTERN_4_3_DIR}")
+    if not paths:
+        raise RuntimeError(f"No marker textures found in {MARKER_PATTERN_4_3_DIR}")
     return paths
-
-
-def cover_resize_to_four_three(src: Path, dst: Path) -> None:
-    with Image.open(src) as im:
-        rgb = im.convert("RGB")
-        fitted = ImageOps.fit(
-            rgb,
-            (TARGET_WIDTH, TARGET_HEIGHT),
-            method=PIL_RESAMPLING.LANCZOS,
-            centering=(0.5, 0.5),
-        )
-        fitted.save(dst, quality=100, subsampling=0)
 
 
 def stage_marker_textures(staging_dir: Path) -> list[Path]:
     staging_dir.mkdir(parents=True, exist_ok=True)
-    square_markers = discover_square_markers()
     four_three_markers = discover_four_three_markers()
     out_paths: list[Path] = []
     seen_stems: set[str] = set()
-
-    for src in square_markers:
-        if src.stem in seen_stems:
-            raise RuntimeError(f"Duplicate marker stem during staging: {src.stem}")
-        dst = staging_dir / f"{src.stem}.jpg"
-        cover_resize_to_four_three(src, dst)
-        out_paths.append(dst)
-        seen_stems.add(src.stem)
 
     for src in four_three_markers:
         if src.stem in seen_stems:
@@ -211,8 +170,6 @@ def stage_marker_textures(staging_dir: Path) -> list[Path]:
         seen_stems.add(src.stem)
 
     out_paths = sorted(out_paths, key=lambda path: path.stem)
-    if len(out_paths) != 20:
-        raise RuntimeError(f"Expected 20 staged marker textures, found {len(out_paths)}")
     return out_paths
 
 
@@ -447,7 +404,11 @@ def determine_split(scale_split: str, indenter_split: str) -> str:
     return "train"
 
 
-def scan_event_records(dataset_root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+def scan_event_records(
+    dataset_root: Path,
+    *,
+    expected_marker_count: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     episodes_out: list[dict[str, Any]] = []
     marker_stems: set[str] = set()
@@ -478,9 +439,10 @@ def scan_event_records(dataset_root: Path) -> tuple[list[dict[str, Any]], list[d
 
             for frame in frame_rows:
                 rendered_markers = sorted(str(v) for v in frame.get("rendered_markers", []))
-                if len(rendered_markers) != 20:
+                if len(rendered_markers) != int(expected_marker_count):
                     raise RuntimeError(
-                        f"Expected 20 rendered markers in {episode_dir / scale_key / str(frame.get('frame_name', ''))}, "
+                        f"Expected {expected_marker_count} rendered markers in "
+                        f"{episode_dir / scale_key / str(frame.get('frame_name', ''))}, "
                         f"found {len(rendered_markers)}"
                     )
                 marker_stems.update(
@@ -622,8 +584,9 @@ def build_manifest(
         "coordinate_convention": rectseq.COORDINATE_CONVENTION,
         "marker_textures_selected": [str(v) for v in marker_stems],
         "marker_texture_count": int(len(marker_stems)),
-        "top_level_square_marker_count": 12,
-        "four_three_marker_count": 8,
+        "top_level_square_marker_count": 0,
+        "four_three_marker_count": int(len(marker_stems)),
+        "marker_texture_source_dir": str(MARKER_PATTERN_4_3_DIR),
         "safe_depth_bad_thresholds_mm": {key: float(value) for key, value in DEFAULT_BAD_DEPTH_MM.items()},
         "safety_margin_mm": float(args.safety_margin_mm),
         "episodes_per_indenter": int(args.episodes_per_indenter),
@@ -832,7 +795,10 @@ def main() -> None:
             )
             next_episode_id += 1
 
-    rows, episodes, discovered_marker_stems = scan_event_records(output_root)
+    rows, episodes, discovered_marker_stems = scan_event_records(
+        output_root,
+        expected_marker_count=len(marker_stems),
+    )
     if sorted(discovered_marker_stems) != sorted(marker_stems):
         raise RuntimeError(
             "Merged dataset marker set does not match staged marker set: "

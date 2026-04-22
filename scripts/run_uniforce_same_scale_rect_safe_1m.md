@@ -5,7 +5,7 @@
 它默认只改两项：
 
 - `OUTPUT_ROOT=/home/suhang/datasets/uniforce_same_scale_rect_safe_1m_short16_all18`
-- `EPISODES_PER_INDENTER=154`
+- `EPISODES_PER_INDENTER=140`
 
 其余配置和 `499k` 版保持一致，包括：
 
@@ -22,22 +22,22 @@
 
 - `18` 个压头
 - `18` frames / episode
-- `20` marker / frame
+- `22` marker / frame
 
 所以每增加 `1` 个 episode / indenter，就会增加：
 
 ```bash
-18 * 18 * 20 = 6480
+18 * 18 * 22 = 7128
 ```
 
 张图。
 
 因此：
 
-- `154` episodes / indenter => `997,920` 张图
-- `155` episodes / indenter => `1,004,400` 张图
+- `140` episodes / indenter => `997,920` 张图
+- `141` episodes / indenter => `1,005,048` 张图
 
-脚本默认取 `154`，因为它更接近 `1,000,000`。
+脚本默认取 `140`，因为它更接近 `1,000,000`。
 
 ## 2. 直接运行
 
@@ -48,7 +48,7 @@ bash /home/suhang/projects/test_code/GenForce_Code/scripts/run_uniforce_same_sca
 ## 3. 如果你想强行跑到 100w 以上
 
 ```bash
-EPISODES_PER_INDENTER=155 \
+EPISODES_PER_INDENTER=141 \
 bash /home/suhang/projects/test_code/GenForce_Code/scripts/run_uniforce_same_scale_rect_safe_1m.sh
 ```
 

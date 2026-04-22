@@ -6,15 +6,16 @@
 - `4:3` rectgel
 - 短边 `16mm`
 - `18` 个压头全覆盖
-- `20` 个 marker
+- 只使用 `sim/marker/marker_pattern/4_3` 里的 marker
 - `640x480`
 - safe-depth 只对指定的 5 个压头生效
 
 默认数据规模约为：
 
-- `77` episodes / indenter
+- 当前 marker 数量：`22`
+- `70` episodes / indenter
 - `18` frames / episode
-- `20` marker / frame
+- `22` marker / frame
 - 总图数约 `498,960`
 
 ## 1. 先激活环境
@@ -31,7 +32,7 @@ conda activate genforce
 ```bash
 OUTPUT_ROOT=/home/suhang/datasets/uniforce_same_scale_rect_safe_499k_short16_all18
 SHORT_EDGE_MM=16.0
-EPISODES_PER_INDENTER=77
+EPISODES_PER_INDENTER=70
 DEPTH_MIN_MM=0.5
 REQUESTED_DEPTH_MAX_MM=2.0
 RENDER_DEVICE=cpu
@@ -46,6 +47,8 @@ PHYSICS_NPZ_CLEANUP=delete_after_scale_complete
 其中：
 
 - `RENDER_SAMPLES` 已固定为 `16`
+- 只会读取 `sim/marker/marker_pattern/4_3` 下的 marker 图
+- `marker / frame` 会按该目录实际图片数量自动统计，当前是 `22`
 - 会开启 render backlog 驱动的自动限流
 - 会在 scale 完成后删除 physics `npz`，避免缓存把磁盘吃满
 - 运行日志里会额外输出全 `18` 个压头的总进度，而不是只看当前压头

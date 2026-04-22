@@ -4,10 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 GENERATOR="${REPO_ROOT}/generate_uniforce_same_scale_rect_safe_depth.py"
+MARKER_SOURCE_DIR="${REPO_ROOT}/sim/marker/marker_pattern/4_3"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/suhang/datasets/uniforce_same_scale_rect_safe_499k_short16_all18}"
 SHORT_EDGE_MM="${SHORT_EDGE_MM:-16.0}"
-EPISODES_PER_INDENTER="${EPISODES_PER_INDENTER:-77}"
+EPISODES_PER_INDENTER="${EPISODES_PER_INDENTER:-70}"
 DEPTH_MIN_MM="${DEPTH_MIN_MM:-0.5}"
 REQUESTED_DEPTH_MAX_MM="${REQUESTED_DEPTH_MAX_MM:-2.0}"
 SEED="${SEED:-42}"
@@ -46,7 +47,23 @@ OBJECTS=(
 
 INDENTER_COUNT="${#OBJECTS[@]}"
 FRAMES_PER_EPISODE=18
-MARKERS_PER_FRAME=20
+if [[ ! -d "${MARKER_SOURCE_DIR}" ]]; then
+  echo "Missing marker source dir: ${MARKER_SOURCE_DIR}" >&2
+  exit 1
+fi
+MARKERS_PER_FRAME="$(python3 - <<'PY' "${MARKER_SOURCE_DIR}"
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+exts = {".jpg", ".jpeg", ".png"}
+count = sum(1 for path in root.iterdir() if path.is_file() and path.suffix.lower() in exts)
+print(count)
+PY
+)"
+if [[ "${MARKERS_PER_FRAME}" -le 0 ]]; then
+  echo "No marker textures found in ${MARKER_SOURCE_DIR}" >&2
+  exit 1
+fi
 TASKS_PER_EPISODE=$((FRAMES_PER_EPISODE + 2))
 TASKS_PER_INDENTER=$((EPISODES_PER_INDENTER * TASKS_PER_EPISODE))
 RENDER_TASKS_PER_INDENTER=$((EPISODES_PER_INDENTER * FRAMES_PER_EPISODE))
@@ -71,6 +88,7 @@ fi
 echo "Repo root             : ${REPO_ROOT}"
 echo "Generator             : ${GENERATOR}"
 echo "Output root           : ${OUTPUT_ROOT}"
+echo "Marker source dir     : ${MARKER_SOURCE_DIR}"
 echo "Short edge mm         : ${SHORT_EDGE_MM}"
 echo "Indenters             : ${INDENTER_COUNT}"
 echo "Episodes / indenter   : ${EPISODES_PER_INDENTER}"
