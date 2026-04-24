@@ -12,17 +12,41 @@ EPISODES_PER_INDENTER="${EPISODES_PER_INDENTER:-70}"
 DEPTH_MIN_MM="${DEPTH_MIN_MM:-0.5}"
 REQUESTED_DEPTH_MAX_MM="${REQUESTED_DEPTH_MAX_MM:-2.0}"
 SEED="${SEED:-42}"
-RENDER_DEVICE="${RENDER_DEVICE:-cpu}"
-RENDER_SAMPLES=16
-MAX_PHYSICS_WORKERS="${MAX_PHYSICS_WORKERS:-3}"
+RENDER_DEVICE="${RENDER_DEVICE:-gpu}"
+RENDER_GPU_BACKEND="${RENDER_GPU_BACKEND:-auto}"
+RENDER_SAMPLES=32
+if [[ -n "${MAX_PHYSICS_WORKERS:-}" ]]; then
+  MAX_PHYSICS_WORKERS="${MAX_PHYSICS_WORKERS}"
+else
+  MAX_PHYSICS_WORKERS=1
+fi
 MAX_MESHING_WORKERS="${MAX_MESHING_WORKERS:-4}"
-MAX_RENDER_WORKERS="${MAX_RENDER_WORKERS:-12}"
+if [[ -n "${MAX_RENDER_WORKERS:-}" ]]; then
+  MAX_RENDER_WORKERS="${MAX_RENDER_WORKERS}"
+elif [[ "${RENDER_DEVICE,,}" == "gpu" ]]; then
+  MAX_RENDER_WORKERS=1
+else
+  MAX_RENDER_WORKERS=12
+fi
 AUTO_BALANCE_PIPELINE="${AUTO_BALANCE_PIPELINE:-1}"
 RENDER_BACKLOG_HIGH_WATERMARK="${RENDER_BACKLOG_HIGH_WATERMARK:-0}"
 RENDER_BACKLOG_LOW_WATERMARK="${RENDER_BACKLOG_LOW_WATERMARK:-0}"
-PHYSICS_NPZ_CLEANUP="${PHYSICS_NPZ_CLEANUP:-delete_after_scale_complete}"
 EST_IMAGES_PER_HOUR="${EST_IMAGES_PER_HOUR:-6000}"
 MONITOR_INTERVAL_SEC="${MONITOR_INTERVAL_SEC:-60}"
+RESUME="${RESUME:-0}"
+KEEP_WORK="${KEEP_WORK:-1}"
+if [[ -n "${PHYSICS_NPZ_CLEANUP:-}" ]]; then
+  PHYSICS_NPZ_CLEANUP="${PHYSICS_NPZ_CLEANUP}"
+else
+  case "${RESUME}:${KEEP_WORK}" in
+    1:*|true:*|TRUE:*|yes:*|YES:*|on:*|ON:*|*:1|*:true|*:TRUE|*:yes|*:YES|*:on|*:ON)
+      PHYSICS_NPZ_CLEANUP=keep
+      ;;
+    *)
+      PHYSICS_NPZ_CLEANUP=delete_after_scale_complete
+      ;;
+  esac
+fi
 
 OBJECTS=(
   cone
@@ -102,6 +126,7 @@ echo "Images / indenter     : ${IMAGES_PER_INDENTER}"
 echo "Total images          : ${TOTAL_IMAGES}"
 echo "Depth range mm        : ${DEPTH_MIN_MM} .. ${REQUESTED_DEPTH_MAX_MM}"
 echo "Render device         : ${RENDER_DEVICE}"
+echo "Render GPU backend    : ${RENDER_GPU_BACKEND}"
 echo "Render samples        : ${RENDER_SAMPLES} (fixed)"
 echo "Physics workers       : ${MAX_PHYSICS_WORKERS}"
 echo "Meshing workers       : ${MAX_MESHING_WORKERS}"
@@ -109,21 +134,48 @@ echo "Render workers        : ${MAX_RENDER_WORKERS}"
 echo "Auto-balance pipeline : ${AUTO_BALANCE_PIPELINE}"
 echo "Backlog high/low      : ${RENDER_BACKLOG_HIGH_WATERMARK}/${RENDER_BACKLOG_LOW_WATERMARK} (0=auto)"
 echo "Physics NPZ cleanup   : ${PHYSICS_NPZ_CLEANUP}"
+echo "Resume                : ${RESUME}"
+echo "Keep work dir         : ${KEEP_WORK}"
 echo "Rough total ETA (h)   : ${ETA_HOURS}  [EST_IMAGES_PER_HOUR=${EST_IMAGES_PER_HOUR}]"
 echo "Monitor interval      : ${MONITOR_INTERVAL_SEC}s"
 echo
 
-if [[ ! -f "/home/suhang/anaconda3/etc/profile.d/conda.sh" ]]; then
-  echo "Missing conda activation script: /home/suhang/anaconda3/etc/profile.d/conda.sh" >&2
+if [[ "${RENDER_DEVICE,,}" == "gpu" ]]; then
+  if [[ "${MAX_RENDER_WORKERS}" -gt 1 ]]; then
+    echo "Warning               : render uses GPU; MAX_RENDER_WORKERS=${MAX_RENDER_WORKERS} may contend with physics on the same GPU"
+  fi
+  if [[ "${MAX_PHYSICS_WORKERS}" -gt 1 ]]; then
+    echo "Warning               : physics uses GPU internally; MAX_PHYSICS_WORKERS=${MAX_PHYSICS_WORKERS} may also contend on the same GPU"
+  fi
+  echo
+fi
+
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-genforce}"
+CONDA_SH="${CONDA_SH:-}"
+
+if [[ -z "${CONDA_SH}" && -n "${CONDA_EXE:-}" ]]; then
+  CONDA_SH="$(cd "$(dirname "${CONDA_EXE}")/.." && pwd)/etc/profile.d/conda.sh"
+fi
+
+if [[ -z "${CONDA_SH}" ]] && command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+  if [[ -n "${CONDA_BASE}" ]]; then
+    CONDA_SH="${CONDA_BASE}/etc/profile.d/conda.sh"
+  fi
+fi
+
+if [[ ! -f "${CONDA_SH}" ]]; then
+  echo "Missing conda activation script. Set CONDA_SH manually or ensure conda is on PATH." >&2
   exit 1
 fi
 
-source /home/suhang/anaconda3/etc/profile.d/conda.sh
-conda activate genforce
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV_NAME}"
 
 START_EPOCH="$(date +%s)"
 START_HUMAN="$(date '+%Y-%m-%d %H:%M:%S')"
 RUN_LOG="${RUN_LOG:-${OUTPUT_ROOT%/}.run.log}"
+mkdir -p "$(dirname "${RUN_LOG}")"
 echo "Start time            : ${START_HUMAN}"
 echo "Run log               : ${RUN_LOG}"
 echo
@@ -172,6 +224,7 @@ trap cleanup_monitor EXIT INT TERM
 
 GENFORCE_ARGS=(
   --render-device "${RENDER_DEVICE}"
+  --render-gpu-backend "${RENDER_GPU_BACKEND}"
   --render-samples "${RENDER_SAMPLES}"
   --max-physics-workers "${MAX_PHYSICS_WORKERS}"
   --max-meshing-workers "${MAX_MESHING_WORKERS}"
@@ -182,6 +235,21 @@ GENFORCE_ARGS=(
 case "${AUTO_BALANCE_PIPELINE}" in
   1|true|TRUE|yes|YES|on|ON)
     GENFORCE_ARGS+=(--auto-balance-pipeline)
+    ;;
+esac
+
+TOP_LEVEL_ARGS=()
+case "${RESUME}" in
+  1|true|TRUE|yes|YES|on|ON)
+    TOP_LEVEL_ARGS+=(--resume)
+    ;;
+esac
+case "${KEEP_WORK}" in
+  1|true|TRUE|yes|YES|on|ON)
+    TOP_LEVEL_ARGS+=(--keep-work)
+    ;;
+  *)
+    TOP_LEVEL_ARGS+=(--no-keep-work)
     ;;
 esac
 
@@ -203,7 +271,7 @@ PYTHONUNBUFFERED=1 python "${GENERATOR}" \
   --depth-min "${DEPTH_MIN_MM}" \
   --requested-depth-max-mm "${REQUESTED_DEPTH_MAX_MM}" \
   --seed "${SEED}" \
-  --no-keep-work \
+  "${TOP_LEVEL_ARGS[@]}" \
   --genforce-args \
   "${GENFORCE_ARGS[@]}" \
   2>&1 | tee "${RUN_LOG}"

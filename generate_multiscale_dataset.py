@@ -544,7 +544,7 @@ def setup_material():
     uv = nodes.new("ShaderNodeTexCoord")
 
     tex.extension = "CLIP"
-    tex.interpolation = "Cubic"
+    tex.interpolation = "Closest"
 
     bsdf.inputs["Specular"].default_value = 0.0
     bsdf.inputs["Roughness"].default_value = 0.45

@@ -93,6 +93,7 @@ class GeneratorRun:
     indenter: str
     run_root: Path
     safe_depth: SafeDepthConfig
+    episodes_needed: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--work-root", type=Path, default=None)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--short-edge-mm", type=float, default=DEFAULT_SHORT_EDGE_MM)
     parser.add_argument("--objects", nargs="*", default=list(DEFAULT_OBJECTS))
     parser.add_argument("--episodes-per-indenter", type=int, default=1)
@@ -250,6 +252,7 @@ def build_rectgel_argv(
     run_root: Path,
     indenter: str,
     marker_stems: Sequence[str],
+    resume: bool,
     seed: int,
     episodes_per_indenter: int,
     gel_width_mm: float,
@@ -258,7 +261,7 @@ def build_rectgel_argv(
     passthrough: Sequence[str],
 ) -> list[str]:
     validate_passthrough_args(passthrough)
-    return [
+    argv = [
         str(rectseq.__file__),
         "--repo-root",
         str(SCRIPT_DIR),
@@ -290,6 +293,9 @@ def build_rectgel_argv(
         str(TARGET_HEIGHT),
         *passthrough,
     ]
+    if resume:
+        argv.append("--resume")
+    return argv
 
 
 def run_rectgel_generation(argv: Sequence[str], *, staged_texture_dir: Path) -> None:
@@ -395,6 +401,40 @@ def episode_has_complete_sequence(episode_dir: Path) -> bool:
         if not (episode_dir / str(seq_rel)).exists():
             return False
     return True
+
+
+def scan_existing_merged_episode_ids(dataset_root: Path) -> list[int]:
+    episode_ids: list[int] = []
+    incomplete: list[str] = []
+    for episode_dir in sorted(dataset_root.glob("episode_*")):
+        try:
+            episode_id = int(episode_dir.name.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if not episode_has_complete_sequence(episode_dir):
+            incomplete.append(str(episode_dir))
+            continue
+        episode_ids.append(episode_id)
+    if incomplete:
+        raise RuntimeError(
+            "Resume found incomplete merged episodes under output root: "
+            + ", ".join(incomplete[:5])
+        )
+    return sorted(episode_ids)
+
+
+def scan_existing_merged_indenter_counts(dataset_root: Path) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for episode_dir in sorted(dataset_root.glob("episode_*")):
+        if not episode_has_complete_sequence(episode_dir):
+            continue
+        metadata_path = episode_dir / "metadata.json"
+        metadata = load_json(metadata_path)
+        indenter = str(metadata.get("indenter", "")).strip()
+        if not indenter:
+            continue
+        counts[indenter] = counts.get(indenter, 0) + 1
+    return counts
 
 
 def determine_split(scale_split: str, indenter_split: str) -> str:
@@ -698,11 +738,15 @@ def main() -> None:
     output_root = resolve_output_root(args)
     work_root = resolve_work_root(args, output_root)
     validate_output_and_work_roots(output_root, work_root)
-    ensure_empty_dir(output_root, "Output root")
-    if work_root != output_root / DEFAULT_WORK_DIRNAME:
-        ensure_empty_dir(work_root, "Work root")
-    else:
+    if args.resume:
+        output_root.mkdir(parents=True, exist_ok=True)
         work_root.mkdir(parents=True, exist_ok=True)
+    else:
+        ensure_empty_dir(output_root, "Output root")
+        if work_root != output_root / DEFAULT_WORK_DIRNAME:
+            ensure_empty_dir(work_root, "Work root")
+        else:
+            work_root.mkdir(parents=True, exist_ok=True)
 
     gel_height_mm = float(args.short_edge_mm)
     gel_width_mm = round(float(args.short_edge_mm) * 4.0 / 3.0, 4)
@@ -725,7 +769,22 @@ def main() -> None:
     requested_depth_mm = float(args.requested_depth_max_mm)
     overall_run_start_ts = time.time()
     total_indenters = len(args.objects)
+    existing_episode_ids = scan_existing_merged_episode_ids(output_root) if args.resume else []
+    existing_indenter_counts = scan_existing_merged_indenter_counts(output_root) if args.resume else {}
+    if args.resume and existing_episode_ids:
+        print(
+            f"Resume mode: found {len(existing_episode_ids)} merged episodes under {output_root}; "
+            f"next episode id will start at {max(existing_episode_ids) + 1}"
+        )
     for indenter_index, indenter in enumerate(args.objects):
+        merged_count = int(existing_indenter_counts.get(str(indenter), 0)) if args.resume else 0
+        remaining_episodes = int(args.episodes_per_indenter) - int(merged_count)
+        if args.resume and remaining_episodes <= 0:
+            print(
+                f"Skipping {indenter} ({indenter_index + 1}/{total_indenters}): "
+                f"already merged {existing_indenter_counts[str(indenter)]} episodes"
+            )
+            continue
         safe_depth = compute_safe_depth(
             indenter=str(indenter),
             requested_depth_mm=requested_depth_mm,
@@ -733,13 +792,17 @@ def main() -> None:
             depth_min_mm=float(args.depth_min),
         )
         run_root = work_root / f"run_{indenter}"
-        ensure_empty_dir(run_root, f"Run root for {indenter}")
+        if args.resume:
+            run_root.mkdir(parents=True, exist_ok=True)
+        else:
+            ensure_empty_dir(run_root, f"Run root for {indenter}")
         argv = build_rectgel_argv(
             run_root=run_root,
             indenter=str(indenter),
             marker_stems=marker_stems,
-            seed=int(args.seed) + indenter_index,
-            episodes_per_indenter=int(args.episodes_per_indenter),
+            resume=bool(args.resume),
+            seed=int(args.seed) + indenter_index + int(merged_count),
+            episodes_per_indenter=int(remaining_episodes if args.resume else args.episodes_per_indenter),
             gel_width_mm=gel_width_mm,
             depth_min_mm=float(args.depth_min),
             depth_max_mm=float(safe_depth.effective_depth_mm),
@@ -750,6 +813,11 @@ def main() -> None:
             f"requested_depth={safe_depth.requested_depth_mm:.4f}mm "
             f"safe_cap={safe_depth.safe_cap_mm:.4f}mm effective={safe_depth.effective_depth_mm:.4f}mm"
         )
+        if args.resume:
+            print(
+                f"Resume target for {indenter}: merged={merged_count} "
+                f"remaining={remaining_episodes} requested_now={remaining_episodes}"
+            )
         original_overall = rectseq.maybe_log_overall_progress
 
         def patched_overall_progress(**kwargs: Any) -> None:
@@ -774,16 +842,31 @@ def main() -> None:
             run_rectgel_generation(argv, staged_texture_dir=staged_texture_dir)
         finally:
             rectseq.maybe_log_overall_progress = original_overall
-        runs.append(GeneratorRun(indenter=str(indenter), run_root=run_root, safe_depth=safe_depth))
+        runs.append(
+            GeneratorRun(
+                indenter=str(indenter),
+                run_root=run_root,
+                safe_depth=safe_depth,
+                episodes_needed=int(remaining_episodes if args.resume else args.episodes_per_indenter),
+            )
+        )
 
-    next_episode_id = 0
+    next_episode_id = max(existing_episode_ids) + 1 if existing_episode_ids else 0
     for run in runs:
         source_episode_dirs = [path for path in sorted(run.run_root.glob("episode_*")) if episode_has_complete_sequence(path)]
         if not source_episode_dirs:
+            if args.resume and existing_indenter_counts.get(run.indenter, 0) >= int(args.episodes_per_indenter):
+                continue
             raise RuntimeError(
                 f"No completed episodes were produced for indenter {run.indenter} in {run.run_root}. "
                 "Check the rectgel generator logs in the work directory."
             )
+        remaining_for_indenter = int(args.episodes_per_indenter) - int(existing_indenter_counts.get(run.indenter, 0))
+        if remaining_for_indenter <= 0:
+            continue
+        source_episode_dirs = source_episode_dirs[:remaining_for_indenter]
+        if not source_episode_dirs:
+            continue
         for source_episode_dir in source_episode_dirs:
             destination_episode_dir = output_root / f"episode_{next_episode_id:06d}"
             shutil.move(str(source_episode_dir), str(destination_episode_dir))
@@ -793,6 +876,7 @@ def main() -> None:
                 safe_depth=run.safe_depth,
                 short_edge_mm=gel_height_mm,
             )
+            existing_indenter_counts[run.indenter] = existing_indenter_counts.get(run.indenter, 0) + 1
             next_episode_id += 1
 
     rows, episodes, discovered_marker_stems = scan_event_records(
